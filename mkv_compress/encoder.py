@@ -22,8 +22,83 @@ def get_duration_seconds(path: Path, ffprobe: Path) -> float:
     return float(raw) if raw else 0.0
 
 
+def get_video_bitrate_kbps(path: Path, ffprobe: Path) -> float:
+    """Return the video stream bitrate in kbps, or 0.0 on failure."""
+    cmd = [
+        str(ffprobe),
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=bit_rate",
+        "-of", "default=nw=1:nk=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        raw = result.stdout.strip()
+        if raw and raw != "N/A":
+            return float(raw) / 1000
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return 0.0
+
+
+# Approximate bitrate reduction factor for H.265 vs common source codecs at CRF 20.
+# H.265 typically achieves 40-60% of the source bitrate for equivalent quality.
+_HEVC_COMPRESSION_FACTOR = 0.40
+
+
+def estimate_output_size(path: Path, ffprobe: Path) -> int:
+    """
+    Estimate the output file size after H.265 encoding.
+
+    Uses the video stream bitrate to estimate the new video size, then adds
+    the non-video streams (audio, subtitles) which are copied unchanged.
+    Returns 0 if estimation is not possible.
+    """
+    try:
+        # Get total file size and duration
+        input_size = path.stat().st_size
+        duration = get_duration_seconds(path, ffprobe)
+        if duration <= 0:
+            return 0
+
+        # Estimate non-video bytes from total bitrate vs video bitrate
+        video_kbps = get_video_bitrate_kbps(path, ffprobe)
+        if video_kbps <= 0:
+            # Fall back: assume video is ~85% of file, apply factor to whole file
+            return int(input_size * _HEVC_COMPRESSION_FACTOR)
+
+        video_bytes = (video_kbps * 1000 / 8) * duration
+        non_video_bytes = max(input_size - video_bytes, 0)
+
+        estimated_video_bytes = video_bytes * _HEVC_COMPRESSION_FACTOR
+        return int(estimated_video_bytes + non_video_bytes)
+    except (OSError, ValueError):
+        return 0
+
+
+# Hardware encoder names recognised as --preset values.
+# Maps preset alias -> (ffmpeg encoder name, quality flag, extra flags)
+_HW_ENCODERS: dict[str, tuple[str, str, list[str]]] = {
+    "qsv":   ("hevc_qsv",  "-global_quality", ["-load_plugin", "hevc_hw"]),
+    "nvenc": ("hevc_nvenc", "-cq",             ["-rc", "vbr"]),
+    "amf":   ("hevc_amf",  "-qp_i",           ["-qp_p", str(0)]),  # placeholder; overridden below
+}
+
+
+def is_hardware_preset(preset: str) -> bool:
+    return preset in _HW_ENCODERS
+
+
 def build_ffmpeg_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
     """Return the canonical FFmpeg encode command for a job."""
+    if job.preset in _HW_ENCODERS:
+        return _build_hw_command(job, ffmpeg)
+    return _build_sw_command(job, ffmpeg)
+
+
+def _build_sw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
+    """Software encode via libx265."""
     return [
         str(ffmpeg),
         "-i", str(job.source),
@@ -40,6 +115,38 @@ def build_ffmpeg_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
         "-stats_period", "2",
         str(job.tmp_output),
     ]
+
+
+def _build_hw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
+    """Hardware-accelerated encode (QSV / NVENC / AMF)."""
+    encoder, quality_flag, extra = _HW_ENCODERS[job.preset]
+
+    # QSV: global_quality maps roughly to CRF (same scale, lower = better)
+    # NVENC: -cq is the CRF equivalent
+    # AMF: use -qp_i / -qp_p
+    if job.preset == "amf":
+        quality_args = ["-qp_i", str(job.crf), "-qp_p", str(job.crf)]
+    else:
+        quality_args = [quality_flag, str(job.crf)]
+
+    cmd = [
+        str(ffmpeg),
+        "-i", str(job.source),
+        "-map", "0",
+        "-c:v", encoder,
+    ]
+    cmd += quality_args
+    cmd += [
+        "-c:a", "copy",
+        "-c:s", "copy",
+        "-tag:v", "hvc1",
+        "-movflags", "+faststart",
+        "-loglevel", "error",
+        "-progress", "pipe:1",
+        "-stats_period", "2",
+        str(job.tmp_output),
+    ]
+    return cmd
 
 
 def parse_progress_line(line: str) -> dict[str, str]:
@@ -92,6 +199,7 @@ def encode_file(
 
     total_duration = get_duration_seconds(job.source, ffprobe)
     cmd = build_ffmpeg_command(job, ffmpeg)
+    media_duration = total_duration
 
     # Ensure output directory exists
     job.tmp_output.parent.mkdir(parents=True, exist_ok=True)
@@ -155,4 +263,5 @@ def encode_file(
         input_size_bytes=input_size,
         output_size_bytes=output_size,
         duration_seconds=duration,
+        media_duration_seconds=media_duration,
     )

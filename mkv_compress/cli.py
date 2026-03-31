@@ -50,9 +50,13 @@ def main(
         max=51,
     ),
     preset: str = typer.Option(
-        "slow",
+        "fast",
         "--preset",
-        help="FFmpeg encoding preset. Slower = better compression. Default: slow.",
+        help=(
+            "Encoding preset. Software: ultrafast/faster/fast/medium/slow. "
+            "Hardware (much faster): qsv (Intel), nvenc (Nvidia), amf (AMD). "
+            "Default: fast."
+        ),
     ),
     recursive: bool = typer.Option(
         False,
@@ -125,21 +129,26 @@ def main(
             raise typer.Exit(code=0)
 
     # 7. Encode
+    total_bytes = sum(j.source.stat().st_size for j in to_encode)
     results = []
+    bytes_done = 0
+
     with display.make_progress_bar() as progress:
         overall_task = progress.add_task(
-            f"[cyan]Encoding {len(to_encode)} file(s)...",
-            total=len(to_encode),
+            f"[cyan]Overall ({len(to_encode)} file(s))",
+            total=total_bytes,
         )
         file_task = progress.add_task("", total=100)
 
-        for i, job in enumerate(jobs):
+        for job in jobs:
             filename = job.source.name
+            file_size = job.source.stat().st_size
             progress.update(file_task, description=f"[white]{filename}", completed=0)
 
-            def make_callback(ft=file_task):
+            def make_callback(ft=file_task, fb=file_size, ot=overall_task, bd=bytes_done):
                 def callback(pct: float) -> None:
                     progress.update(ft, completed=pct)
+                    progress.update(ot, completed=bd + fb * pct / 100)
                 return callback
 
             try:
@@ -156,7 +165,8 @@ def main(
             results.append(result)
 
             if not job.skip:
-                progress.update(overall_task, advance=1)
+                bytes_done += file_size
+                progress.update(overall_task, completed=bytes_done)
                 progress.update(file_task, completed=100)
 
     # 8. Summary

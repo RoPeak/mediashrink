@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 from mkv_compress.models import EncodeJob
 
 
+def _natural_sort_key(path: Path) -> list[int | str]:
+    """Sort key that orders '2' before '10' (natural/human sort)."""
+    parts: list[int | str] = []
+    for chunk in re.split(r"(\d+)", path.name):
+        parts.append(int(chunk) if chunk.isdigit() else chunk.lower())
+    return parts
+
+
 def scan_directory(directory: Path, recursive: bool = False) -> list[Path]:
-    """Return sorted list of .mkv files in directory."""
+    """Return naturally sorted list of .mkv files in directory."""
     pattern = "**/*.mkv" if recursive else "*.mkv"
-    return sorted(directory.glob(pattern))
+    return sorted(directory.glob(pattern), key=_natural_sort_key)
 
 
 def probe_video_codec(path: Path, ffprobe: Path) -> str | None:
@@ -34,6 +43,7 @@ def is_already_compressed(
     path: Path,
     ffprobe: Path,
     no_skip: bool = False,
+    codec: str | None = None,
 ) -> tuple[bool, str]:
     """Return (should_skip, reason). Always returns (False, '') when no_skip=True."""
     if no_skip:
@@ -42,7 +52,8 @@ def is_already_compressed(
     if "_compressed" in path.stem:
         return True, "filename contains '_compressed'"
 
-    codec = probe_video_codec(path, ffprobe)
+    if codec is None:
+        codec = probe_video_codec(path, ffprobe)
     if codec == "hevc":
         return True, "video stream is already H.265/HEVC"
 
@@ -60,10 +71,13 @@ def build_jobs(
     no_skip: bool = False,
 ) -> list[EncodeJob]:
     """Construct an EncodeJob for each file, skipping already-compressed ones."""
+    from mkv_compress.encoder import estimate_output_size
+
     jobs: list[EncodeJob] = []
 
     for source in files:
-        skip, skip_reason = is_already_compressed(source, ffprobe, no_skip)
+        codec = probe_video_codec(source, ffprobe)
+        skip, skip_reason = is_already_compressed(source, ffprobe, no_skip, codec=codec)
 
         if overwrite:
             output = source
@@ -73,6 +87,8 @@ def build_jobs(
             output = source.with_stem(source.stem + "_compressed")
 
         tmp_output = output.parent / f".tmp_{output.stem}.mkv"
+
+        estimated = estimate_output_size(source, ffprobe) if not skip else 0
 
         jobs.append(
             EncodeJob(
@@ -84,6 +100,8 @@ def build_jobs(
                 dry_run=dry_run,
                 skip=skip,
                 skip_reason=skip_reason if skip else None,
+                source_codec=codec,
+                estimated_output_bytes=estimated,
             )
         )
 

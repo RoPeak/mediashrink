@@ -9,6 +9,7 @@ from mkv_compress.encoder import (
     build_ffmpeg_command,
     encode_file,
     get_duration_seconds,
+    is_hardware_preset,
     parse_progress_line,
 )
 from mkv_compress.models import EncodeJob
@@ -72,6 +73,34 @@ def test_build_ffmpeg_command_uses_job_crf(tmp_path: Path) -> None:
     assert cmd[crf_idx + 1] == "28"
     preset_idx = cmd.index("-preset")
     assert cmd[preset_idx + 1] == "fast"
+
+
+def test_build_ffmpeg_command_qsv(tmp_path: Path) -> None:
+    job = _make_job(tmp_path, crf=20, preset="qsv")
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "hevc_qsv" in cmd
+    assert "libx265" not in cmd
+    assert "-preset" not in cmd
+    assert "-global_quality" in cmd
+    q_idx = cmd.index("-global_quality")
+    assert cmd[q_idx + 1] == "20"
+    assert str(job.tmp_output) == cmd[-1]
+
+
+def test_build_ffmpeg_command_nvenc(tmp_path: Path) -> None:
+    job = _make_job(tmp_path, crf=22, preset="nvenc")
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "hevc_nvenc" in cmd
+    assert "libx265" not in cmd
+    assert "-cq" in cmd
+
+
+def test_is_hardware_preset() -> None:
+    assert is_hardware_preset("qsv") is True
+    assert is_hardware_preset("nvenc") is True
+    assert is_hardware_preset("amf") is True
+    assert is_hardware_preset("fast") is False
+    assert is_hardware_preset("slow") is False
 
 
 # ---------------------------------------------------------------------------

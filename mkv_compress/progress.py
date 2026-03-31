@@ -43,6 +43,9 @@ class EncodingDisplay:
 
     def show_scan_table(self, jobs: list[EncodeJob]) -> None:
         """Display a table of files found and the planned action for each."""
+        # Determine if we should show estimate columns (dry-run with estimates available)
+        show_estimates = any(j.dry_run and j.estimated_output_bytes > 0 for j in jobs)
+
         table = Table(
             title="Files found",
             show_header=True,
@@ -50,30 +53,42 @@ class EncodingDisplay:
             expand=True,
         )
         table.add_column("File", style="white", no_wrap=False)
+        table.add_column("Codec", style="dim cyan", justify="center", no_wrap=True)
         table.add_column("Size", style="yellow", justify="right", no_wrap=True)
-        table.add_column("Output", style="dim white", no_wrap=False)
+        if show_estimates:
+            table.add_column("Est. Output", style="green", justify="right", no_wrap=True)
+            table.add_column("Est. Saving", style="bold green", justify="right", no_wrap=True)
         table.add_column("Action", justify="center", no_wrap=True)
 
         for job in jobs:
             size_str = _fmt_size(job.source.stat().st_size)
-            output_name = job.output.name
+            codec_str = job.source_codec or "?"
 
             if job.skip:
                 action = Text("SKIP", style="dim")
-                reason = f"  [dim]({job.skip_reason})[/dim]"
             elif job.dry_run:
                 action = Text("DRY RUN", style="cyan")
-                reason = ""
             else:
                 action = Text("ENCODE", style="green bold")
-                reason = ""
 
-            table.add_row(
-                job.source.name + (f"\n[dim]{job.skip_reason}[/dim]" if job.skip else ""),
-                size_str,
-                output_name,
-                action,
-            )
+            filename = job.source.name
+            if job.skip and job.skip_reason:
+                filename += f"\n[dim]{job.skip_reason}[/dim]"
+
+            row: list[str | Text] = [filename, codec_str, size_str]
+            if show_estimates:
+                if job.skip or job.estimated_output_bytes == 0:
+                    row += ["—", "—"]
+                else:
+                    est_out = job.estimated_output_bytes
+                    est_saved = job.source.stat().st_size - est_out
+                    est_pct = (est_saved / job.source.stat().st_size * 100) if job.source.stat().st_size else 0
+                    row += [
+                        _fmt_size(est_out),
+                        f"{_fmt_size(est_saved)} ({est_pct:.0f}%)",
+                    ]
+            row.append(action)
+            table.add_row(*row)
 
         self.console.print()
         self.console.print(table)
@@ -81,13 +96,22 @@ class EncodingDisplay:
         to_encode = sum(1 for j in jobs if not j.skip)
         to_skip = sum(1 for j in jobs if j.skip)
         total_input_bytes = sum(j.source.stat().st_size for j in jobs if not j.skip)
+        total_est_bytes = sum(j.estimated_output_bytes for j in jobs if not j.skip and j.estimated_output_bytes > 0)
 
-        self.console.print(
+        summary = (
             f"[bold]{len(jobs)}[/bold] file(s) found — "
             f"[green bold]{to_encode}[/green bold] to encode, "
             f"[dim]{to_skip}[/dim] to skip  "
             f"([yellow]{_fmt_size(total_input_bytes)}[/yellow] total input)"
         )
+        if show_estimates and total_est_bytes > 0:
+            total_saving = total_input_bytes - total_est_bytes
+            total_pct = total_saving / total_input_bytes * 100 if total_input_bytes else 0
+            summary += (
+                f"  ->  est. [green]{_fmt_size(total_est_bytes)}[/green] output"
+                f"  ([bold green]{_fmt_size(total_saving)} saved, ~{total_pct:.0f}%[/bold green])"
+            )
+        self.console.print(summary, highlight=False)
         self.console.print()
 
     def confirm_proceed(self, count: int) -> bool:
@@ -99,21 +123,26 @@ class EncodingDisplay:
 
     def make_progress_bar(self) -> Progress:
         """Return a Rich Progress bar for per-file encoding."""
+        from rich.progress import DownloadColumn, TransferSpeedColumn
         return Progress(
             SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
+            TextColumn("[progress.description]{task.description}", table_column=None),
+            BarColumn(bar_width=None),
             TaskProgressColumn(),
+            DownloadColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             console=self.console,
             transient=False,
+            expand=True,
         )
 
     def show_summary(self, results: list[EncodeResult]) -> None:
         """Display a before/after summary table across all processed files."""
+        is_dry_run = any(r.job.dry_run for r in results)
+
         table = Table(
-            title="Encoding summary",
+            title="Encoding summary" if not is_dry_run else "Dry-run summary (estimates)",
             show_header=True,
             header_style="bold cyan",
             expand=True,
@@ -121,9 +150,11 @@ class EncodingDisplay:
         table.add_column("File", style="white", no_wrap=False)
         table.add_column("Before", style="yellow", justify="right", no_wrap=True)
         table.add_column("After", style="green", justify="right", no_wrap=True)
-        table.add_column("Saved", style="bold green", justify="right", no_wrap=True)
+        table.add_column("Saving", style="bold green", justify="right", no_wrap=True)
         table.add_column("Reduction", justify="right", no_wrap=True)
-        table.add_column("Time", justify="right", no_wrap=True)
+        if not is_dry_run:
+            table.add_column("Time", justify="right", no_wrap=True)
+            table.add_column("Speed", justify="right", no_wrap=True)
         table.add_column("Status", justify="center", no_wrap=True)
 
         total_input = 0
@@ -133,55 +164,76 @@ class EncodingDisplay:
 
         for r in results:
             if r.skipped:
-                table.add_row(
+                row: list[str | Text] = [
                     r.job.source.name,
                     _fmt_size(r.input_size_bytes),
-                    "—",
-                    "—",
-                    "—",
-                    "—",
-                    Text("SKIPPED", style="dim"),
-                )
+                    "—", "—", "—",
+                ]
+                if not is_dry_run:
+                    row += ["—", "—"]
+                row.append(Text("SKIPPED", style="dim"))
+                table.add_row(*row)
                 continue
 
             if not r.success:
-                table.add_row(
+                row = [
                     r.job.source.name,
                     _fmt_size(r.input_size_bytes),
-                    "—",
-                    "—",
-                    "—",
-                    _fmt_duration(r.duration_seconds),
-                    Text("FAILED", style="red bold"),
-                )
+                    "—", "—", "—",
+                ]
+                if not is_dry_run:
+                    row += [_fmt_duration(r.duration_seconds), "—"]
+                row.append(Text("FAILED", style="red bold"))
+                table.add_row(*row)
                 continue
 
             if r.job.dry_run:
-                table.add_row(
-                    r.job.source.name,
-                    _fmt_size(r.input_size_bytes),
-                    "—",
-                    "—",
-                    "—",
-                    "—",
-                    Text("DRY RUN", style="cyan"),
-                )
+                est = r.job.estimated_output_bytes
+                if est > 0:
+                    est_saved = r.input_size_bytes - est
+                    est_pct = est_saved / r.input_size_bytes * 100 if r.input_size_bytes else 0
+                    pct_style = "green bold" if est_pct >= 30 else "yellow" if est_pct >= 10 else "red"
+                    row = [
+                        r.job.source.name,
+                        _fmt_size(r.input_size_bytes),
+                        f"~{_fmt_size(est)}",
+                        f"~{_fmt_size(est_saved)}",
+                        Text(f"~{est_pct:.0f}%", style=pct_style),
+                        Text("DRY RUN", style="cyan"),
+                    ]
+                    total_input += r.input_size_bytes
+                    total_output += est
+                    total_saved += est_saved
+                else:
+                    row = [
+                        r.job.source.name,
+                        _fmt_size(r.input_size_bytes),
+                        "—", "—", "—",
+                        Text("DRY RUN", style="cyan"),
+                    ]
+                table.add_row(*row)
                 continue
 
             saved = r.size_reduction_bytes
             pct = r.size_reduction_pct
-            pct_str = f"{pct:.1f}%"
             pct_style = "green bold" if pct >= 30 else "yellow" if pct >= 10 else "red"
 
-            table.add_row(
+            speed_str = "—"
+            if r.duration_seconds > 0 and r.media_duration_seconds > 0:
+                speed_x = r.media_duration_seconds / r.duration_seconds
+                speed_str = f"{speed_x:.2f}x"
+
+            row = [
                 r.job.source.name,
                 _fmt_size(r.input_size_bytes),
                 _fmt_size(r.output_size_bytes),
                 _fmt_size(saved),
-                Text(pct_str, style=pct_style),
+                Text(f"{pct:.1f}%", style=pct_style),
                 _fmt_duration(r.duration_seconds),
+                speed_str,
                 Text("OK", style="green bold"),
-            )
+            ]
+            table.add_row(*row)
 
             total_input += r.input_size_bytes
             total_output += r.output_size_bytes
@@ -193,11 +245,13 @@ class EncodingDisplay:
 
         if total_input > 0:
             overall_pct = (total_saved / total_input) * 100
+            est_marker = "~" if is_dry_run else ""
             self.console.print(
                 f"\n[bold]Total:[/bold] "
-                f"[yellow]{_fmt_size(total_input)}[/yellow] → "
-                f"[green]{_fmt_size(total_output)}[/green]  "
-                f"([bold green]{_fmt_size(total_saved)} saved, {overall_pct:.1f}%[/bold green])  "
-                f"[dim]{_fmt_duration(total_time)} elapsed[/dim]"
+                f"[yellow]{_fmt_size(total_input)}[/yellow] -> "
+                f"[green]{est_marker}{_fmt_size(total_output)}[/green]  "
+                f"([bold green]{est_marker}{_fmt_size(total_saved)} saved, {est_marker}{overall_pct:.1f}%[/bold green])"
+                + (f"  [dim]{_fmt_duration(total_time)} elapsed[/dim]" if total_time > 0 else ""),
+                highlight=False,
             )
         self.console.print()

@@ -14,6 +14,8 @@ class EncodeJob:
     dry_run: bool
     skip: bool = False
     skip_reason: str | None = None
+    source_codec: str | None = None          # e.g. "vc1", "h264", "hevc"
+    estimated_output_bytes: int = 0          # 0 means unknown
 
 
 @dataclass
@@ -26,6 +28,7 @@ class EncodeResult:
     output_size_bytes: int
     duration_seconds: float
     error_message: str | None = field(default=None)
+    media_duration_seconds: float = 0.0   # source file's playback duration
 
     @property
     def size_reduction_bytes(self) -> int:
