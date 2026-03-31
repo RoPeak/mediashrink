@@ -30,6 +30,12 @@ pip install -e .[dev]
 # Encode in-place with a _compressed suffix
 mkvcompress /path/to/mkvs
 
+# Analyze a library and write a candidate manifest
+mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
+
+# Apply a previously generated manifest
+mkvcompress apply candidates.json
+
 # Dry run only
 mkvcompress /path/to/mkvs --dry-run
 
@@ -65,6 +71,55 @@ The wizard:
 7. Optionally saves the chosen settings as a named profile before encoding starts.
 
 Important: wizard time and size numbers are approximate estimates, not guarantees.
+
+## Library Analysis
+
+`mkvcompress analyze` adds a conservative recommendation pass before encoding:
+
+```bash
+mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
+```
+
+The analysis flow:
+
+1. Scans `.mkv` files in the target directory tree.
+2. Probes codec, duration, bitrate, and projected output size.
+3. Classifies each file as `recommended`, `maybe`, or `skip`.
+4. Prints a summary of likely savings and rough encode time using the chosen profile/settings.
+5. Optionally writes a JSON manifest containing only recommended files.
+
+Defaults are conservative:
+
+- already-HEVC files are skipped
+- files already marked `_compressed` are skipped
+- small projected wins are skipped
+- borderline cases are shown as `maybe` in the console but excluded from the default manifest
+
+Analysis supports the same settings precedence as encoding:
+
+```bash
+mkvcompress analyze /path/to/library --profile tv-batch
+mkvcompress analyze /path/to/library --profile tv-batch --crf 18 --preset slow
+```
+
+Explicit `--crf` and `--preset` still override profile values.
+
+## Manifest Apply
+
+Use `apply` to run the existing encode pipeline against a manifest:
+
+```bash
+mkvcompress apply candidates.json
+mkvcompress apply candidates.json --output-dir /path/to/output
+mkvcompress apply candidates.json --profile tv-batch
+```
+
+`apply`:
+
+- reads the manifest settings by default
+- allows `--profile`, `--crf`, and `--preset` overrides
+- skips missing files from stale manifests with a warning
+- re-checks skip conditions at execution time instead of trusting the manifest blindly
 
 ## Saved Profiles
 
@@ -145,6 +200,8 @@ FFmpeg probe success determines whether a hardware encoder is offered. If a hard
 5. Rename the temp file only after a successful encode.
 6. Delete temp files on failure or interruption.
 7. Never replace originals unless `--overwrite` is explicitly requested.
+
+The optional analyze/apply flow sits in front of this to help you choose which files are worth compressing before any encode begins.
 
 ## Testing
 

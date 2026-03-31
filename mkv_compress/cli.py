@@ -9,6 +9,14 @@ import typer
 from rich.console import Console
 from typer.core import TyperGroup
 
+from mkv_compress.analysis import (
+    analyze_directory,
+    build_manifest,
+    display_analysis_summary,
+    estimate_analysis_encode_seconds,
+    load_manifest,
+    save_manifest,
+)
 from mkv_compress.encoder import encode_file
 from mkv_compress.models import EncodeJob
 from mkv_compress.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
@@ -106,6 +114,32 @@ def _prepare_tools(output_dir: Optional[Path]) -> tuple[Path, Path]:
     return ffmpeg, ffprobe
 
 
+def _resolve_encode_settings(
+    profile: Optional[str],
+    crf: Optional[int],
+    preset: Optional[str],
+) -> tuple[int, str, str | None]:
+    effective_crf = 20
+    effective_preset = "fast"
+    profile_name: str | None = None
+
+    if profile:
+        saved_profile = get_profile(profile)
+        if saved_profile is None:
+            console.print(f"[red bold]Error:[/red bold] profile '{profile}' was not found.")
+            raise typer.Exit(code=1)
+        effective_crf = saved_profile.crf
+        effective_preset = saved_profile.preset
+        profile_name = saved_profile.name
+
+    if crf is not None:
+        effective_crf = crf
+    if preset is not None:
+        effective_preset = preset
+
+    return effective_crf, effective_preset, profile_name
+
+
 @app.command("encode", hidden=True)
 def encode_cmd(
     directory: Path = typer.Argument(
@@ -174,20 +208,7 @@ def encode_cmd(
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
 
-    effective_crf = 20
-    effective_preset = "fast"
-    if profile:
-        saved_profile = get_profile(profile)
-        if saved_profile is None:
-            console.print(f"[red bold]Error:[/red bold] profile '{profile}' was not found.")
-            raise typer.Exit(code=1)
-        effective_crf = saved_profile.crf
-        effective_preset = saved_profile.preset
-
-    if crf is not None:
-        effective_crf = crf
-    if preset is not None:
-        effective_preset = preset
+    effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
 
     files = scan_directory(directory, recursive=recursive)
     if not files:
@@ -216,6 +237,162 @@ def encode_cmd(
         if not display.confirm_proceed(len(to_encode)):
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(code=0)
+
+    _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+
+
+@app.command()
+def analyze(
+    directory: Path = typer.Argument(
+        ...,
+        help="Directory containing .mkv files to analyze.",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+    ),
+    recursive: bool = typer.Option(
+        False,
+        "--recursive",
+        "-r",
+        help="Scan subdirectories for .mkv files.",
+    ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Load saved CRF/preset defaults from a named profile.",
+    ),
+    crf: Optional[int] = typer.Option(
+        None,
+        "--crf",
+        min=0,
+        max=51,
+        help="H.265 CRF quality value used for analysis estimates.",
+    ),
+    preset: Optional[str] = typer.Option(
+        None,
+        "--preset",
+        help="Encoding preset used for analysis estimates.",
+    ),
+    manifest_out: Optional[Path] = typer.Option(
+        None,
+        "--manifest-out",
+        help="Write recommended candidates to a JSON manifest.",
+    ),
+) -> None:
+    ffmpeg, ffprobe = _prepare_tools(None)
+    effective_crf, effective_preset, profile_name = _resolve_encode_settings(profile, crf, preset)
+
+    items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
+    if not items:
+        console.print(f"[yellow]No .mkv files found in[/yellow] {directory}")
+        raise typer.Exit(code=0)
+
+    estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+        items=items,
+        preset=effective_preset,
+        crf=effective_crf,
+        ffmpeg=ffmpeg,
+    )
+    display_analysis_summary(items, estimated_total_encode_seconds, console)
+
+    if manifest_out is not None:
+        manifest = build_manifest(
+            directory=directory,
+            recursive=recursive,
+            preset=effective_preset,
+            crf=effective_crf,
+            profile_name=profile_name,
+            estimated_total_encode_seconds=estimated_total_encode_seconds,
+            items=items,
+        )
+        save_manifest(manifest, manifest_out)
+        console.print(f"[green]Wrote manifest[/green] {manifest_out}")
+
+
+@app.command()
+def apply(
+    manifest: Path = typer.Argument(
+        ...,
+        help="Path to an analysis manifest JSON file.",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Write output files here instead of alongside originals.",
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Replace original files after successful encoding.",
+    ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Override manifest settings using a saved profile.",
+    ),
+    crf: Optional[int] = typer.Option(
+        None,
+        "--crf",
+        min=0,
+        max=51,
+        help="Override manifest CRF.",
+    ),
+    preset: Optional[str] = typer.Option(
+        None,
+        "--preset",
+        help="Override manifest preset.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt.",
+    ),
+) -> None:
+    display = EncodingDisplay(console)
+    ffmpeg, ffprobe = _prepare_tools(output_dir)
+    loaded_manifest = load_manifest(manifest)
+
+    effective_crf = loaded_manifest.crf
+    effective_preset = loaded_manifest.preset
+    if profile or crf is not None or preset is not None:
+        effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
+
+    missing_files = [item.source for item in loaded_manifest.items if not item.source.exists()]
+    existing_files = [item.source for item in loaded_manifest.items if item.source.exists()]
+    for missing_path in missing_files:
+        console.print(f"[yellow]Missing file from manifest:[/yellow] {missing_path}")
+
+    if not existing_files:
+        console.print("[yellow]No manifest files are available to encode.[/yellow]")
+        raise typer.Exit(code=0)
+
+    jobs = build_jobs(
+        files=existing_files,
+        output_dir=output_dir,
+        overwrite=overwrite,
+        crf=effective_crf,
+        preset=effective_preset,
+        dry_run=False,
+        ffprobe=ffprobe,
+        no_skip=False,
+    )
+
+    display.show_scan_table(jobs)
+    to_encode = [job for job in jobs if not job.skip]
+    if not to_encode:
+        console.print("[dim]Nothing to encode.[/dim]")
+        raise typer.Exit(code=0)
+
+    if not yes and not display.confirm_proceed(len(to_encode)):
+        console.print("[dim]Aborted.[/dim]")
+        raise typer.Exit(code=0)
 
     _run_encode_loop(jobs, ffmpeg, ffprobe, display)
 
