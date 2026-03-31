@@ -4,7 +4,6 @@ import typer
 from rich.console import Console
 from rich.progress import (
     BarColumn,
-    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
@@ -17,8 +16,8 @@ from rich.text import Text
 
 from mkv_compress.models import EncodeJob, EncodeResult
 
-_GB = 1024 ** 3
-_MB = 1024 ** 2
+_GB = 1024**3
+_MB = 1024**2
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -42,9 +41,7 @@ class EncodingDisplay:
         self.console = console or Console()
 
     def show_scan_table(self, jobs: list[EncodeJob]) -> None:
-        """Display a table of files found and the planned action for each."""
-        # Determine if we should show estimate columns (dry-run with estimates available)
-        show_estimates = any(j.dry_run and j.estimated_output_bytes > 0 for j in jobs)
+        show_estimates = any(job.dry_run and job.estimated_output_bytes > 0 for job in jobs)
 
         table = Table(
             title="Files found",
@@ -78,28 +75,27 @@ class EncodingDisplay:
             row: list[str | Text] = [filename, codec_str, size_str]
             if show_estimates:
                 if job.skip or job.estimated_output_bytes == 0:
-                    row += ["—", "—"]
+                    row += ["-", "-"]
                 else:
                     est_out = job.estimated_output_bytes
                     est_saved = job.source.stat().st_size - est_out
                     est_pct = (est_saved / job.source.stat().st_size * 100) if job.source.stat().st_size else 0
-                    row += [
-                        _fmt_size(est_out),
-                        f"{_fmt_size(est_saved)} ({est_pct:.0f}%)",
-                    ]
+                    row += [_fmt_size(est_out), f"{_fmt_size(est_saved)} ({est_pct:.0f}%)"]
             row.append(action)
             table.add_row(*row)
 
         self.console.print()
         self.console.print(table)
 
-        to_encode = sum(1 for j in jobs if not j.skip)
-        to_skip = sum(1 for j in jobs if j.skip)
-        total_input_bytes = sum(j.source.stat().st_size for j in jobs if not j.skip)
-        total_est_bytes = sum(j.estimated_output_bytes for j in jobs if not j.skip and j.estimated_output_bytes > 0)
+        to_encode = sum(1 for job in jobs if not job.skip)
+        to_skip = sum(1 for job in jobs if job.skip)
+        total_input_bytes = sum(job.source.stat().st_size for job in jobs if not job.skip)
+        total_est_bytes = sum(
+            job.estimated_output_bytes for job in jobs if not job.skip and job.estimated_output_bytes > 0
+        )
 
         summary = (
-            f"[bold]{len(jobs)}[/bold] file(s) found — "
+            f"[bold]{len(jobs)}[/bold] file(s) found - "
             f"[green bold]{to_encode}[/green bold] to encode, "
             f"[dim]{to_skip}[/dim] to skip  "
             f"([yellow]{_fmt_size(total_input_bytes)}[/yellow] total input)"
@@ -108,22 +104,18 @@ class EncodingDisplay:
             total_saving = total_input_bytes - total_est_bytes
             total_pct = total_saving / total_input_bytes * 100 if total_input_bytes else 0
             summary += (
-                f"  ->  est. [green]{_fmt_size(total_est_bytes)}[/green] output"
+                f"  -> est. [green]{_fmt_size(total_est_bytes)}[/green] output"
                 f"  ([bold green]{_fmt_size(total_saving)} saved, ~{total_pct:.0f}%[/bold green])"
             )
         self.console.print(summary, highlight=False)
         self.console.print()
 
     def confirm_proceed(self, count: int) -> bool:
-        """Prompt the user to confirm encoding. Returns True if confirmed."""
-        return typer.confirm(
-            f"Encode {count} file(s)?",
-            default=True,
-        )
+        return typer.confirm(f"Encode {count} file(s)?", default=True)
 
     def make_progress_bar(self) -> Progress:
-        """Return a Rich Progress bar for per-file encoding."""
-        from rich.progress import DownloadColumn, TransferSpeedColumn
+        from rich.progress import DownloadColumn
+
         return Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}", table_column=None),
@@ -138,8 +130,7 @@ class EncodingDisplay:
         )
 
     def show_summary(self, results: list[EncodeResult]) -> None:
-        """Display a before/after summary table across all processed files."""
-        is_dry_run = any(r.job.dry_run for r in results)
+        is_dry_run = any(result.job.dry_run for result in results)
 
         table = Table(
             title="Encoding summary" if not is_dry_run else "Dry-run summary (estimates)",
@@ -162,83 +153,70 @@ class EncodingDisplay:
         total_saved = 0
         total_time = 0.0
 
-        for r in results:
-            if r.skipped:
-                row: list[str | Text] = [
-                    r.job.source.name,
-                    _fmt_size(r.input_size_bytes),
-                    "—", "—", "—",
-                ]
+        for result in results:
+            if result.skipped:
+                row: list[str | Text] = [result.job.source.name, _fmt_size(result.input_size_bytes), "-", "-", "-"]
                 if not is_dry_run:
-                    row += ["—", "—"]
+                    row += ["-", "-"]
                 row.append(Text("SKIPPED", style="dim"))
                 table.add_row(*row)
                 continue
 
-            if not r.success:
-                row = [
-                    r.job.source.name,
-                    _fmt_size(r.input_size_bytes),
-                    "—", "—", "—",
-                ]
+            if not result.success:
+                row = [result.job.source.name, _fmt_size(result.input_size_bytes), "-", "-", "-"]
                 if not is_dry_run:
-                    row += [_fmt_duration(r.duration_seconds), "—"]
+                    row += [_fmt_duration(result.duration_seconds), "-"]
                 row.append(Text("FAILED", style="red bold"))
                 table.add_row(*row)
                 continue
 
-            if r.job.dry_run:
-                est = r.job.estimated_output_bytes
+            if result.job.dry_run:
+                est = result.job.estimated_output_bytes
                 if est > 0:
-                    est_saved = r.input_size_bytes - est
-                    est_pct = est_saved / r.input_size_bytes * 100 if r.input_size_bytes else 0
+                    est_saved = result.input_size_bytes - est
+                    est_pct = est_saved / result.input_size_bytes * 100 if result.input_size_bytes else 0
                     pct_style = "green bold" if est_pct >= 30 else "yellow" if est_pct >= 10 else "red"
                     row = [
-                        r.job.source.name,
-                        _fmt_size(r.input_size_bytes),
+                        result.job.source.name,
+                        _fmt_size(result.input_size_bytes),
                         f"~{_fmt_size(est)}",
                         f"~{_fmt_size(est_saved)}",
                         Text(f"~{est_pct:.0f}%", style=pct_style),
                         Text("DRY RUN", style="cyan"),
                     ]
-                    total_input += r.input_size_bytes
+                    total_input += result.input_size_bytes
                     total_output += est
                     total_saved += est_saved
                 else:
-                    row = [
-                        r.job.source.name,
-                        _fmt_size(r.input_size_bytes),
-                        "—", "—", "—",
-                        Text("DRY RUN", style="cyan"),
-                    ]
+                    row = [result.job.source.name, _fmt_size(result.input_size_bytes), "-", "-", "-", Text("DRY RUN", style="cyan")]
                 table.add_row(*row)
                 continue
 
-            saved = r.size_reduction_bytes
-            pct = r.size_reduction_pct
+            saved = result.size_reduction_bytes
+            pct = result.size_reduction_pct
             pct_style = "green bold" if pct >= 30 else "yellow" if pct >= 10 else "red"
 
-            speed_str = "—"
-            if r.duration_seconds > 0 and r.media_duration_seconds > 0:
-                speed_x = r.media_duration_seconds / r.duration_seconds
+            speed_str = "-"
+            if result.duration_seconds > 0 and result.media_duration_seconds > 0:
+                speed_x = result.media_duration_seconds / result.duration_seconds
                 speed_str = f"{speed_x:.2f}x"
 
             row = [
-                r.job.source.name,
-                _fmt_size(r.input_size_bytes),
-                _fmt_size(r.output_size_bytes),
+                result.job.source.name,
+                _fmt_size(result.input_size_bytes),
+                _fmt_size(result.output_size_bytes),
                 _fmt_size(saved),
                 Text(f"{pct:.1f}%", style=pct_style),
-                _fmt_duration(r.duration_seconds),
+                _fmt_duration(result.duration_seconds),
                 speed_str,
                 Text("OK", style="green bold"),
             ]
             table.add_row(*row)
 
-            total_input += r.input_size_bytes
-            total_output += r.output_size_bytes
+            total_input += result.input_size_bytes
+            total_output += result.output_size_bytes
             total_saved += saved
-            total_time += r.duration_seconds
+            total_time += result.duration_seconds
 
         self.console.print()
         self.console.print(table)

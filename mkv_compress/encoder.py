@@ -80,10 +80,47 @@ def estimate_output_size(path: Path, ffprobe: Path) -> int:
 # Hardware encoder names recognised as --preset values.
 # Maps preset alias -> (ffmpeg encoder name, quality flag, extra flags)
 _HW_ENCODERS: dict[str, tuple[str, str, list[str]]] = {
-    "qsv":   ("hevc_qsv",  "-global_quality", ["-load_plugin", "hevc_hw"]),
+    "qsv":   ("hevc_qsv",  "-global_quality", []),
     "nvenc": ("hevc_nvenc", "-cq",             ["-rc", "vbr"]),
     "amf":   ("hevc_amf",  "-qp_i",           ["-qp_p", str(0)]),  # placeholder; overridden below
 }
+
+
+def probe_encoder_available(encoder_key: str, ffmpeg: Path) -> bool:
+    """
+    Run a null-encode test with a synthetic 64x64 1-second source to check if
+    encoder_key is usable on this machine. Returns True only if FFmpeg exits 0.
+    encoder_key must be one of "qsv", "nvenc", "amf".
+    """
+    if encoder_key not in _HW_ENCODERS:
+        return False
+
+    encoder_name, quality_flag, extra_flags = _HW_ENCODERS[encoder_key]
+
+    if encoder_key == "amf":
+        quality_args = ["-qp_i", "28", "-qp_p", "28"]
+    else:
+        quality_args = [quality_flag, "28"]
+
+    cmd = [
+        str(ffmpeg),
+        "-f", "lavfi",
+        "-i", "color=black:s=64x64:r=1",
+        "-t", "1",
+        "-c:v", encoder_name,
+    ] + quality_args + extra_flags + [
+        "-f", "null", "-",
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=15,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def is_hardware_preset(preset: str) -> bool:
