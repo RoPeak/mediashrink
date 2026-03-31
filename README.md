@@ -26,6 +26,24 @@ pip install -e .[dev]
 
 ## Usage
 
+For most users, start with the wizard:
+
+```bash
+mkvcompress wizard /path/to/library
+```
+
+It now handles:
+
+- encoder/profile selection
+- automatic library analysis
+- recommended/maybe/skip review
+- manifest export if wanted
+- compressing the recommended set by default
+
+Advanced/manual flows are still available below.
+
+## Advanced Usage
+
 ```bash
 # Encode in-place with a _compressed suffix
 mkvcompress /path/to/mkvs
@@ -54,7 +72,7 @@ mkvcompress /path/to/mkvs --profile tv-batch
 
 ## Wizard
 
-The wizard detects usable encoders with FFmpeg probe runs, benchmarks a short sample, and then offers generated presets plus a custom path.
+The wizard is the main guided workflow. It detects usable encoders with FFmpeg probe runs, benchmarks a short sample, analyzes the target library with the chosen settings, and then walks the user to a simple next step.
 
 ```bash
 mkvcompress wizard /path/to/mkvs
@@ -68,13 +86,15 @@ The wizard:
 4. Benchmarks a short clip to estimate relative speed.
 5. Presents generated profiles with approximate output-size, time, and quality trade-offs.
 6. Lets you select a generated profile or customize encoder, CRF, and software preset.
-7. Optionally saves the chosen settings as a named profile before encoding starts.
+7. Analyzes the library with those settings and classifies files as `recommended`, `maybe`, or `skip`.
+8. Defaults to compressing the recommended files only.
+9. Can optionally review `maybe` files or export a manifest instead of encoding immediately.
 
 Important: wizard time and size numbers are approximate estimates, not guarantees.
 
 ## Library Analysis
 
-`mkvcompress analyze` adds a conservative recommendation pass before encoding:
+`mkvcompress analyze` is the advanced/manual version of the same recommendation pass used by the wizard:
 
 ```bash
 mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
@@ -106,7 +126,7 @@ Explicit `--crf` and `--preset` still override profile values.
 
 ## Manifest Apply
 
-Use `apply` to run the existing encode pipeline against a manifest:
+Use `apply` to run the existing encode pipeline against a manifest when you want a scriptable two-step workflow:
 
 ```bash
 mkvcompress apply candidates.json

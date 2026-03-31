@@ -436,7 +436,7 @@ def wizard(
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     display = EncodingDisplay(console)
 
-    jobs, confirmed = run_wizard(
+    jobs, action = run_wizard(
         directory=directory,
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
@@ -447,8 +447,10 @@ def wizard(
         console=console,
     )
 
-    if not confirmed:
+    if action == "cancel":
         console.print("[dim]Aborted.[/dim]")
+        raise typer.Exit(code=0)
+    if action == "export":
         raise typer.Exit(code=0)
 
     _run_encode_loop(jobs, ffmpeg, ffprobe, display)

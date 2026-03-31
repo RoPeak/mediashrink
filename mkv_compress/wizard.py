@@ -11,8 +11,15 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from mkv_compress.analysis import (
+    analyze_directory,
+    build_manifest,
+    display_analysis_summary,
+    estimate_analysis_encode_seconds,
+    save_manifest,
+)
 from mkv_compress.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available
-from mkv_compress.models import EncodeJob
+from mkv_compress.models import AnalysisItem, EncodeJob
 from mkv_compress.platform_utils import detect_device_labels
 from mkv_compress.profiles import SavedProfile, upsert_profile
 from mkv_compress.scanner import build_jobs, scan_directory
@@ -453,6 +460,74 @@ def maybe_save_profile(
     console.print(f"[green]Saved profile[/green] {name}")
 
 
+def display_candidate_table(title: str, items: list[AnalysisItem], console: Console) -> None:
+    table = Table(title=title, header_style="bold cyan", expand=True)
+    table.add_column("File")
+    table.add_column("Codec", justify="center", no_wrap=True)
+    table.add_column("Size", justify="right", no_wrap=True)
+    table.add_column("Est. Saving", justify="right", no_wrap=True)
+    table.add_column("Reason")
+
+    for item in sorted(items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True)[:12]:
+        saving = "-" if item.estimated_savings_bytes <= 0 else f"~{_fmt_size(item.estimated_savings_bytes)}"
+        table.add_row(
+            item.source.name,
+            item.codec or "?",
+            _fmt_size(item.size_bytes),
+            saving,
+            item.reason_text,
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+
+
+def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Console) -> str:
+    console.print("[bold]Next step:[/bold]")
+    console.print("  1. Compress recommended only")
+    if maybe_count:
+        console.print("  2. Review maybe files")
+        console.print("  3. Export manifest")
+        console.print("  4. Cancel")
+        max_choice = 4
+        export_choice = 3
+        cancel_choice = 4
+    else:
+        console.print("  2. Export manifest")
+        console.print("  3. Cancel")
+        max_choice = 3
+        export_choice = 2
+        cancel_choice = 3
+
+    while True:
+        try:
+            choice = int(
+                typer.prompt(
+                    f"Choose action [1-{max_choice}]",
+                    default="1",
+                )
+            )
+        except ValueError:
+            choice = -1
+
+        if choice == 1:
+            return "compress_recommended"
+        if maybe_count and choice == 2:
+            return "review_maybe"
+        if choice == export_choice:
+            return "export"
+        if choice == cancel_choice:
+            return "cancel"
+
+        console.print("[yellow]Invalid choice.[/yellow]")
+
+
+def review_maybe_items(maybe_items: list[AnalysisItem], console: Console) -> bool:
+    display_candidate_table("Maybe files", maybe_items, console)
+    return typer.confirm("Include maybe files in this run?", default=False)
+
+
 def run_wizard(
     directory: Path,
     ffmpeg: Path,
@@ -462,15 +537,15 @@ def run_wizard(
     overwrite: bool,
     no_skip: bool,
     console: Console,
-) -> tuple[list[EncodeJob], bool]:
-    """Run the interactive wizard and return (jobs, confirmed)."""
+) -> tuple[list[EncodeJob], str]:
+    """Run the interactive wizard and return (jobs, action)."""
     console.print("\n[bold cyan]mkvcompress wizard[/bold cyan]")
     console.print("[dim]Scanning files and detecting hardware...[/dim]\n")
 
     files = scan_directory(directory, recursive=recursive)
     if not files:
         console.print(f"[yellow]No .mkv files found in[/yellow] {directory}")
-        return [], False
+        return [], "cancel"
 
     total_input_bytes = sum(path.stat().st_size for path in files)
     console.print(
@@ -525,8 +600,49 @@ def run_wizard(
         sw_preset = selected.sw_preset
         display_label = selected.name
 
+    maybe_save_profile(preset, crf, display_label, console)
+
+    analysis_items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
+    estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+        items=analysis_items,
+        preset=preset,
+        crf=crf,
+        ffmpeg=ffmpeg,
+    )
+    display_analysis_summary(analysis_items, estimated_total_encode_seconds, console)
+
+    recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
+    maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
+    if not recommended_items:
+        console.print("[dim]No recommended files were found for automatic compression.[/dim]")
+        return [], "cancel"
+
+    action = prompt_analysis_action(len(recommended_items), len(maybe_items), console)
+    if action == "cancel":
+        return [], "cancel"
+    if action == "export":
+        manifest = build_manifest(
+            directory=directory,
+            recursive=recursive,
+            preset=preset,
+            crf=crf,
+            profile_name=None,
+            estimated_total_encode_seconds=estimated_total_encode_seconds,
+            items=analysis_items,
+        )
+        default_manifest_path = directory / "mkvcompress-analysis.json"
+        manifest_path = Path(typer.prompt("Manifest path", default=str(default_manifest_path)))
+        save_manifest(manifest, manifest_path)
+        console.print(f"[green]Wrote manifest[/green] {manifest_path}")
+        return [], "export"
+
+    selected_items = list(recommended_items)
+    if action == "review_maybe" and maybe_items:
+        if review_maybe_items(maybe_items, console):
+            selected_items.extend(maybe_items)
+
     jobs = build_jobs(
-        files=files,
+        files=[item.source for item in selected_items],
         output_dir=output_dir,
         overwrite=overwrite,
         crf=crf,
@@ -538,30 +654,26 @@ def run_wizard(
 
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
-        console.print("[dim]All files are already H.265. Nothing to encode.[/dim]")
-        return jobs, False
-
-    maybe_save_profile(preset, crf, display_label, console)
+        console.print("[dim]Nothing to encode after re-checking the selected files.[/dim]")
+        return [], "cancel"
 
     console.print()
     console.print("[bold]Ready to encode[/bold]")
     console.print(f"  Files:    {len(to_encode)}")
     console.print(f"  Encoder:  {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}")
     console.print(f"  CRF:      {crf}")
-    console.print(f"  Input:    {_fmt_size(total_input_bytes)}")
-
-    est_out = _estimate_output_bytes(total_input_bytes, crf)
-    saved = total_input_bytes - est_out
-    saved_pct = saved / total_input_bytes * 100 if total_input_bytes else 0
-    console.print(f"  Est. out: ~{_fmt_size(est_out)}  (~{_fmt_size(saved)} saved, ~{saved_pct:.0f}%)")
-
-    chosen_speed = benchmark_speeds.get(preset)
-    if chosen_speed is None and sw_preset == "slow":
-        fast_speed = benchmark_speeds.get("fast")
-        chosen_speed = (fast_speed / 4) if fast_speed else None
-    est_time = _estimate_time(total_media_seconds, chosen_speed)
-    if est_time > 0:
-        console.print(f"  Est. time: ~{_fmt_duration(est_time)}")
+    selected_input_bytes = sum(item.size_bytes for item in selected_items)
+    selected_output_bytes = sum(item.estimated_output_bytes for item in selected_items if item.estimated_output_bytes > 0)
+    selected_saved_bytes = sum(item.estimated_savings_bytes for item in selected_items)
+    selected_saved_pct = selected_saved_bytes / selected_input_bytes * 100 if selected_input_bytes else 0.0
+    console.print(f"  Input:    {_fmt_size(selected_input_bytes)}")
+    if selected_output_bytes > 0:
+        console.print(
+            f"  Est. out: ~{_fmt_size(selected_output_bytes)}  "
+            f"(~{_fmt_size(selected_saved_bytes)} saved, ~{selected_saved_pct:.0f}%)"
+        )
+    if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
+        console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
 
     if not to_encode[0].output.parent.exists():
         console.print(f"  Output:   {to_encode[0].output.parent}")
@@ -569,4 +681,6 @@ def run_wizard(
     console.print()
 
     confirmed = typer.confirm("Start encoding?", default=True)
-    return jobs, confirmed
+    if not confirmed:
+        return [], "cancel"
+    return jobs, "encode"

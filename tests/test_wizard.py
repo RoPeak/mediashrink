@@ -6,13 +6,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 from rich.console import Console
 
+from mkv_compress.models import AnalysisItem, EncodeJob
 from mkv_compress.wizard import (
     _sum_media_durations,
+    EncoderProfile,
     benchmark_encoder,
     build_profiles,
     detect_available_encoders,
     display_profiles_table,
     maybe_save_profile,
+    review_maybe_items,
+    run_wizard,
     run_custom_wizard,
 )
 
@@ -178,3 +182,159 @@ def test_maybe_save_profile_persists_choice(tmp_path: Path, monkeypatch) -> None
     assert profile.preset == "slow"
     assert profile.crf == 18
     assert profile.label == "Best Quality"
+
+
+def test_review_maybe_items_defaults_to_not_include(tmp_path: Path) -> None:
+    console = Console()
+    item = _analysis_item(tmp_path / "maybe.mkv", "maybe")
+
+    with patch("mkv_compress.wizard.typer.confirm", return_value=False):
+        included = review_maybe_items([item], console)
+
+    assert included is False
+
+
+def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path) -> None:
+    console = Console()
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    maybe = _analysis_item(tmp_path / "ep02.mkv", "maybe")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+
+    with patch("mkv_compress.wizard.scan_directory", return_value=[source]), \
+         patch("mkv_compress.wizard.get_duration_seconds", return_value=120.0), \
+         patch("mkv_compress.wizard.detect_available_encoders", return_value=[]), \
+         patch("mkv_compress.wizard.detect_device_labels", return_value={}), \
+         patch("mkv_compress.wizard.benchmark_encoder", return_value=1.0), \
+         patch("mkv_compress.wizard.display_profiles_table"), \
+         patch("mkv_compress.wizard.prompt_profile_selection", return_value=selected_profile), \
+         patch("mkv_compress.wizard.maybe_save_profile"), \
+         patch("mkv_compress.wizard.analyze_directory", return_value=[recommended, maybe]) as mock_analyze, \
+         patch("mkv_compress.wizard.display_analysis_summary"), \
+         patch("mkv_compress.wizard.prompt_analysis_action", return_value="compress_recommended"), \
+         patch("mkv_compress.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
+         patch("mkv_compress.wizard.typer.confirm", return_value=True):
+        jobs, action = run_wizard(tmp_path, FFMPEG, FFPROBE, True, None, False, False, console)
+
+    assert action == "encode"
+    assert jobs == [fake_job]
+    mock_analyze.assert_called_once()
+    assert mock_build_jobs.call_args.kwargs["files"] == [source]
+
+
+def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
+    console = Console()
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    manifest_path = tmp_path / "analysis.json"
+
+    with patch("mkv_compress.wizard.scan_directory", return_value=[source]), \
+         patch("mkv_compress.wizard.get_duration_seconds", return_value=120.0), \
+         patch("mkv_compress.wizard.detect_available_encoders", return_value=[]), \
+         patch("mkv_compress.wizard.detect_device_labels", return_value={}), \
+         patch("mkv_compress.wizard.benchmark_encoder", return_value=1.0), \
+         patch("mkv_compress.wizard.display_profiles_table"), \
+         patch("mkv_compress.wizard.prompt_profile_selection", return_value=selected_profile), \
+         patch("mkv_compress.wizard.maybe_save_profile"), \
+         patch("mkv_compress.wizard.analyze_directory", return_value=[recommended]), \
+         patch("mkv_compress.wizard.display_analysis_summary"), \
+         patch("mkv_compress.wizard.prompt_analysis_action", return_value="export"), \
+         patch("mkv_compress.wizard.typer.prompt", return_value=str(manifest_path)), \
+         patch("mkv_compress.wizard.save_manifest") as mock_save_manifest, \
+         patch("mkv_compress.wizard.build_jobs") as mock_build_jobs:
+        jobs, action = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+
+    assert action == "export"
+    assert jobs == []
+    mock_save_manifest.assert_called_once()
+    mock_build_jobs.assert_not_called()
+
+
+def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> None:
+    console = Console()
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    maybe = _analysis_item(source, "maybe")
+    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+
+    with patch("mkv_compress.wizard.scan_directory", return_value=[source]), \
+         patch("mkv_compress.wizard.get_duration_seconds", return_value=120.0), \
+         patch("mkv_compress.wizard.detect_available_encoders", return_value=[]), \
+         patch("mkv_compress.wizard.detect_device_labels", return_value={}), \
+         patch("mkv_compress.wizard.benchmark_encoder", return_value=1.0), \
+         patch("mkv_compress.wizard.display_profiles_table"), \
+         patch("mkv_compress.wizard.prompt_profile_selection", return_value=selected_profile), \
+         patch("mkv_compress.wizard.maybe_save_profile"), \
+         patch("mkv_compress.wizard.analyze_directory", return_value=[maybe]), \
+         patch("mkv_compress.wizard.display_analysis_summary"), \
+         patch("mkv_compress.wizard.build_jobs") as mock_build_jobs:
+        jobs, action = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+
+    assert action == "cancel"
+    assert jobs == []
+    mock_build_jobs.assert_not_called()
+
+
+def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> None:
+    console = Console()
+    recommended_path = tmp_path / "ep01.mkv"
+    maybe_path = tmp_path / "ep02.mkv"
+    recommended_path.write_bytes(b"x" * 1000)
+    maybe_path.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(recommended_path, "recommended")
+    maybe = _analysis_item(maybe_path, "maybe")
+    fake_job = _job_for(recommended_path)
+    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+
+    with patch("mkv_compress.wizard.scan_directory", return_value=[recommended_path, maybe_path]), \
+         patch("mkv_compress.wizard.get_duration_seconds", return_value=120.0), \
+         patch("mkv_compress.wizard.detect_available_encoders", return_value=[]), \
+         patch("mkv_compress.wizard.detect_device_labels", return_value={}), \
+         patch("mkv_compress.wizard.benchmark_encoder", return_value=1.0), \
+         patch("mkv_compress.wizard.display_profiles_table"), \
+         patch("mkv_compress.wizard.prompt_profile_selection", return_value=selected_profile), \
+         patch("mkv_compress.wizard.maybe_save_profile"), \
+         patch("mkv_compress.wizard.analyze_directory", return_value=[recommended, maybe]), \
+         patch("mkv_compress.wizard.display_analysis_summary"), \
+         patch("mkv_compress.wizard.prompt_analysis_action", return_value="review_maybe"), \
+         patch("mkv_compress.wizard.review_maybe_items", return_value=True), \
+         patch("mkv_compress.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
+         patch("mkv_compress.wizard.typer.confirm", return_value=True):
+        jobs, action = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+
+    assert action == "encode"
+    assert jobs == [fake_job]
+    assert mock_build_jobs.call_args.kwargs["files"] == [recommended_path, maybe_path]
+
+
+def _analysis_item(source: Path, recommendation: str) -> AnalysisItem:
+    source.write_bytes(b"x")
+    return AnalysisItem(
+        source=source,
+        codec="h264",
+        size_bytes=2 * 1024**3,
+        duration_seconds=120.0,
+        bitrate_kbps=12000.0,
+        estimated_output_bytes=800 * 1024**2,
+        estimated_savings_bytes=(2 * 1024**3) - (800 * 1024**2),
+        recommendation=recommendation,
+        reason_code="reason",
+        reason_text="reason text",
+    )
+
+
+def _job_for(source: Path) -> EncodeJob:
+    return EncodeJob(
+        source=source,
+        output=source.with_stem(source.stem + "_compressed"),
+        tmp_output=source.parent / f".tmp_{source.stem}_compressed.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+        skip_reason=None,
+    )

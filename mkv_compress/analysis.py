@@ -9,7 +9,6 @@ from rich.table import Table
 from mkv_compress.encoder import estimate_output_size, get_duration_seconds, get_video_bitrate_kbps
 from mkv_compress.models import AnalysisItem, AnalysisManifest
 from mkv_compress.scanner import is_already_compressed, probe_video_codec, scan_directory
-from mkv_compress.wizard import benchmark_encoder
 
 MANIFEST_VERSION = 1
 
@@ -134,6 +133,8 @@ def estimate_analysis_encode_seconds(
     crf: int,
     ffmpeg: Path,
 ) -> float | None:
+    from mkv_compress.wizard import benchmark_encoder
+
     recommended = [item for item in items if item.recommendation == "recommended"]
     if not recommended:
         return 0.0

@@ -136,7 +136,7 @@ def test_estimate_analysis_encode_seconds_uses_recommended_only(tmp_path: Path) 
         duration_seconds=500.0,
     )
 
-    with patch("mkv_compress.analysis.benchmark_encoder", return_value=2.0):
+    with patch("mkv_compress.wizard.benchmark_encoder", return_value=2.0):
         estimate = estimate_analysis_encode_seconds([recommended, maybe], "fast", 20, FFMPEG)
 
     assert estimate == 50.0
