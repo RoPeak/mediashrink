@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mkv-compress"
+version = "0.1.0"
+description = "CLI tool to re-encode MKV files using H.265/HEVC for significant file size reduction."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "typer==0.12.3",
+  "click==8.1.7",
+  "rich==13.7.1",
+]
+
+[project.scripts]
+mkvcompress = "mkv_compress.cli:app"
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.2.2",
+  "pre-commit>=3.7,<5",
+]
+
+[tool.setuptools.packages.find]
+include = ["mkv_compress*"]
