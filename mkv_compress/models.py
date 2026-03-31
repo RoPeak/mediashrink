@@ -12,6 +12,8 @@ class EncodeJob:
     crf: int
     preset: str
     dry_run: bool
+    skip: bool = False
+    skip_reason: str | None = None
 
 
 @dataclass

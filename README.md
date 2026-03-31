@@ -3,6 +3,10 @@
 A CLI tool to re-encode MKV files using H.265/HEVC, reducing Blu-ray rips (~9 GB) to
 manageable sizes (~1–4 GB) while preserving all audio and subtitle streams.
 
+At CRF 20 (the default), expect roughly **60–75% file size reduction** — a 9 GB Blu-ray
+episode typically comes out around 1.5–3 GB with no perceptible quality loss at normal
+viewing distance. Files whose video stream is already H.265 are skipped automatically.
+
 Companion tool to [plexify](../plexify).
 
 ## Requirements
