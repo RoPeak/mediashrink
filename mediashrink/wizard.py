@@ -19,7 +19,13 @@ from mediashrink.analysis import (
     save_manifest,
 )
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
-from mediashrink.encoder import _HW_ENCODERS, encode_preview, get_duration_seconds, probe_encoder_available, validate_encoder
+from mediashrink.encoder import (
+    _HW_ENCODERS,
+    encode_preview,
+    get_duration_seconds,
+    probe_encoder_available,
+    validate_encoder,
+)
 from mediashrink.models import AnalysisItem, EncodeJob
 from mediashrink.platform_utils import detect_device_labels
 from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
@@ -38,7 +44,7 @@ _HARDWARE_DISPLAY_NAMES = {
 }
 _HW_ENCODER_CAVEATS: dict[str, str] = {
     "nvenc": "NVENC: consumer GPUs allow max 3 concurrent encode sessions.",
-    "amf":   "AMF: quality may vary on older Radeon GPUs; test output before batch use.",
+    "amf": "AMF: quality may vary on older Radeon GPUs; test output before batch use.",
 }
 
 
@@ -89,10 +95,7 @@ def detect_available_encoders(
 
     with console.status("[dim]Detecting hardware encoders...[/dim]", spinner="dots"):
         with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
-            futures = {
-                pool.submit(probe_encoder_available, key, ffmpeg): key
-                for key in candidates
-            }
+            futures = {pool.submit(probe_encoder_available, key, ffmpeg): key for key in candidates}
             detected: set[str] = set()
             for future in as_completed(futures):
                 key = futures[future]
@@ -146,22 +149,26 @@ def benchmark_encoder(
     else:
         video_flags = ["-c:v", "libx265", "-crf", str(crf), "-preset", encoder_key]
 
-    cmd = [
-        str(ffmpeg),
-        "-ss",
-        str(seek_pos),
-        "-i",
-        str(sample_file),
-        "-t",
-        str(clip_len),
-    ] + video_flags + [
-        "-an",
-        "-f",
-        "null",
-        "-",
-        "-loglevel",
-        "error",
-    ]
+    cmd = (
+        [
+            str(ffmpeg),
+            "-ss",
+            str(seek_pos),
+            "-i",
+            str(sample_file),
+            "-t",
+            str(clip_len),
+        ]
+        + video_flags
+        + [
+            "-an",
+            "-f",
+            "null",
+            "-",
+            "-loglevel",
+            "error",
+        ]
+    )
 
     try:
         start = time.monotonic()
@@ -209,7 +216,9 @@ def _sum_media_durations(files: list[Path], ffprobe: Path) -> float:
 _ENCODER_LABEL_MAX_CHARS = 22
 
 
-def _encoder_display_name(encoder_key: str, device_labels: dict[str, str], truncate: bool = False) -> str:
+def _encoder_display_name(
+    encoder_key: str, device_labels: dict[str, str], truncate: bool = False
+) -> str:
     if encoder_key in _HW_ENCODERS:
         label = device_labels.get(encoder_key)
         if label:
@@ -238,7 +247,7 @@ def build_profiles(
         profiles.append(
             EncoderProfile(
                 index=idx,
-                name=f"Fastest on this device",
+                name="Fastest on this device",
                 encoder_key=key,
                 crf=20,
                 sw_preset=None,
@@ -315,8 +324,8 @@ def build_profiles(
 
     # Built-in intent presets
     _BUILTIN_QUALITY_LABELS = {
-        "TV Batch":           "Very good",
-        "Archival":           "Visually lossless",
+        "TV Batch": "Very good",
+        "Archival": "Visually lossless",
         "Fast GPU Transcode": "Good",
         "Smallest Acceptable": "Acceptable",
     }
@@ -445,8 +454,12 @@ def display_profiles_table(
     console.print(table)
     console.print(f"  [dim]Total input: {_fmt_size(total_input_bytes)}[/dim]")
     console.print("  [dim]Time and size numbers are approximate estimates.[/dim]")
-    console.print("  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]")
-    console.print("  [dim]For lower wait time, choose Fastest on this device or Faster Encode.[/dim]")
+    console.print(
+        "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
+    )
+    console.print(
+        "  [dim]For lower wait time, choose Fastest on this device or Faster Encode.[/dim]"
+    )
     console.print()
 
 
@@ -486,7 +499,9 @@ def run_custom_wizard(available_hw: list[str], console: Console) -> tuple[str, i
 
     while True:
         try:
-            enc_idx = int(typer.prompt(f"Choose encoder [1-{len(encoder_choices)}]", default="1")) - 1
+            enc_idx = (
+                int(typer.prompt(f"Choose encoder [1-{len(encoder_choices)}]", default="1")) - 1
+            )
         except ValueError:
             enc_idx = -1
         if 0 <= enc_idx < len(encoder_choices):
@@ -497,7 +512,9 @@ def run_custom_wizard(available_hw: list[str], console: Console) -> tuple[str, i
 
     while True:
         try:
-            crf = int(typer.prompt("CRF quality value [0-51, lower = better quality]", default="20"))
+            crf = int(
+                typer.prompt("CRF quality value [0-51, lower = better quality]", default="20")
+            )
         except ValueError:
             crf = -1
         if 0 <= crf <= 51:
@@ -558,8 +575,14 @@ def display_candidate_table(title: str, items: list[AnalysisItem], console: Cons
     table.add_column("Est. Saving", justify="right", no_wrap=True)
     table.add_column("Reason")
 
-    for item in sorted(items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True)[:12]:
-        saving = "-" if item.estimated_savings_bytes <= 0 else f"~{_fmt_size(item.estimated_savings_bytes)}"
+    for item in sorted(
+        items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True
+    )[:12]:
+        saving = (
+            "-"
+            if item.estimated_savings_bytes <= 0
+            else f"~{_fmt_size(item.estimated_savings_bytes)}"
+        )
         table.add_row(
             item.source.name,
             item.codec or "?",
@@ -652,7 +675,9 @@ def run_wizard(
     if sample_duration <= 0:
         sample_duration = 3600.0
 
-    available_hw = detect_available_encoders(ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe)
+    available_hw = detect_available_encoders(
+        ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe
+    )
     device_labels = detect_device_labels()
 
     if available_hw:
@@ -685,7 +710,9 @@ def run_wizard(
 
     for hw_key in available_hw:
         if hw_key in _HW_ENCODER_CAVEATS:
-            console.print(f"  [dim yellow]Note:[/dim yellow] [dim]{_HW_ENCODER_CAVEATS[hw_key]}[/dim]")
+            console.print(
+                f"  [dim yellow]Note:[/dim yellow] [dim]{_HW_ENCODER_CAVEATS[hw_key]}[/dim]"
+            )
 
     if auto:
         selected = next((p for p in profiles if p.is_recommended), profiles[0])
@@ -704,7 +731,9 @@ def run_wizard(
     if not auto:
         maybe_save_profile(preset, crf, display_label, console)
 
-    if not auto and typer.confirm("Test encode the first 2 minutes before the full batch?", default=False):
+    if not auto and typer.confirm(
+        "Test encode the first 2 minutes before the full batch?", default=False
+    ):
         console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
         preview_result = encode_preview(
             source=sample_file,
@@ -715,9 +744,15 @@ def run_wizard(
             preset=preset,
         )
         from mediashrink.progress import EncodingDisplay
+
         EncodingDisplay(console).show_summary([preview_result])
         if not preview_result.success:
-            console.print("[yellow]Preview encode failed — continuing with full batch selection.[/yellow]")
+            if preview_result.error_message:
+                console.print(f"[red]Preview encode failed:[/red] {preview_result.error_message}")
+            else:
+                console.print("[red]Preview encode failed.[/red]")
+            if not typer.confirm("Continue to full batch anyway?", default=False):
+                return [], "cancel", False
 
     analysis_items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
     estimated_total_encode_seconds = estimate_analysis_encode_seconds(
@@ -735,7 +770,11 @@ def run_wizard(
         console.print("[dim]No recommended files were found for automatic compression.[/dim]")
         return [], "cancel", False
 
-    action = "compress_recommended" if auto else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
+    action = (
+        "compress_recommended"
+        if auto
+        else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
+    )
     if action == "cancel":
         return [], "cancel", False
     if action == "export":
@@ -778,12 +817,18 @@ def run_wizard(
     console.print()
     console.print("[bold]Ready to encode[/bold]")
     console.print(f"  Files:    {len(to_encode)}")
-    console.print(f"  Encoder:  {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}")
+    console.print(
+        f"  Encoder:  {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}"
+    )
     console.print(f"  CRF:      {crf}")
     selected_input_bytes = sum(item.size_bytes for item in selected_items)
-    selected_output_bytes = sum(item.estimated_output_bytes for item in selected_items if item.estimated_output_bytes > 0)
+    selected_output_bytes = sum(
+        item.estimated_output_bytes for item in selected_items if item.estimated_output_bytes > 0
+    )
     selected_saved_bytes = sum(item.estimated_savings_bytes for item in selected_items)
-    selected_saved_pct = selected_saved_bytes / selected_input_bytes * 100 if selected_input_bytes else 0.0
+    selected_saved_pct = (
+        selected_saved_bytes / selected_input_bytes * 100 if selected_input_bytes else 0.0
+    )
     console.print(f"  Input:    {_fmt_size(selected_input_bytes)}")
     if selected_output_bytes > 0:
         console.print(
@@ -793,11 +838,17 @@ def run_wizard(
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
     if preset in _HW_ENCODERS:
-        console.print("  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]")
+        console.print(
+            "  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]"
+        )
     elif preset in {"faster", "ultrafast"}:
-        console.print("  [dim]This favors faster completion over maximum compression efficiency.[/dim]")
+        console.print(
+            "  [dim]This favors faster completion over maximum compression efficiency.[/dim]"
+        )
     else:
-        console.print("  [dim]Slower software presets trade more time for slightly smaller files.[/dim]")
+        console.print(
+            "  [dim]Slower software presets trade more time for slightly smaller files.[/dim]"
+        )
 
     if not to_encode[0].output.parent.exists():
         console.print(f"  Output:   {to_encode[0].output.parent}")
@@ -805,9 +856,7 @@ def run_wizard(
 
     cleanup_after = False
     if not overwrite and output_dir is None and not auto:
-        cleanup_after = typer.confirm(
-            "  Delete originals after successful encodes?", default=False
-        )
+        cleanup_after = typer.confirm("  Delete originals after successful encodes?", default=False)
     console.print()
 
     if not auto:

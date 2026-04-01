@@ -14,9 +14,12 @@ def get_duration_seconds(path: Path, ffprobe: Path) -> float:
     """Return the total duration of the media file in seconds."""
     cmd = [
         str(ffprobe),
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=nw=1:nk=1",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nw=1:nk=1",
         str(path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -31,10 +34,14 @@ def get_video_bitrate_kbps(path: Path, ffprobe: Path) -> float:
     """Return the video stream bitrate in kbps, or 0.0 on failure."""
     cmd = [
         str(ffprobe),
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=bit_rate",
-        "-of", "default=nw=1:nk=1",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=bit_rate",
+        "-of",
+        "default=nw=1:nk=1",
         str(path),
     ]
     try:
@@ -51,10 +58,10 @@ def get_video_bitrate_kbps(path: Path, ffprobe: Path) -> float:
 # Represents the expected output-to-input size ratio after H.265 encoding.
 # Calibrated against real-world encodes (vc1/mpeg2 values from observed runs).
 _CODEC_BASE_FACTOR: dict[str, float] = {
-    "h264":       0.50,
-    "vc1":        0.48,
+    "h264": 0.50,
+    "vc1": 0.48,
     "mpeg2video": 0.48,
-    "hevc":       1.00,  # already H.265 — no meaningful savings expected
+    "hevc": 1.00,  # already H.265 — no meaningful savings expected
 }
 _DEFAULT_CODEC_FACTOR = 0.45  # used for unknown/unlisted codecs
 
@@ -63,10 +70,14 @@ def get_video_resolution(path: Path, ffprobe: Path) -> tuple[int, int]:
     """Return (width, height) of the first video stream, or (0, 0) on failure."""
     cmd = [
         str(ffprobe),
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "default=nw=1",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "default=nw=1",
         str(path),
     ]
     try:
@@ -89,11 +100,11 @@ def _resolution_factor(width: int, height: int) -> float:
     4K content tends to compress more efficiently (more spatial redundancy);
     SD/720p has less room for improvement.
     """
-    if width > 2000:   # 4K / UHD
+    if width > 2000:  # 4K / UHD
         return 0.85
     if width >= 1280:  # 1080p / 720p
         return 1.00
-    return 1.10        # SD — less redundancy, harder to compress
+    return 1.10  # SD — less redundancy, harder to compress
 
 
 def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, crf: int = 20) -> int:
@@ -147,9 +158,9 @@ def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, cr
 # Maps preset alias -> (ffmpeg encoder name, quality flag, extra flags)
 # Extra flags include per-encoder quality tuning derived from real-world defaults.
 _HW_ENCODERS: dict[str, tuple[str, str, list[str]]] = {
-    "qsv":   ("hevc_qsv",   "-global_quality", ["-preset", "medium", "-look_ahead", "1"]),
-    "nvenc": ("hevc_nvenc", "-cq",              ["-rc", "vbr", "-preset", "p4", "-tune", "hq", "-bf", "3"]),
-    "amf":   ("hevc_amf",  "-qp_i",            ["-qp_p", "0", "-quality", "balanced", "-bf_ref", "1"]),
+    "qsv": ("hevc_qsv", "-global_quality", ["-preset", "medium", "-look_ahead", "1"]),
+    "nvenc": ("hevc_nvenc", "-cq", ["-rc", "vbr", "-preset", "p4", "-tune", "hq", "-bf", "3"]),
+    "amf": ("hevc_amf", "-qp_i", ["-rc", "cqp", "-quality", "balanced", "-bf_ref", "1"]),
 }
 
 
@@ -174,15 +185,26 @@ def probe_encoder_available(encoder_key: str, ffmpeg: Path) -> bool:
     encoder_name, _, extra_flags = _HW_ENCODERS[encoder_key]
     quality_args = _hw_quality_args(encoder_key, 28)
 
-    cmd = [
-        str(ffmpeg),
-        "-f", "lavfi",
-        "-i", "color=black:s=256x256:r=1",
-        "-t", "1",
-        "-c:v", encoder_name,
-    ] + quality_args + extra_flags + [
-        "-f", "null", "-",
-    ]
+    cmd = (
+        [
+            str(ffmpeg),
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:s=256x256:r=1",
+            "-t",
+            "1",
+            "-c:v",
+            encoder_name,
+        ]
+        + quality_args
+        + extra_flags
+        + [
+            "-f",
+            "null",
+            "-",
+        ]
+    )
 
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=15)
@@ -211,16 +233,29 @@ def validate_encoder(
     encoder_name, _, extra_flags = _HW_ENCODERS[encoder_key]
     quality_args = _hw_quality_args(encoder_key, 28)
 
-    cmd = [
-        str(ffmpeg),
-        "-ss", str(seek),
-        "-i", str(sample_file),
-        "-t", "3",
-        "-c:v", encoder_name,
-    ] + quality_args + extra_flags + [
-        "-an", "-f", "null", "-",
-        "-loglevel", "error",
-    ]
+    cmd = (
+        [
+            str(ffmpeg),
+            "-ss",
+            str(seek),
+            "-i",
+            str(sample_file),
+            "-t",
+            "3",
+            "-c:v",
+            encoder_name,
+        ]
+        + quality_args
+        + extra_flags
+        + [
+            "-an",
+            "-f",
+            "null",
+            "-",
+            "-loglevel",
+            "error",
+        ]
+    )
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -266,21 +301,37 @@ def _build_sw_command(
     duration_limit_seconds: float | None = None,
 ) -> list[str]:
     """Software encode via libx265."""
-    return [
-        str(ffmpeg),
-        "-i", str(job.source),
-        "-map", "0",
-        "-c:v", "libx265",
-        "-crf", str(job.crf),
-        "-preset", job.preset,
-        "-c:a", "copy",
-        "-c:s", "copy",
-        "-tag:v", "hvc1",
-        "-movflags", "+faststart",
-        "-loglevel", "error",
-        "-progress", "pipe:1",
-        "-stats_period", "2",
-    ] + _duration_flags(duration_limit_seconds) + [str(job.tmp_output)]
+    return (
+        [
+            str(ffmpeg),
+            "-i",
+            str(job.source),
+            "-map",
+            "0",
+            "-c:v",
+            "libx265",
+            "-crf",
+            str(job.crf),
+            "-preset",
+            job.preset,
+            "-c:a",
+            "copy",
+            "-c:s",
+            "copy",
+            "-tag:v",
+            "hvc1",
+            "-movflags",
+            "+faststart",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "2",
+        ]
+        + _duration_flags(duration_limit_seconds)
+        + [str(job.tmp_output)]
+    )
 
 
 def _build_hw_command(
@@ -294,20 +345,30 @@ def _build_hw_command(
 
     cmd = [
         str(ffmpeg),
-        "-i", str(job.source),
-        "-map", "0",
-        "-c:v", encoder,
+        "-i",
+        str(job.source),
+        "-map",
+        "0",
+        "-c:v",
+        encoder,
     ]
     cmd += quality_args
     cmd += extra
     cmd += [
-        "-c:a", "copy",
-        "-c:s", "copy",
-        "-tag:v", "hvc1",
-        "-movflags", "+faststart",
-        "-loglevel", "error",
-        "-progress", "pipe:1",
-        "-stats_period", "2",
+        "-c:a",
+        "copy",
+        "-c:s",
+        "copy",
+        "-tag:v",
+        "hvc1",
+        "-movflags",
+        "+faststart",
+        "-loglevel",
+        "error",
+        "-progress",
+        "pipe:1",
+        "-stats_period",
+        "2",
     ]
     cmd += _duration_flags(duration_limit_seconds)
     cmd += [str(job.tmp_output)]
@@ -386,8 +447,8 @@ def encode_file(
 
     stderr_thread: threading.Thread | None = None
     if log_path is not None and process.stderr is not None:
+
         def _drain_stderr(src: object, dst: Path) -> None:
-            import io
             assert hasattr(src, "read")
             with dst.open("a", encoding="utf-8", errors="replace") as fh:
                 for line in src:  # type: ignore[union-attr]
@@ -407,7 +468,7 @@ def encode_file(
                     # FFmpeg names the field out_time_ms but unit is microseconds
                     out_us = float(parsed["out_time_ms"])
                     if total_duration > 0:
-                        pct = min((out_us / 1_000_000) / total_duration * 100, 100.0)
+                        pct = min((out_us / 1_000_000) / media_duration * 100, 100.0)
                         progress_callback(pct)
                 except ValueError:
                     pass
@@ -470,7 +531,10 @@ def encode_preview(
 
     Output path: `<stem>_preview<suffix>` alongside the source.
     The source is never modified. The preview is NOT a session entry.
+    Stderr is captured to a temp log file so failures include a useful error message.
     """
+    import tempfile
+
     output = source.parent / f"{source.stem}_preview{source.suffix}"
     tmp_output = source.parent / f".tmp_{source.stem}_preview{source.suffix}"
     job = EncodeJob(
@@ -483,4 +547,27 @@ def encode_preview(
         skip=False,
     )
     limit = duration_minutes * 60.0
-    return encode_file(job, ffmpeg, ffprobe, duration_limit_seconds=limit)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as tf:
+        log_path = Path(tf.name)
+
+    try:
+        result = encode_file(job, ffmpeg, ffprobe, duration_limit_seconds=limit, log_path=log_path)
+        if not result.success and log_path.exists():
+            stderr_text = log_path.read_text(encoding="utf-8", errors="replace").strip()
+            if stderr_text:
+                last_lines = "\n".join(stderr_text.splitlines()[-5:])
+                result = EncodeResult(
+                    job=result.job,
+                    skipped=result.skipped,
+                    skip_reason=result.skip_reason,
+                    success=False,
+                    input_size_bytes=result.input_size_bytes,
+                    output_size_bytes=result.output_size_bytes,
+                    duration_seconds=result.duration_seconds,
+                    error_message=last_lines,
+                )
+        return result
+    finally:
+        if log_path.exists():
+            log_path.unlink()

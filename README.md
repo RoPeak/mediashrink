@@ -1,5 +1,7 @@
 # mediashrink
 
+[![CI](https://github.com/RoPeak/mediashrink/actions/workflows/ci.yml/badge.svg)](https://github.com/RoPeak/mediashrink/actions/workflows/ci.yml)
+
 A CLI tool to re-encode supported video files (`.mkv`, `.mp4`, `.m4v`) to H.265/HEVC, keeping all audio and subtitle streams while cutting file sizes substantially.
 
 For Blu-ray-era H.264 or VC-1 sources, CRF 20 often lands around a 50-70% reduction with little visible loss in normal TV/movie viewing. Files already using HEVC are skipped by default.
