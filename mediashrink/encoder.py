@@ -19,7 +19,10 @@ def get_duration_seconds(path: Path, ffprobe: Path) -> float:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     raw = result.stdout.strip()
-    return float(raw) if raw else 0.0
+    try:
+        return float(raw) if raw else 0.0
+    except ValueError:
+        return 0.0
 
 
 def get_video_bitrate_kbps(path: Path, ffprobe: Path) -> float:

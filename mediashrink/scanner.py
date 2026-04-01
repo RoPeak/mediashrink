@@ -20,7 +20,12 @@ def _natural_sort_key(path: Path) -> list[int | str]:
 def scan_directory(directory: Path, recursive: bool = False) -> list[Path]:
     """Return naturally sorted list of supported video files in directory."""
     patterns = [f"**/*{ext}" if recursive else f"*{ext}" for ext in SUPPORTED_EXTENSIONS]
-    files = [path for pattern in patterns for path in directory.glob(pattern) if path.is_file()]
+    files = [
+        path
+        for pattern in patterns
+        for path in directory.glob(pattern)
+        if path.is_file() and not path.name.startswith(".tmp_")
+    ]
     return sorted(files, key=_natural_sort_key)
 
 
