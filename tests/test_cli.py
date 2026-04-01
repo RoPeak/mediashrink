@@ -62,9 +62,11 @@ def test_ffmpeg_not_found_error(tmp_path: Path) -> None:
 def test_no_supported_video_files(tmp_path: Path) -> None:
     (tmp_path / "cover.jpg").touch()
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+    ):
         result = runner.invoke(app, [str(tmp_path)])
 
     assert result.exit_code == 1
@@ -79,12 +81,14 @@ def test_dry_run_no_encoding(tmp_path: Path) -> None:
     fake_job.dry_run = True
     fake_result = _make_result(fake_job, output_size_bytes=0)
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[mkv]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.cli.encode_file", return_value=fake_result):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[mkv]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
         result = runner.invoke(app, [str(tmp_path), "--dry-run", "--yes"])
 
     assert result.exit_code == 0
@@ -97,14 +101,16 @@ def test_yes_flag_skips_prompt(tmp_path: Path) -> None:
     fake_job = _make_job(mkv)
     fake_result = _make_result(fake_job)
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[mkv]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.cli.encode_file", return_value=fake_result), \
-         patch("mediashrink.progress.typer.confirm") as mock_confirm, \
-         patch("mediashrink.cli.typer.confirm") as mock_cleanup_confirm:
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[mkv]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+        patch("mediashrink.progress.typer.confirm") as mock_confirm,
+        patch("mediashrink.cli.typer.confirm") as mock_cleanup_confirm,
+    ):
         result = runner.invoke(app, [str(tmp_path), "--yes"])
 
     mock_confirm.assert_not_called()
@@ -120,12 +126,14 @@ def test_all_skipped_no_encoding(tmp_path: Path) -> None:
     fake_job.skip = True
     fake_job.skip_reason = "already HEVC"
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[mkv]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.cli.encode_file") as mock_encode:
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[mkv]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file") as mock_encode,
+    ):
         result = runner.invoke(app, [str(tmp_path)])
 
     mock_encode.assert_not_called()
@@ -142,12 +150,14 @@ def test_profile_option_applies_saved_settings(tmp_path: Path, monkeypatch) -> N
 
     upsert_profile(SavedProfile(name="tv", preset="nvenc", crf=24, created_from_wizard=True))
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.cli.encode_file", return_value=fake_result):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
         result = runner.invoke(app, [str(tmp_path), "--profile", "tv", "--yes"])
 
     assert result.exit_code == 0
@@ -164,12 +174,14 @@ def test_explicit_flags_override_profile(tmp_path: Path, monkeypatch) -> None:
 
     upsert_profile(SavedProfile(name="tv", preset="nvenc", crf=24))
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.cli.encode_file", return_value=fake_result):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
         result = runner.invoke(
             app,
             [str(tmp_path), "--profile", "tv", "--crf", "18", "--preset", "slow", "--yes"],
@@ -182,7 +194,9 @@ def test_explicit_flags_override_profile(tmp_path: Path, monkeypatch) -> None:
 
 def test_profiles_list_and_delete(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
-    upsert_profile(SavedProfile(name="tv", preset="fast", crf=20, label="Balanced", created_from_wizard=True))
+    upsert_profile(
+        SavedProfile(name="tv", preset="fast", crf=20, label="Balanced", created_from_wizard=True)
+    )
 
     list_result = runner.invoke(app, ["profiles", "list"])
     delete_result = runner.invoke(app, ["profiles", "delete", "tv"])
@@ -204,9 +218,13 @@ def test_wizard_subcommand_registered() -> None:
 
 
 def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
-    with patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)), \
-         patch("mediashrink.cli.EncodingDisplay"), \
-         patch("mediashrink.wizard.run_wizard", return_value=([], "cancel", False)) as mock_run_wizard:
+    with (
+        patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.cli.EncodingDisplay"),
+        patch(
+            "mediashrink.wizard.run_wizard", return_value=([], "cancel", False)
+        ) as mock_run_wizard,
+    ):
         result = runner.invoke(app, ["wizard", str(tmp_path)])
 
     assert result.exit_code == 3
@@ -230,12 +248,16 @@ def test_analyze_writes_manifest(tmp_path: Path) -> None:
         reason_text="legacy codec with strong projected space savings",
     )
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.analyze_directory", return_value=[item]), \
-         patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0):
-        result = runner.invoke(app, ["analyze", str(tmp_path), "--manifest-out", str(manifest_path)])
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.analyze_directory", return_value=[item]),
+        patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0),
+    ):
+        result = runner.invoke(
+            app, ["analyze", str(tmp_path), "--manifest-out", str(manifest_path)]
+        )
 
     assert result.exit_code == 0
     assert manifest_path.exists()
@@ -260,16 +282,29 @@ def test_analyze_profile_and_explicit_overrides_apply(tmp_path: Path, monkeypatc
         reason_text="legacy codec with strong projected space savings",
     )
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.analyze_directory", return_value=[item]), \
-         patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0), \
-         patch("mediashrink.cli.build_manifest") as mock_build_manifest, \
-         patch("mediashrink.cli.save_manifest") as mock_save_manifest:
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.analyze_directory", return_value=[item]),
+        patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0),
+        patch("mediashrink.cli.build_manifest") as mock_build_manifest,
+        patch("mediashrink.cli.save_manifest") as mock_save_manifest,
+    ):
         result = runner.invoke(
             app,
-            ["analyze", str(tmp_path), "--profile", "tv", "--crf", "18", "--preset", "slow", "--manifest-out", str(tmp_path / "analysis.json")],
+            [
+                "analyze",
+                str(tmp_path),
+                "--profile",
+                "tv",
+                "--crf",
+                "18",
+                "--preset",
+                "slow",
+                "--manifest-out",
+                str(tmp_path / "analysis.json"),
+            ],
         )
 
     assert result.exit_code == 0
@@ -309,11 +344,13 @@ def test_apply_uses_manifest_settings(tmp_path: Path) -> None:
     manifest_path = tmp_path / "analysis.json"
     save_manifest(manifest, manifest_path)
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.cli.encode_file", return_value=fake_result):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
         result = runner.invoke(app, ["apply", str(manifest_path), "--yes"])
 
     assert result.exit_code == 0
@@ -353,12 +390,27 @@ def test_apply_explicit_overrides_manifest(tmp_path: Path, monkeypatch) -> None:
     manifest_path = tmp_path / "analysis.json"
     save_manifest(manifest, manifest_path)
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.cli.encode_file", return_value=fake_result):
-        result = runner.invoke(app, ["apply", str(manifest_path), "--profile", "tv", "--crf", "18", "--preset", "slow", "--yes"])
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "apply",
+                str(manifest_path),
+                "--profile",
+                "tv",
+                "--crf",
+                "18",
+                "--preset",
+                "slow",
+                "--yes",
+            ],
+        )
 
     assert result.exit_code == 0
     assert mock_build_jobs.call_args.kwargs["crf"] == 18
@@ -408,11 +460,13 @@ def test_apply_reports_missing_manifest_files(tmp_path: Path) -> None:
     manifest_path = tmp_path / "analysis.json"
     save_manifest(manifest, manifest_path)
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.cli.encode_file", return_value=fake_result):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
         result = runner.invoke(app, ["apply", str(manifest_path), "--yes"])
 
     assert result.exit_code == 0
@@ -427,15 +481,17 @@ def test_encode_prompts_for_cleanup_after_successful_side_by_side_run(tmp_path: 
     fake_result = _make_result(fake_job)
     fake_job.output.write_bytes(b"compressed")
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.cli.encode_file", return_value=fake_result), \
-         patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True), \
-         patch("mediashrink.cli.typer.confirm", return_value=False) as mock_cleanup_confirm, \
-         patch("mediashrink.cli.cleanup_successful_results") as mock_cleanup:
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+        patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True),
+        patch("mediashrink.cli.typer.confirm", return_value=False) as mock_cleanup_confirm,
+        patch("mediashrink.cli.cleanup_successful_results") as mock_cleanup,
+    ):
         result = runner.invoke(app, [str(tmp_path)])
 
     assert result.exit_code == 0
@@ -450,15 +506,17 @@ def test_encode_cleanup_flag_runs_without_prompt(tmp_path: Path) -> None:
     fake_result = _make_result(fake_job)
     fake_job.output.write_bytes(b"compressed")
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.cli.encode_file", return_value=fake_result), \
-         patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True), \
-         patch("mediashrink.cli.typer.confirm") as mock_cleanup_confirm, \
-         patch("mediashrink.cli.cleanup_successful_results", return_value=[source]) as mock_cleanup:
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+        patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True),
+        patch("mediashrink.cli.typer.confirm") as mock_cleanup_confirm,
+        patch("mediashrink.cli.cleanup_successful_results", return_value=[source]) as mock_cleanup,
+    ):
         result = runner.invoke(app, [str(tmp_path), "--cleanup", "--yes"])
 
     assert result.exit_code == 0
@@ -496,12 +554,14 @@ def test_apply_yes_does_not_prompt_for_cleanup_without_flag(tmp_path: Path) -> N
     manifest_path = tmp_path / "analysis.json"
     save_manifest(manifest, manifest_path)
 
-    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.cli.encode_file", return_value=fake_result), \
-         patch("mediashrink.cli.typer.confirm") as mock_cleanup_confirm:
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+        patch("mediashrink.cli.typer.confirm") as mock_cleanup_confirm,
+    ):
         result = runner.invoke(app, ["apply", str(manifest_path), "--yes"])
 
     assert result.exit_code == 0
@@ -511,6 +571,7 @@ def test_apply_yes_does_not_prompt_for_cleanup_without_flag(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 # Stage 6 — preview command
 # ---------------------------------------------------------------------------
+
 
 def test_preview_command_exits_zero(tmp_path: Path) -> None:
     source = tmp_path / "film.mkv"
@@ -535,9 +596,12 @@ def test_preview_command_exits_zero(tmp_path: Path) -> None:
         duration_seconds=1.0,
     )
 
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.encode_preview", return_value=fake_result):
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.encode_preview", return_value=fake_result),
+    ):
         result = runner.invoke(app, ["preview", str(source)])
 
     assert result.exit_code == 0
@@ -547,8 +611,10 @@ def test_preview_command_unsupported_ext(tmp_path: Path) -> None:
     source = tmp_path / "image.jpg"
     source.write_bytes(b"fake")
 
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE):
+    with (
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+    ):
         result = runner.invoke(app, ["preview", str(source)])
 
     assert result.exit_code != 0
@@ -558,12 +624,16 @@ def test_preview_command_unsupported_ext(tmp_path: Path) -> None:
 # Stage 7 — Exit codes
 # ---------------------------------------------------------------------------
 
+
 def test_exit_no_files_is_1(tmp_path: Path) -> None:
     from mediashrink.cli import EXIT_NO_FILES
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.scan_directory", return_value=[]):
+
+    with (
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.scan_directory", return_value=[]),
+    ):
         result = runner.invoke(app, ["encode", str(tmp_path)])
     assert result.exit_code == EXIT_NO_FILES
     assert EXIT_NO_FILES == 1
@@ -571,6 +641,7 @@ def test_exit_no_files_is_1(tmp_path: Path) -> None:
 
 def test_exit_ffmpeg_not_found_is_4(tmp_path: Path) -> None:
     from mediashrink.cli import EXIT_FFMPEG_NOT_FOUND
+
     with patch("mediashrink.cli.check_ffmpeg_available", return_value=(False, "ffmpeg not found")):
         result = runner.invoke(app, ["encode", str(tmp_path)])
     assert result.exit_code == EXIT_FFMPEG_NOT_FOUND
@@ -579,11 +650,13 @@ def test_exit_ffmpeg_not_found_is_4(tmp_path: Path) -> None:
 
 def test_exit_success_is_0() -> None:
     from mediashrink.cli import EXIT_SUCCESS
+
     assert EXIT_SUCCESS == 0
 
 
 def test_exit_encode_failures_is_2(tmp_path: Path) -> None:
     from mediashrink.cli import EXIT_ENCODE_FAILURES
+
     source = tmp_path / "vid.mkv"
     source.write_bytes(b"x" * 100)
 
@@ -607,12 +680,14 @@ def test_exit_encode_failures_is_2(tmp_path: Path) -> None:
         error_message="FFmpeg exited with code 1",
     )
 
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[job]), \
-         patch("mediashrink.cli._run_encode_loop", return_value=[failed_result]):
+    with (
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch("mediashrink.cli._run_encode_loop", return_value=[failed_result]),
+    ):
         result = runner.invoke(app, ["encode", str(tmp_path), "--yes"])
 
     assert result.exit_code == EXIT_ENCODE_FAILURES
@@ -623,6 +698,7 @@ def test_exit_encode_failures_is_2(tmp_path: Path) -> None:
 # Stage 8 — JSON output and verbose logging
 # ---------------------------------------------------------------------------
 
+
 def test_json_flag_outputs_valid_json(tmp_path: Path) -> None:
     source = tmp_path / "vid.mkv"
     source.write_bytes(b"x" * 1000)
@@ -631,19 +707,29 @@ def test_json_flag_outputs_valid_json(tmp_path: Path) -> None:
         source=source,
         output=tmp_path / "vid_out.mkv",
         tmp_output=tmp_path / ".tmp_vid_out.mkv",
-        crf=20, preset="fast", dry_run=False, skip=False,
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
     )
     ok_result = EncodeResult(
-        job=job, skipped=False, skip_reason=None, success=True,
-        input_size_bytes=1000, output_size_bytes=500, duration_seconds=1.0,
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=1.0,
     )
 
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[job]), \
-         patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]):
+    with (
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]),
+    ):
         result = runner.invoke(app, ["encode", str(tmp_path), "--yes", "--json"])
 
     assert result.exit_code == 0
@@ -661,23 +747,35 @@ def test_json_flag_suppresses_rich_markup(tmp_path: Path) -> None:
         source=source,
         output=tmp_path / "vid_out.mkv",
         tmp_output=tmp_path / ".tmp_vid_out.mkv",
-        crf=20, preset="fast", dry_run=False, skip=False,
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
     )
     ok_result = EncodeResult(
-        job=job, skipped=False, skip_reason=None, success=True,
-        input_size_bytes=1000, output_size_bytes=500, duration_seconds=1.0,
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=1.0,
     )
 
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[job]), \
-         patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]):
+    with (
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]),
+    ):
         result = runner.invoke(app, ["encode", str(tmp_path), "--yes", "--json"])
 
     # Output should be a single JSON line — no Rich markup tags
-    assert "[" not in result.stdout.split("\n")[0].replace("[", "").replace("]", "") or result.stdout.strip().startswith("{")
+    assert "[" not in result.stdout.split("\n")[0].replace("[", "").replace(
+        "]", ""
+    ) or result.stdout.strip().startswith("{")
     assert result.stdout.strip().startswith("{")
 
 
@@ -689,19 +787,29 @@ def test_verbose_flag_creates_log_file(tmp_path: Path) -> None:
         source=source,
         output=tmp_path / "vid_out.mkv",
         tmp_output=tmp_path / ".tmp_vid_out.mkv",
-        crf=20, preset="fast", dry_run=False, skip=False,
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
     )
     ok_result = EncodeResult(
-        job=job, skipped=False, skip_reason=None, success=True,
-        input_size_bytes=1000, output_size_bytes=500, duration_seconds=1.0,
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=1.0,
     )
 
-    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
-         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
-         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
-         patch("mediashrink.cli.scan_directory", return_value=[source]), \
-         patch("mediashrink.cli.build_jobs", return_value=[job]), \
-         patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]) as mock_loop:
+    with (
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]) as mock_loop,
+    ):
         result = runner.invoke(app, ["encode", str(tmp_path), "--yes", "--verbose"])
 
     assert result.exit_code == 0
@@ -716,6 +824,7 @@ def test_verbose_flag_creates_log_file(tmp_path: Path) -> None:
 # Stage 10 — UX polish regression tests
 # ---------------------------------------------------------------------------
 
+
 def test_progress_bar_nonzero_total(tmp_path: Path) -> None:
     """Per-file task total passed to progress.update must never be zero."""
     from mediashrink.cli import _run_encode_loop
@@ -727,12 +836,20 @@ def test_progress_bar_nonzero_total(tmp_path: Path) -> None:
         source=source,
         output=tmp_path / "vid_out.mkv",
         tmp_output=tmp_path / ".tmp_vid_out.mkv",
-        crf=20, preset="fast", dry_run=False, skip=True,
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=True,
         skip_reason="already HEVC",
     )
     ok_result = EncodeResult(
-        job=job, skipped=True, skip_reason="already HEVC", success=False,
-        input_size_bytes=5_000_000, output_size_bytes=0, duration_seconds=0.0,
+        job=job,
+        skipped=True,
+        skip_reason="already HEVC",
+        success=False,
+        input_size_bytes=5_000_000,
+        output_size_bytes=0,
+        duration_seconds=0.0,
     )
 
     mock_progress = MagicMock()
@@ -749,9 +866,7 @@ def test_progress_bar_nonzero_total(tmp_path: Path) -> None:
 
     # Collect all 'total' kwargs passed to progress.update
     totals = [
-        kwargs["total"]
-        for _, kwargs in mock_progress.update.call_args_list
-        if "total" in kwargs
+        kwargs["total"] for _, kwargs in mock_progress.update.call_args_list if "total" in kwargs
     ]
     assert totals, "progress.update was never called with a total="
     assert all(t >= 1 for t in totals), f"Found zero or negative total: {totals}"
