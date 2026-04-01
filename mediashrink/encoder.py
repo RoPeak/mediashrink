@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from mkv_compress.models import EncodeJob, EncodeResult
+from mediashrink.models import EncodeJob, EncodeResult
 
 
 def get_duration_seconds(path: Path, ffprobe: Path) -> float:

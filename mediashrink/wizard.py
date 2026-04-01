@@ -11,18 +11,18 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from mkv_compress.analysis import (
+from mediashrink.analysis import (
     analyze_directory,
     build_manifest,
     display_analysis_summary,
     estimate_analysis_encode_seconds,
     save_manifest,
 )
-from mkv_compress.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available
-from mkv_compress.models import AnalysisItem, EncodeJob
-from mkv_compress.platform_utils import detect_device_labels
-from mkv_compress.profiles import SavedProfile, upsert_profile
-from mkv_compress.scanner import build_jobs, scan_directory, supported_formats_label
+from mediashrink.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available
+from mediashrink.models import AnalysisItem, EncodeJob
+from mediashrink.platform_utils import detect_device_labels
+from mediashrink.profiles import SavedProfile, upsert_profile
+from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
 
 _GB = 1024**3
 _MB = 1024**2
@@ -558,7 +558,7 @@ def run_wizard(
     console: Console,
 ) -> tuple[list[EncodeJob], str]:
     """Run the interactive wizard and return (jobs, action)."""
-    console.print("\n[bold cyan]mkvcompress wizard[/bold cyan]")
+    console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
     console.print("[dim]Scanning files and detecting hardware...[/dim]\n")
 
     files = scan_directory(directory, recursive=recursive)
@@ -651,7 +651,7 @@ def run_wizard(
             estimated_total_encode_seconds=estimated_total_encode_seconds,
             items=analysis_items,
         )
-        default_manifest_path = directory / "mkvcompress-analysis.json"
+        default_manifest_path = directory / "mediashrink-analysis.json"
         manifest_path = Path(typer.prompt("Manifest path", default=str(default_manifest_path)))
         save_manifest(manifest, manifest_path)
         console.print(f"[green]Wrote manifest[/green] {manifest_path}")

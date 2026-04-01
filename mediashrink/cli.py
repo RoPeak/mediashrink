@@ -9,7 +9,7 @@ import typer
 from rich.console import Console
 from typer.core import TyperGroup
 
-from mkv_compress.analysis import (
+from mediashrink.analysis import (
     analyze_directory,
     build_manifest,
     display_analysis_summary,
@@ -17,17 +17,17 @@ from mkv_compress.analysis import (
     load_manifest,
     save_manifest,
 )
-from mkv_compress.cleanup import cleanup_successful_results, eligible_cleanup_results
-from mkv_compress.encoder import encode_file
-from mkv_compress.models import EncodeJob, EncodeResult
-from mkv_compress.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
-from mkv_compress.profiles import delete_profile, get_profile, load_profiles
-from mkv_compress.progress import EncodingDisplay
-from mkv_compress.scanner import build_jobs, scan_directory, supported_formats_label
+from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
+from mediashrink.encoder import encode_file
+from mediashrink.models import EncodeJob, EncodeResult
+from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
+from mediashrink.profiles import delete_profile, get_profile, load_profiles
+from mediashrink.progress import EncodingDisplay
+from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
 
 
 class DefaultCommandGroup(TyperGroup):
-    """Route bare `mkvcompress ...` invocations to the hidden encode command."""
+    """Route bare `mediashrink ...` invocations to the hidden encode command."""
 
     default_command_name = "encode"
 
@@ -38,7 +38,7 @@ class DefaultCommandGroup(TyperGroup):
 
 
 app = typer.Typer(
-    name="mkvcompress",
+    name="mediashrink",
     help=f"Re-encode supported video files ({supported_formats_label()}) to H.265/HEVC to reduce file size.",
     add_completion=False,
     cls=DefaultCommandGroup,
@@ -474,7 +474,7 @@ def wizard(
     ),
 ) -> None:
     """Interactively detect hardware, choose settings, and optionally save a profile."""
-    from mkv_compress.wizard import run_wizard
+    from mediashrink.wizard import run_wizard
 
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     display = EncodingDisplay(console)

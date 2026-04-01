@@ -4,7 +4,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from mkv_compress.models import EncodeJob
+from mediashrink.models import EncodeJob
 
 SUPPORTED_EXTENSIONS = (".mkv", ".mp4", ".m4v")
 
@@ -79,7 +79,7 @@ def build_jobs(
     no_skip: bool = False,
 ) -> list[EncodeJob]:
     """Construct an EncodeJob for each file, skipping already-compressed ones."""
-    from mkv_compress.encoder import estimate_output_size
+    from mediashrink.encoder import estimate_output_size
 
     jobs: list[EncodeJob] = []
 

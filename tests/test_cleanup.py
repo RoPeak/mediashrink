@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mkv_compress.cleanup import cleanup_successful_results, eligible_cleanup_results
-from mkv_compress.models import EncodeJob, EncodeResult
+from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
+from mediashrink.models import EncodeJob, EncodeResult
 
 
 def _make_result(

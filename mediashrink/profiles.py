@@ -18,13 +18,13 @@ class SavedProfile:
 def get_profiles_path() -> Path:
     appdata = os.getenv("APPDATA")
     if appdata:
-        return Path(appdata) / "mkvcompress" / "profiles.json"
+        return Path(appdata) / "mediashrink" / "profiles.json"
 
     xdg_config = os.getenv("XDG_CONFIG_HOME")
     if xdg_config:
-        return Path(xdg_config) / "mkvcompress" / "profiles.json"
+        return Path(xdg_config) / "mediashrink" / "profiles.json"
 
-    return Path.home() / ".config" / "mkvcompress" / "profiles.json"
+    return Path.home() / ".config" / "mediashrink" / "profiles.json"
 
 
 def load_profiles(path: Path | None = None) -> list[SavedProfile]:

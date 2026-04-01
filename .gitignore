@@ -30,7 +30,7 @@ env/
 Thumbs.db
 Desktop.ini
 
-# mkv-compress runtime
+# mediashrink runtime
 *.tmp_*.mkv
 test-output/
 artifacts/

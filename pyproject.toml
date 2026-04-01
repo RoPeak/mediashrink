@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mkv-compress"
+name = "mediashrink"
 version = "0.1.0"
-description = "CLI tool to re-encode MKV files using H.265/HEVC for significant file size reduction."
+description = "CLI tool to re-encode video files using H.265/HEVC for significant file size reduction."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mkvcompress = "mkv_compress.cli:app"
+mediashrink = "mediashrink.cli:app"
 
 [project.optional-dependencies]
 dev = [
@@ -24,4 +24,4 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["mkv_compress*"]
+include = ["mediashrink*"]

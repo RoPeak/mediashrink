@@ -14,7 +14,7 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
-from mkv_compress.models import EncodeJob, EncodeResult
+from mediashrink.models import EncodeJob, EncodeResult
 
 _GB = 1024**3
 _MB = 1024**2

@@ -5,14 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mkv_compress.encoder import (
+from mediashrink.encoder import (
     build_ffmpeg_command,
     encode_file,
     get_duration_seconds,
     is_hardware_preset,
     parse_progress_line,
 )
-from mkv_compress.models import EncodeJob
+from mediashrink.models import EncodeJob
 
 FFMPEG = Path("/usr/bin/ffmpeg")
 FFPROBE = Path("/usr/bin/ffprobe")
@@ -138,8 +138,8 @@ def test_encode_file_success(tmp_path: Path) -> None:
         dest.write_bytes(b"compressed output")
         return dest
 
-    with patch("mkv_compress.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mkv_compress.encoder.get_duration_seconds", return_value=10.0), \
+    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
+         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0), \
          patch("pathlib.Path.rename", fake_rename):
         result = encode_file(job, FFMPEG, FFPROBE)
 
@@ -164,8 +164,8 @@ def test_encode_file_reports_progress(tmp_path: Path) -> None:
         dest.write_bytes(b"x")
         return dest
 
-    with patch("mkv_compress.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mkv_compress.encoder.get_duration_seconds", return_value=10.0), \
+    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
+         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0), \
          patch("pathlib.Path.rename", fake_rename):
         encode_file(job, FFMPEG, FFPROBE, progress_callback=reported.append)
 
@@ -186,8 +186,8 @@ def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
     mock_process.returncode = 1
     mock_process.stdout = iter([])
 
-    with patch("mkv_compress.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mkv_compress.encoder.get_duration_seconds", return_value=10.0):
+    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
+         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0):
         result = encode_file(job, FFMPEG, FFPROBE)
 
     assert result.success is False
@@ -203,7 +203,7 @@ def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
 def test_encode_file_skip(tmp_path: Path) -> None:
     job = _make_job(tmp_path, skip=True, skip_reason="already HEVC")
 
-    with patch("mkv_compress.encoder.subprocess.Popen") as mock_popen:
+    with patch("mediashrink.encoder.subprocess.Popen") as mock_popen:
         result = encode_file(job, FFMPEG, FFPROBE)
 
     mock_popen.assert_not_called()
@@ -218,7 +218,7 @@ def test_encode_file_skip(tmp_path: Path) -> None:
 def test_encode_file_dry_run_no_subprocess(tmp_path: Path) -> None:
     job = _make_job(tmp_path, dry_run=True)
 
-    with patch("mkv_compress.encoder.subprocess.Popen") as mock_popen:
+    with patch("mediashrink.encoder.subprocess.Popen") as mock_popen:
         result = encode_file(job, FFMPEG, FFPROBE)
 
     mock_popen.assert_not_called()
@@ -241,8 +241,8 @@ def test_encode_file_interrupt_cleans_up_tmp(tmp_path: Path) -> None:
     mock_process = MagicMock()
     mock_process.stdout = raising_stdout()
 
-    with patch("mkv_compress.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mkv_compress.encoder.get_duration_seconds", return_value=10.0):
+    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
+         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0):
         with pytest.raises(KeyboardInterrupt):
             encode_file(job, FFMPEG, FFPROBE)
 

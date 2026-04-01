@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from mkv_compress.models import EncodeResult
+from mediashrink.models import EncodeResult
 
 
 def eligible_cleanup_results(results: list[EncodeResult]) -> list[EncodeResult]:

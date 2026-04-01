@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from mkv_compress.analysis import (
+from mediashrink.analysis import (
     build_analysis_item,
     build_manifest,
     display_analysis_summary,
@@ -22,10 +22,10 @@ def test_build_analysis_item_skips_hevc(tmp_path: Path) -> None:
     path = tmp_path / "movie.mkv"
     path.write_bytes(b"x" * 1024)
 
-    with patch("mkv_compress.analysis.probe_video_codec", return_value="hevc"), \
-         patch("mkv_compress.analysis.is_already_compressed", return_value=(True, "video stream is already H.265/HEVC")), \
-         patch("mkv_compress.analysis.get_duration_seconds", return_value=100.0), \
-         patch("mkv_compress.analysis.get_video_bitrate_kbps", return_value=10000.0):
+    with patch("mediashrink.analysis.probe_video_codec", return_value="hevc"), \
+         patch("mediashrink.analysis.is_already_compressed", return_value=(True, "video stream is already H.265/HEVC")), \
+         patch("mediashrink.analysis.get_duration_seconds", return_value=100.0), \
+         patch("mediashrink.analysis.get_video_bitrate_kbps", return_value=10000.0):
         item = build_analysis_item(path, FFPROBE)
 
     assert item.recommendation == "skip"
@@ -36,10 +36,10 @@ def test_build_analysis_item_skips_compressed_filename(tmp_path: Path) -> None:
     path = tmp_path / "movie_compressed.mkv"
     path.write_bytes(b"x" * 1024)
 
-    with patch("mkv_compress.analysis.probe_video_codec", return_value="h264"), \
-         patch("mkv_compress.analysis.is_already_compressed", return_value=(True, "filename contains '_compressed'")), \
-         patch("mkv_compress.analysis.get_duration_seconds", return_value=100.0), \
-         patch("mkv_compress.analysis.get_video_bitrate_kbps", return_value=10000.0):
+    with patch("mediashrink.analysis.probe_video_codec", return_value="h264"), \
+         patch("mediashrink.analysis.is_already_compressed", return_value=(True, "filename contains '_compressed'")), \
+         patch("mediashrink.analysis.get_duration_seconds", return_value=100.0), \
+         patch("mediashrink.analysis.get_video_bitrate_kbps", return_value=10000.0):
         item = build_analysis_item(path, FFPROBE)
 
     assert item.recommendation == "skip"
@@ -50,11 +50,11 @@ def test_build_analysis_item_recommends_strong_candidate(tmp_path: Path) -> None
     path = tmp_path / "movie.mkv"
     path.write_bytes(b"x" * (2 * 1024**3))
 
-    with patch("mkv_compress.analysis.probe_video_codec", return_value="h264"), \
-         patch("mkv_compress.analysis.is_already_compressed", return_value=(False, "")), \
-         patch("mkv_compress.analysis.get_duration_seconds", return_value=3600.0), \
-         patch("mkv_compress.analysis.get_video_bitrate_kbps", return_value=12000.0), \
-         patch("mkv_compress.analysis.estimate_output_size", return_value=700 * 1024**2):
+    with patch("mediashrink.analysis.probe_video_codec", return_value="h264"), \
+         patch("mediashrink.analysis.is_already_compressed", return_value=(False, "")), \
+         patch("mediashrink.analysis.get_duration_seconds", return_value=3600.0), \
+         patch("mediashrink.analysis.get_video_bitrate_kbps", return_value=12000.0), \
+         patch("mediashrink.analysis.estimate_output_size", return_value=700 * 1024**2):
         item = build_analysis_item(path, FFPROBE)
 
     assert item.recommendation == "recommended"
@@ -65,11 +65,11 @@ def test_build_analysis_item_marks_borderline_candidate(tmp_path: Path) -> None:
     path = tmp_path / "movie.mkv"
     path.write_bytes(b"x" * (900 * 1024**2))
 
-    with patch("mkv_compress.analysis.probe_video_codec", return_value="h264"), \
-         patch("mkv_compress.analysis.is_already_compressed", return_value=(False, "")), \
-         patch("mkv_compress.analysis.get_duration_seconds", return_value=1800.0), \
-         patch("mkv_compress.analysis.get_video_bitrate_kbps", return_value=6000.0), \
-         patch("mkv_compress.analysis.estimate_output_size", return_value=500 * 1024**2):
+    with patch("mediashrink.analysis.probe_video_codec", return_value="h264"), \
+         patch("mediashrink.analysis.is_already_compressed", return_value=(False, "")), \
+         patch("mediashrink.analysis.get_duration_seconds", return_value=1800.0), \
+         patch("mediashrink.analysis.get_video_bitrate_kbps", return_value=6000.0), \
+         patch("mediashrink.analysis.estimate_output_size", return_value=500 * 1024**2):
         item = build_analysis_item(path, FFPROBE)
 
     assert item.recommendation == "maybe"
@@ -136,7 +136,7 @@ def test_estimate_analysis_encode_seconds_uses_recommended_only(tmp_path: Path) 
         duration_seconds=500.0,
     )
 
-    with patch("mkv_compress.wizard.benchmark_encoder", return_value=2.0):
+    with patch("mediashrink.wizard.benchmark_encoder", return_value=2.0):
         estimate = estimate_analysis_encode_seconds([recommended, maybe], "fast", 20, FFMPEG)
 
     assert estimate == 50.0
@@ -166,7 +166,7 @@ def build_analysis_item_dict_item(
     duration_seconds: float = 120.0,
 ) -> object:
     source.write_bytes(b"x")
-    from mkv_compress.models import AnalysisItem
+    from mediashrink.models import AnalysisItem
 
     return AnalysisItem(
         source=source,

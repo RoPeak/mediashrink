@@ -1,4 +1,4 @@
-# mkv-compress
+# mediashrink
 
 A CLI tool to re-encode supported video files (`.mkv`, `.mp4`, `.m4v`) to H.265/HEVC, keeping all audio and subtitle streams while cutting file sizes substantially.
 
@@ -29,7 +29,7 @@ pip install -e .[dev]
 For most users, start with the wizard:
 
 ```bash
-mkvcompress wizard /path/to/library
+mediashrink wizard /path/to/library
 ```
 
 It now handles:
@@ -46,31 +46,31 @@ Advanced/manual flows are still available below.
 
 ```bash
 # Encode in-place with a _compressed suffix
-mkvcompress /path/to/mkvs
+mediashrink /path/to/mkvs
 
 # Encode and then clean up originals after success
-mkvcompress /path/to/mkvs --cleanup
+mediashrink /path/to/mkvs --cleanup
 
 # Analyze a library and write a candidate manifest
-mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
+mediashrink analyze /path/to/library --recursive --manifest-out candidates.json
 
 # Apply a previously generated manifest
-mkvcompress apply candidates.json
+mediashrink apply candidates.json
 
 # Dry run only
-mkvcompress /path/to/mkvs --dry-run
+mediashrink /path/to/mkvs --dry-run
 
 # Send output to another directory
-mkvcompress /path/to/mkvs --output-dir /path/to/output
+mediashrink /path/to/mkvs --output-dir /path/to/output
 
 # Overwrite originals after successful encode
-mkvcompress /path/to/mkvs --overwrite
+mediashrink /path/to/mkvs --overwrite
 
 # Override defaults manually
-mkvcompress /path/to/mkvs --crf 22 --preset slow
+mediashrink /path/to/mkvs --crf 22 --preset slow
 
 # Reuse a saved wizard profile
-mkvcompress /path/to/mkvs --profile tv-batch
+mediashrink /path/to/mkvs --profile tv-batch
 ```
 
 ## Wizard
@@ -78,7 +78,7 @@ mkvcompress /path/to/mkvs --profile tv-batch
 The wizard is the main guided workflow. It detects usable encoders with FFmpeg probe runs, benchmarks a short sample, analyzes the target library with the chosen settings, and then walks the user to a simple next step.
 
 ```bash
-mkvcompress wizard /path/to/mkvs
+mediashrink wizard /path/to/mkvs
 ```
 
 The wizard:
@@ -97,10 +97,10 @@ Important: wizard time and size numbers are approximate estimates, not guarantee
 
 ## Library Analysis
 
-`mkvcompress analyze` is the advanced/manual version of the same recommendation pass used by the wizard:
+`mediashrink analyze` is the advanced/manual version of the same recommendation pass used by the wizard:
 
 ```bash
-mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
+mediashrink analyze /path/to/library --recursive --manifest-out candidates.json
 ```
 
 The analysis flow:
@@ -121,8 +121,8 @@ Defaults are conservative:
 Analysis supports the same settings precedence as encoding:
 
 ```bash
-mkvcompress analyze /path/to/library --profile tv-batch
-mkvcompress analyze /path/to/library --profile tv-batch --crf 18 --preset slow
+mediashrink analyze /path/to/library --profile tv-batch
+mediashrink analyze /path/to/library --profile tv-batch --crf 18 --preset slow
 ```
 
 Explicit `--crf` and `--preset` still override profile values.
@@ -132,9 +132,9 @@ Explicit `--crf` and `--preset` still override profile values.
 Use `apply` to run the existing encode pipeline against a manifest when you want a scriptable two-step workflow:
 
 ```bash
-mkvcompress apply candidates.json
-mkvcompress apply candidates.json --output-dir /path/to/output
-mkvcompress apply candidates.json --profile tv-batch
+mediashrink apply candidates.json
+mediashrink apply candidates.json --output-dir /path/to/output
+mediashrink apply candidates.json --profile tv-batch
 ```
 
 `apply`:
@@ -154,16 +154,16 @@ Profiles store only encoder settings:
 
 Profiles are saved per-user in a local JSON config file:
 
-- Windows: `%APPDATA%\mkvcompress\profiles.json`
-- Linux: `$XDG_CONFIG_HOME/mkvcompress/profiles.json`
-- Fallback: `~/.config/mkvcompress/profiles.json`
+- Windows: `%APPDATA%\mediashrink\profiles.json`
+- Linux: `$XDG_CONFIG_HOME/mediashrink/profiles.json`
+- Fallback: `~/.config/mediashrink/profiles.json`
 
 Use them with:
 
 ```bash
-mkvcompress /path/to/mkvs --profile tv-batch
-mkvcompress profiles list
-mkvcompress profiles delete tv-batch
+mediashrink /path/to/mkvs --profile tv-batch
+mediashrink profiles list
+mediashrink profiles delete tv-batch
 ```
 
 If `--profile` is supplied together with `--crf` or `--preset`, the explicit CLI flags win.

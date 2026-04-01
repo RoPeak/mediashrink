@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from mkv_compress.scanner import (
+from mediashrink.scanner import (
     build_jobs,
     is_already_compressed,
     probe_video_codec,
@@ -80,7 +80,7 @@ def test_is_already_compressed_by_codec(tmp_path: Path) -> None:
     path = tmp_path / "Heroes_S01E01.mkv"
     path.touch()
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="hevc"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="hevc"):
         skip, reason = is_already_compressed(path, FFPROBE)
 
     assert skip is True
@@ -91,7 +91,7 @@ def test_is_already_compressed_false_for_h264(tmp_path: Path) -> None:
     path = tmp_path / "Heroes_S01E01.mkv"
     path.touch()
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="h264"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="h264"):
         skip, reason = is_already_compressed(path, FFPROBE)
 
     assert skip is False
@@ -123,7 +123,7 @@ def _make_files(tmp_path: Path, names: list[str]) -> list[Path]:
 def test_build_jobs_default_output(tmp_path: Path) -> None:
     files = _make_files(tmp_path, ["ep01.mkv"])
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="h264"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="h264"):
         jobs = build_jobs(files, output_dir=None, overwrite=False,
                           crf=20, preset="slow", dry_run=False, ffprobe=FFPROBE)
 
@@ -138,7 +138,7 @@ def test_build_jobs_output_dir(tmp_path: Path) -> None:
     out_dir.mkdir()
     files = _make_files(tmp_path, ["ep01.mp4"])
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="h264"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="h264"):
         jobs = build_jobs(files, output_dir=out_dir, overwrite=False,
                           crf=20, preset="slow", dry_run=False, ffprobe=FFPROBE)
 
@@ -150,7 +150,7 @@ def test_build_jobs_output_dir(tmp_path: Path) -> None:
 def test_build_jobs_overwrite(tmp_path: Path) -> None:
     files = _make_files(tmp_path, ["ep01.mkv"])
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="h264"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="h264"):
         jobs = build_jobs(files, output_dir=None, overwrite=True,
                           crf=20, preset="slow", dry_run=False, ffprobe=FFPROBE)
 
@@ -160,7 +160,7 @@ def test_build_jobs_overwrite(tmp_path: Path) -> None:
 def test_build_jobs_default_output_preserves_container(tmp_path: Path) -> None:
     files = _make_files(tmp_path, ["ep01.m4v"])
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="h264"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="h264"):
         jobs = build_jobs(files, output_dir=None, overwrite=False,
                           crf=20, preset="slow", dry_run=False, ffprobe=FFPROBE)
 
@@ -171,7 +171,7 @@ def test_build_jobs_default_output_preserves_container(tmp_path: Path) -> None:
 def test_build_jobs_skip_hevc(tmp_path: Path) -> None:
     files = _make_files(tmp_path, ["ep01.mkv"])
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="hevc"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="hevc"):
         jobs = build_jobs(files, output_dir=None, overwrite=False,
                           crf=20, preset="slow", dry_run=False, ffprobe=FFPROBE)
 
@@ -182,7 +182,7 @@ def test_build_jobs_skip_hevc(tmp_path: Path) -> None:
 def test_build_jobs_crf_and_preset_passed_through(tmp_path: Path) -> None:
     files = _make_files(tmp_path, ["ep01.mkv"])
 
-    with patch("mkv_compress.scanner.probe_video_codec", return_value="h264"):
+    with patch("mediashrink.scanner.probe_video_codec", return_value="h264"):
         jobs = build_jobs(files, output_dir=None, overwrite=False,
                           crf=22, preset="medium", dry_run=True, ffprobe=FFPROBE)
 
