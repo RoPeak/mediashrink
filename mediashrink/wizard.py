@@ -19,7 +19,7 @@ from mediashrink.analysis import (
     save_manifest,
 )
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
-from mediashrink.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available
+from mediashrink.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available, validate_encoder
 from mediashrink.models import AnalysisItem, EncodeJob
 from mediashrink.platform_utils import detect_device_labels
 from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
@@ -35,6 +35,10 @@ _HARDWARE_DISPLAY_NAMES = {
     "qsv": "Intel Quick Sync",
     "nvenc": "Nvidia NVENC",
     "amf": "AMD AMF",
+}
+_HW_ENCODER_CAVEATS: dict[str, str] = {
+    "nvenc": "NVENC: consumer GPUs allow max 3 concurrent encode sessions.",
+    "amf":   "AMF: quality may vary on older Radeon GPUs; test output before batch use.",
 }
 
 
@@ -69,9 +73,18 @@ class EncoderProfile:
     is_builtin: bool = False
 
 
-def detect_available_encoders(ffmpeg: Path, console: Console) -> list[str]:
-    """Return available hardware encoder keys in stable display order."""
-    available: list[str] = []
+def detect_available_encoders(
+    ffmpeg: Path,
+    console: Console,
+    sample_file: Path | None = None,
+    ffprobe: Path | None = None,
+) -> list[str]:
+    """Return available hardware encoder keys in stable display order.
+
+    If sample_file and ffprobe are provided, each probed encoder is validated
+    against real content to catch encoders that pass the synthetic test but
+    fail on actual video input.
+    """
     candidates = list(_HW_ENCODERS.keys())
 
     with console.status("[dim]Detecting hardware encoders...[/dim]", spinner="dots"):
@@ -89,6 +102,21 @@ def detect_available_encoders(ffmpeg: Path, console: Console) -> list[str]:
                 except Exception:
                     pass
 
+    # Validation pass — encode 3s of real content to catch broken encoders
+    if sample_file is not None and ffprobe is not None:
+        validated: set[str] = set()
+        for key in detected:
+            ok, err = validate_encoder(key, sample_file, ffmpeg, ffprobe)
+            if ok:
+                validated.add(key)
+            else:
+                console.print(
+                    f"[yellow]Warning:[/yellow] {_HARDWARE_DISPLAY_NAMES.get(key, key)} "
+                    f"passed availability check but failed validation ({err}). Skipping."
+                )
+        detected = validated
+
+    available: list[str] = []
     for key in ("qsv", "nvenc", "amf"):
         if key in detected:
             available.append(key)
@@ -618,7 +646,7 @@ def run_wizard(
     if sample_duration <= 0:
         sample_duration = 3600.0
 
-    available_hw = detect_available_encoders(ffmpeg, console)
+    available_hw = detect_available_encoders(ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe)
     device_labels = detect_device_labels()
 
     if available_hw:
@@ -648,6 +676,10 @@ def run_wizard(
         total_input_bytes=total_input_bytes,
     )
     display_profiles_table(profiles, total_input_bytes, device_labels, console)
+
+    for hw_key in available_hw:
+        if hw_key in _HW_ENCODER_CAVEATS:
+            console.print(f"  [dim yellow]Note:[/dim yellow] [dim]{_HW_ENCODER_CAVEATS[hw_key]}[/dim]")
 
     selected = prompt_profile_selection(profiles, console)
     if selected.is_custom:

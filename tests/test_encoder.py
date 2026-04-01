@@ -14,6 +14,7 @@ from mediashrink.encoder import (
     get_video_resolution,
     is_hardware_preset,
     parse_progress_line,
+    validate_encoder,
 )
 from mediashrink.models import EncodeJob
 
@@ -83,7 +84,6 @@ def test_build_ffmpeg_command_qsv(tmp_path: Path) -> None:
     cmd = build_ffmpeg_command(job, FFMPEG)
     assert "hevc_qsv" in cmd
     assert "libx265" not in cmd
-    assert "-preset" not in cmd
     assert "-global_quality" in cmd
     q_idx = cmd.index("-global_quality")
     assert cmd[q_idx + 1] == "20"
@@ -96,6 +96,41 @@ def test_build_ffmpeg_command_nvenc(tmp_path: Path) -> None:
     assert "hevc_nvenc" in cmd
     assert "libx265" not in cmd
     assert "-cq" in cmd
+
+
+# ---------------------------------------------------------------------------
+# Hardware tuning flags
+# ---------------------------------------------------------------------------
+
+def test_build_hw_command_qsv_includes_tuning(tmp_path: Path) -> None:
+    job = _make_job(tmp_path, crf=20, preset="qsv")
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-preset" in cmd
+    preset_idx = cmd.index("-preset")
+    assert cmd[preset_idx + 1] == "medium"
+    assert "-look_ahead" in cmd
+
+
+def test_build_hw_command_nvenc_includes_tuning(tmp_path: Path) -> None:
+    job = _make_job(tmp_path, crf=20, preset="nvenc")
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-preset" in cmd
+    preset_idx = cmd.index("-preset")
+    assert cmd[preset_idx + 1] == "p4"
+    assert "-tune" in cmd
+    tune_idx = cmd.index("-tune")
+    assert cmd[tune_idx + 1] == "hq"
+    assert "-bf" in cmd
+
+
+def test_build_hw_command_amf_includes_tuning(tmp_path: Path) -> None:
+    job = _make_job(tmp_path, crf=20, preset="amf")
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "hevc_amf" in cmd
+    assert "-quality" in cmd
+    quality_idx = cmd.index("-quality")
+    assert cmd[quality_idx + 1] == "balanced"
+    assert "-bf_ref" in cmd
 
 
 def test_is_hardware_preset() -> None:
@@ -366,3 +401,53 @@ def test_codec_base_factor_keys_present() -> None:
     assert "vc1" in _CODEC_BASE_FACTOR
     assert "hevc" in _CODEC_BASE_FACTOR
     assert _CODEC_BASE_FACTOR["hevc"] == 1.00
+
+
+# ---------------------------------------------------------------------------
+# validate_encoder
+# ---------------------------------------------------------------------------
+
+def test_validate_encoder_returns_true_on_success(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.mkv"
+    sample.write_bytes(b"fake")
+
+    mock_duration = MagicMock()
+    mock_duration.stdout = "120.0\n"
+    mock_duration.returncode = 0
+
+    mock_encode = MagicMock()
+    mock_encode.returncode = 0
+    mock_encode.stderr = ""
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=[mock_duration, mock_encode]):
+        ok, err = validate_encoder("qsv", sample, FFMPEG, FFPROBE)
+
+    assert ok is True
+    assert err == ""
+
+
+def test_validate_encoder_returns_false_on_nonzero_exit(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.mkv"
+    sample.write_bytes(b"fake")
+
+    mock_duration = MagicMock()
+    mock_duration.stdout = "120.0\n"
+    mock_duration.returncode = 0
+
+    mock_encode = MagicMock()
+    mock_encode.returncode = 1
+    mock_encode.stderr = "Error: no device found"
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=[mock_duration, mock_encode]):
+        ok, err = validate_encoder("nvenc", sample, FFMPEG, FFPROBE)
+
+    assert ok is False
+    assert "no device found" in err
+
+
+def test_validate_encoder_returns_false_for_unknown_key(tmp_path: Path) -> None:
+    sample = tmp_path / "sample.mkv"
+    sample.write_bytes(b"fake")
+    ok, err = validate_encoder("unknown_hw", sample, FFMPEG, FFPROBE)
+    assert ok is False
+    assert err != ""

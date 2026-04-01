@@ -144,28 +144,34 @@ def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, cr
 
 # Hardware encoder names recognised as --preset values.
 # Maps preset alias -> (ffmpeg encoder name, quality flag, extra flags)
+# Extra flags include per-encoder quality tuning derived from real-world defaults.
 _HW_ENCODERS: dict[str, tuple[str, str, list[str]]] = {
-    "qsv":   ("hevc_qsv",  "-global_quality", []),
-    "nvenc": ("hevc_nvenc", "-cq",             ["-rc", "vbr"]),
-    "amf":   ("hevc_amf",  "-qp_i",           ["-qp_p", str(0)]),  # placeholder; overridden below
+    "qsv":   ("hevc_qsv",   "-global_quality", ["-preset", "medium", "-look_ahead", "1"]),
+    "nvenc": ("hevc_nvenc", "-cq",              ["-rc", "vbr", "-preset", "p4", "-tune", "hq", "-bf", "3"]),
+    "amf":   ("hevc_amf",  "-qp_i",            ["-qp_p", "0", "-quality", "balanced", "-bf_ref", "1"]),
 }
+
+
+def _hw_quality_args(encoder_key: str, crf: int) -> list[str]:
+    """Return the quality flag(s) for a hardware encoder at the given CRF."""
+    _, quality_flag, _ = _HW_ENCODERS[encoder_key]
+    if encoder_key == "amf":
+        return ["-qp_i", str(crf), "-qp_p", str(crf)]
+    return [quality_flag, str(crf)]
 
 
 def probe_encoder_available(encoder_key: str, ffmpeg: Path) -> bool:
     """
-    Run a null-encode test with a synthetic 64x64 1-second source to check if
+    Run a null-encode test with a synthetic 256x256 1-second source to check if
     encoder_key is usable on this machine. Returns True only if FFmpeg exits 0.
+    Uses full tuning flags so probe results reflect real encode behaviour.
     encoder_key must be one of "qsv", "nvenc", "amf".
     """
     if encoder_key not in _HW_ENCODERS:
         return False
 
-    encoder_name, quality_flag, extra_flags = _HW_ENCODERS[encoder_key]
-
-    if encoder_key == "amf":
-        quality_args = ["-qp_i", "28", "-qp_p", "28"]
-    else:
-        quality_args = [quality_flag, "28"]
+    encoder_name, _, extra_flags = _HW_ENCODERS[encoder_key]
+    quality_args = _hw_quality_args(encoder_key, 28)
 
     cmd = [
         str(ffmpeg),
@@ -178,14 +184,54 @@ def probe_encoder_available(encoder_key: str, ffmpeg: Path) -> bool:
     ]
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=15,
-        )
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
         return False
+
+
+def validate_encoder(
+    encoder_key: str,
+    sample_file: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+) -> tuple[bool, str]:
+    """
+    Encode 3 seconds of real content to /dev/null using full tuning flags.
+    Returns (True, '') on success, (False, error_summary) on failure.
+    Used to catch encoders that pass the synthetic probe but fail on real input.
+    """
+    if encoder_key not in _HW_ENCODERS:
+        return False, f"Unknown encoder key: {encoder_key}"
+
+    duration = get_duration_seconds(sample_file, ffprobe)
+    seek = max(duration * 0.2, 0.0) if duration > 0 else 0.0
+
+    encoder_name, _, extra_flags = _HW_ENCODERS[encoder_key]
+    quality_args = _hw_quality_args(encoder_key, 28)
+
+    cmd = [
+        str(ffmpeg),
+        "-ss", str(seek),
+        "-i", str(sample_file),
+        "-t", "3",
+        "-c:v", encoder_name,
+    ] + quality_args + extra_flags + [
+        "-an", "-f", "null", "-",
+        "-loglevel", "error",
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return True, ""
+        stderr = result.stderr.strip()
+        summary = stderr.splitlines()[-1] if stderr else f"exit code {result.returncode}"
+        return False, summary
+    except subprocess.TimeoutExpired:
+        return False, "validation timed out"
+    except OSError as exc:
+        return False, str(exc)
 
 
 def is_hardware_preset(preset: str) -> bool:
@@ -221,15 +267,8 @@ def _build_sw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
 
 def _build_hw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
     """Hardware-accelerated encode (QSV / NVENC / AMF)."""
-    encoder, quality_flag, extra = _HW_ENCODERS[job.preset]
-
-    # QSV: global_quality maps roughly to CRF (same scale, lower = better)
-    # NVENC: -cq is the CRF equivalent
-    # AMF: use -qp_i / -qp_p
-    if job.preset == "amf":
-        quality_args = ["-qp_i", str(job.crf), "-qp_p", str(job.crf)]
-    else:
-        quality_args = [quality_flag, str(job.crf)]
+    encoder, _, extra = _HW_ENCODERS[job.preset]
+    quality_args = _hw_quality_args(job.preset, job.crf)
 
     cmd = [
         str(ffmpeg),
@@ -238,6 +277,7 @@ def _build_hw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
         "-c:v", encoder,
     ]
     cmd += quality_args
+    cmd += extra
     cmd += [
         "-c:a", "copy",
         "-c:s", "copy",
