@@ -13,6 +13,7 @@ class SavedProfile:
     crf: int
     label: str | None = None
     created_from_wizard: bool = False
+    builtin: bool = False
 
 
 def get_profiles_path() -> Path:
@@ -51,6 +52,7 @@ def load_profiles(path: Path | None = None) -> list[SavedProfile]:
             continue
         label = item.get("label")
         created_from_wizard = item.get("created_from_wizard", False)
+        builtin = item.get("builtin", False)
         profiles.append(
             SavedProfile(
                 name=name,
@@ -58,15 +60,32 @@ def load_profiles(path: Path | None = None) -> list[SavedProfile]:
                 crf=crf,
                 label=label if isinstance(label, str) else None,
                 created_from_wizard=bool(created_from_wizard),
+                builtin=bool(builtin),
             )
         )
     return profiles
 
 
+def get_builtin_profiles() -> list[SavedProfile]:
+    """Return the fixed built-in intent presets. These are never persisted."""
+    return [
+        SavedProfile(name="TV Batch",            preset="faster", crf=22, label="TV shows / fast batch",    builtin=True),
+        SavedProfile(name="Archival",             preset="slow",   crf=16, label="Maximum quality",          builtin=True),
+        SavedProfile(name="Fast GPU Transcode",   preset="nvenc",  crf=22, label="Hardware speed (GPU)",     builtin=True),
+        SavedProfile(name="Smallest Acceptable",  preset="slow",   crf=28, label="Maximum compression",      builtin=True),
+    ]
+
+
+def list_all_profiles(path: Path | None = None) -> list[SavedProfile]:
+    """Return built-in profiles followed by user-saved profiles."""
+    return get_builtin_profiles() + load_profiles(path)
+
+
 def save_profiles(profiles: list[SavedProfile], path: Path | None = None) -> Path:
     profiles_path = path or get_profiles_path()
     profiles_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [asdict(profile) for profile in profiles]
+    # Never persist built-in profiles
+    payload = [asdict(profile) for profile in profiles if not profile.builtin]
     profiles_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return profiles_path
 

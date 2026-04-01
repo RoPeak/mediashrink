@@ -104,6 +104,89 @@ class AnalysisItem:
 
 
 @dataclass
+class SessionFileEntry:
+    source: str               # absolute path as string
+    status: str               # "pending" | "success" | "failed" | "skipped"
+    output: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "source": self.source,
+            "status": self.status,
+            "output": self.output,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, object]) -> "SessionFileEntry":
+        source = raw.get("source")
+        status = raw.get("status")
+        if not isinstance(source, str):
+            raise ValueError("session entry source must be a string")
+        if not isinstance(status, str):
+            raise ValueError("session entry status must be a string")
+        output = raw.get("output")
+        error = raw.get("error")
+        return cls(
+            source=source,
+            status=status,
+            output=output if isinstance(output, str) else None,
+            error=error if isinstance(error, str) else None,
+        )
+
+
+@dataclass
+class SessionManifest:
+    version: int
+    directory: str
+    timestamp: str            # ISO-8601
+    preset: str
+    crf: int
+    overwrite: bool
+    output_dir: str | None
+    entries: list[SessionFileEntry]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "directory": self.directory,
+            "timestamp": self.timestamp,
+            "preset": self.preset,
+            "crf": self.crf,
+            "overwrite": self.overwrite,
+            "output_dir": self.output_dir,
+            "entries": [e.to_dict() for e in self.entries],
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, object]) -> "SessionManifest":
+        directory = raw.get("directory")
+        preset = raw.get("preset")
+        timestamp = raw.get("timestamp")
+        if not isinstance(directory, str):
+            raise ValueError("session manifest directory must be a string")
+        if not isinstance(preset, str):
+            raise ValueError("session manifest preset must be a string")
+        if not isinstance(timestamp, str):
+            raise ValueError("session manifest timestamp must be a string")
+        raw_entries = raw.get("entries")
+        if not isinstance(raw_entries, list):
+            raise ValueError("session manifest entries must be a list")
+        output_dir = raw.get("output_dir")
+        return cls(
+            version=int(raw.get("version", 0)),
+            directory=directory,
+            timestamp=timestamp,
+            preset=preset,
+            crf=int(raw.get("crf", 0)),
+            overwrite=bool(raw.get("overwrite", False)),
+            output_dir=output_dir if isinstance(output_dir, str) else None,
+            entries=[SessionFileEntry.from_dict(e) for e in raw_entries],
+        )
+
+
+@dataclass
 class AnalysisManifest:
     version: int
     analyzed_directory: Path
