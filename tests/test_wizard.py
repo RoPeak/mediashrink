@@ -225,6 +225,10 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
         patch("mediashrink.wizard.typer.confirm", return_value=True),
     ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, True, None, False, False, console)
@@ -326,6 +330,10 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
         patch("mediashrink.wizard.prompt_analysis_action", return_value="review_maybe"),
         patch("mediashrink.wizard.review_maybe_items", return_value=True),
         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(recommended_path, success=True),
+        ),
         patch("mediashrink.wizard.typer.confirm", return_value=True),
     ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
@@ -370,6 +378,10 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
         patch("mediashrink.wizard.encode_preview", return_value=preview_result),
         patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(larger, success=True),
+        ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[True, False, False]) as mock_confirm,
     ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
@@ -502,6 +514,30 @@ def _fake_preview_result(source: Path) -> EncodeResult:
     )
 
 
+def _fake_encode_result(
+    source: Path, *, success: bool, error_message: str | None = None
+) -> EncodeResult:
+    job = EncodeJob(
+        source=source,
+        output=source.with_stem(source.stem + "_compressed"),
+        tmp_output=source.parent / f".tmp_{source.stem}_compressed{source.suffix}",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    return EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=success,
+        input_size_bytes=1000,
+        output_size_bytes=500 if success else 0,
+        duration_seconds=2.0,
+        error_message=error_message,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stage 9 — --auto mode
 # ---------------------------------------------------------------------------
@@ -531,6 +567,10 @@ def test_run_wizard_auto_selects_recommended_profile(tmp_path: Path) -> None:
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.prompt_analysis_action") as mock_action,
         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
     ):
         jobs, action, _ = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True
@@ -560,6 +600,10 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
         patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
         patch("mediashrink.wizard.typer.confirm") as mock_confirm,
         patch("mediashrink.wizard.typer.prompt") as mock_prompt,
     ):
@@ -570,6 +614,47 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
     assert action == "encode"
     mock_confirm.assert_not_called()
     mock_prompt.assert_not_called()
+
+
+def test_run_wizard_aborts_when_preflight_encode_fails(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard.encode_preview"),
+        patch("mediashrink.wizard.typer.confirm", return_value=False),
+        patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(
+                source,
+                success=False,
+                error_message="[mp4 @ 123] Could not write header\nInvalid argument",
+            ),
+        ),
+    ):
+        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+
+    output = console.export_text()
+    assert action == "cancel"
+    assert jobs == []
+    assert "failed a short compatibility check" in output
+    assert "Could not write header" in output
 
 
 # ---------------------------------------------------------------------------

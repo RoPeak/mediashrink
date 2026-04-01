@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -384,6 +385,14 @@ def parse_progress_line(line: str) -> dict[str, str]:
     return {}
 
 
+def _summarize_stderr_lines(stderr_lines: list[str], returncode: int) -> str:
+    """Return a concise ffmpeg failure summary from captured stderr."""
+    cleaned = [line.strip() for line in stderr_lines if line.strip()]
+    if not cleaned:
+        return f"FFmpeg exited with code {returncode}"
+    return "\n".join(cleaned[-5:])
+
+
 def encode_file(
     job: EncodeJob,
     ffmpeg: Path,
@@ -437,25 +446,30 @@ def encode_file(
     # Ensure output directory exists
     job.tmp_output.parent.mkdir(parents=True, exist_ok=True)
 
-    stderr_target = subprocess.PIPE if log_path is not None else subprocess.DEVNULL
+    stderr_tail: deque[str] = deque(maxlen=20)
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=stderr_target,
+        stderr=subprocess.PIPE,
         text=True,
     )
 
     stderr_thread: threading.Thread | None = None
-    if log_path is not None and process.stderr is not None:
+    if process.stderr is not None:
 
-        def _drain_stderr(src: object, dst: Path) -> None:
-            assert hasattr(src, "read")
+        def _drain_stderr(src: object, dst: Path | None, tail: deque[str]) -> None:
+            if dst is None:
+                for line in src:  # type: ignore[union-attr, attr-defined]
+                    tail.append(line)
+                return
+
             with dst.open("a", encoding="utf-8", errors="replace") as fh:
                 for line in src:  # type: ignore[union-attr, attr-defined]
+                    tail.append(line)
                     fh.write(line)
 
         stderr_thread = threading.Thread(
-            target=_drain_stderr, args=(process.stderr, log_path), daemon=True
+            target=_drain_stderr, args=(process.stderr, log_path, stderr_tail), daemon=True
         )
         stderr_thread.start()
 
@@ -498,7 +512,7 @@ def encode_file(
             input_size_bytes=input_size,
             output_size_bytes=0,
             duration_seconds=duration,
-            error_message=f"FFmpeg exited with code {process.returncode}",
+            error_message=_summarize_stderr_lines(list(stderr_tail), process.returncode),
         )
 
     # Success: rename tmp → final output
@@ -571,3 +585,39 @@ def encode_preview(
     finally:
         if log_path.exists():
             log_path.unlink()
+
+
+def preflight_encode_job(
+    source: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+    *,
+    crf: int,
+    preset: str,
+    duration_seconds: float = 3.0,
+) -> EncodeResult:
+    """Run a short real-output encode to validate the final batch settings."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="mediashrink-preflight-") as temp_dir:
+        temp_root = Path(temp_dir)
+        output = temp_root / f"{source.stem}_preflight{source.suffix}"
+        tmp_output = temp_root / f".tmp_{source.stem}_preflight{source.suffix}"
+        job = EncodeJob(
+            source=source,
+            output=output,
+            tmp_output=tmp_output,
+            crf=crf,
+            preset=preset,
+            dry_run=False,
+            skip=False,
+        )
+        result = encode_file(
+            job,
+            ffmpeg,
+            ffprobe,
+            duration_limit_seconds=duration_seconds,
+        )
+        if result.success and output.exists():
+            output.unlink()
+        return result

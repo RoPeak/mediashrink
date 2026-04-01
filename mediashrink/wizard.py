@@ -23,6 +23,7 @@ from mediashrink.encoder import (
     _HW_ENCODERS,
     encode_preview,
     get_duration_seconds,
+    preflight_encode_job,
     probe_encoder_available,
     validate_encoder,
 )
@@ -844,6 +845,28 @@ def run_wizard(
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
         console.print("[dim]Nothing to encode after re-checking the selected files.[/dim]")
+        return [], "cancel", False
+
+    preflight_job = max(to_encode, key=lambda job: job.source.stat().st_size)
+    with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
+        preflight_result = preflight_encode_job(
+            preflight_job.source,
+            ffmpeg,
+            ffprobe,
+            crf=crf,
+            preset=preset,
+        )
+    if not preflight_result.success:
+        console.print()
+        console.print(
+            "[red]Selected settings failed a short compatibility check before batch encoding.[/red]"
+        )
+        if preflight_result.error_message:
+            console.print(f"[red]FFmpeg reported:[/red] {preflight_result.error_message}")
+        console.print(
+            "[dim]This usually means the chosen encoder or stream/container combination is not valid for these files. "
+            "Try a software profile such as 'Faster Encode' or run `mediashrink preview` on one file to inspect the exact behavior.[/dim]"
+        )
         return [], "cancel", False
 
     console.print()

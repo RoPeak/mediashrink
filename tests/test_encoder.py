@@ -187,6 +187,7 @@ def test_encode_file_success(tmp_path: Path) -> None:
     mock_process = MagicMock()
     mock_process.returncode = 0
     mock_process.stdout = iter(["out_time_ms=1000000\n", "progress=end\n"])
+    mock_process.stderr = iter([])
 
     def fake_rename(self: Path, dest: Path) -> Path:
         dest.write_bytes(b"compressed output")
@@ -217,6 +218,7 @@ def test_encode_file_reports_progress(tmp_path: Path) -> None:
             "progress=end\n",
         ]
     )
+    mock_process.stderr = iter([])
 
     def fake_rename(self: Path, dest: Path) -> Path:
         dest.write_bytes(b"x")
@@ -246,6 +248,7 @@ def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
     mock_process = MagicMock()
     mock_process.returncode = 1
     mock_process.stdout = iter([])
+    mock_process.stderr = iter(["[mp4 @ 123] Could not write header\n", "Invalid argument\n"])
 
     with (
         patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
@@ -254,7 +257,7 @@ def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
         result = encode_file(job, FFMPEG, FFPROBE)
 
     assert result.success is False
-    assert result.error_message is not None
+    assert result.error_message == "[mp4 @ 123] Could not write header\nInvalid argument"
     assert not job.tmp_output.exists()
     assert job.source.exists()
 
@@ -306,6 +309,7 @@ def test_encode_file_interrupt_cleans_up_tmp(tmp_path: Path) -> None:
 
     mock_process = MagicMock()
     mock_process.stdout = raising_stdout()
+    mock_process.stderr = iter([])
 
     with (
         patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
