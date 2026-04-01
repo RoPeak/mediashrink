@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 from rich.console import Console
@@ -124,9 +125,23 @@ def build_analysis_item(path: Path, ffprobe: Path) -> AnalysisItem:
     )
 
 
+def analyze_files(
+    files: list[Path],
+    ffprobe: Path,
+    progress_callback: Callable[[int, int, Path], None] | None = None,
+) -> list[AnalysisItem]:
+    items: list[AnalysisItem] = []
+    total = len(files)
+    for index, path in enumerate(files, start=1):
+        items.append(build_analysis_item(path, ffprobe))
+        if progress_callback is not None:
+            progress_callback(index, total, path)
+    return items
+
+
 def analyze_directory(directory: Path, recursive: bool, ffprobe: Path) -> list[AnalysisItem]:
     files = scan_directory(directory, recursive=recursive)
-    return [build_analysis_item(path, ffprobe) for path in files]
+    return analyze_files(files, ffprobe)
 
 
 def estimate_analysis_encode_seconds(

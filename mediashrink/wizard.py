@@ -8,11 +8,12 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
 from mediashrink.analysis import (
-    analyze_directory,
+    analyze_files,
     build_manifest,
     display_analysis_summary,
     estimate_analysis_encode_seconds,
@@ -47,6 +48,7 @@ _HW_ENCODER_CAVEATS: dict[str, str] = {
     "nvenc": "NVENC: consumer GPUs allow max 3 concurrent encode sessions.",
     "amf": "AMF: quality may vary on older Radeon GPUs; test output before batch use.",
 }
+_DEFAULT_FALLBACK_PROFILE = ("faster", 22, "Faster Encode", "faster")
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -191,6 +193,26 @@ def _estimate_time(total_media_seconds: float, speed: float | None) -> float:
     if speed is None or speed <= 0:
         return 0.0
     return total_media_seconds / speed
+
+
+def _sum_item_durations(items: list[AnalysisItem]) -> float:
+    total = 0.0
+    fallback_count = 0
+
+    for item in items:
+        if item.duration_seconds > 0:
+            total += item.duration_seconds
+        else:
+            fallback_count += 1
+
+    if total <= 0 and items:
+        return 3600.0 * len(items)
+
+    if fallback_count:
+        avg_known = total / max(len(items) - fallback_count, 1)
+        total += avg_known * fallback_count
+
+    return total
 
 
 def _sum_media_durations(files: list[Path], ffprobe: Path) -> float:
@@ -397,6 +419,7 @@ def build_profiles(
 def display_profiles_table(
     profiles: list[EncoderProfile],
     total_input_bytes: int,
+    candidate_count: int,
     device_labels: dict[str, str],
     console: Console,
 ) -> None:
@@ -459,8 +482,12 @@ def display_profiles_table(
 
     console.print()
     console.print(table)
-    console.print(f"  [dim]Total input: {_fmt_size(total_input_bytes)}[/dim]")
-    console.print("  [dim]Time and size numbers are approximate estimates.[/dim]")
+    console.print(
+        f"  [dim]Likely encode candidates: {candidate_count} file(s) / {_fmt_size(total_input_bytes)}[/dim]"
+    )
+    console.print(
+        "  [dim]Time and size numbers are approximate estimates for likely encode candidates, not already-skipped files.[/dim]"
+    )
     console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
@@ -650,6 +677,110 @@ def review_maybe_items(maybe_items: list[AnalysisItem], console: Console) -> boo
     return typer.confirm("Include maybe files in this run?", default=False)
 
 
+def _select_profile_interactively(
+    profiles: list[EncoderProfile],
+    available_hw: list[str],
+    device_labels: dict[str, str],
+    auto: bool,
+    console: Console,
+) -> tuple[str, int, str | None, str]:
+    if auto:
+        selected = next((p for p in profiles if p.is_recommended), profiles[0])
+        console.print(f"[dim]Auto mode: selected profile[/dim] {selected.name}")
+    else:
+        selected = prompt_profile_selection(profiles, console)
+
+    if selected.is_custom:
+        preset, crf, sw_preset = run_custom_wizard(available_hw, console)
+        display_label = f"Custom ({preset}, CRF {crf})"
+    else:
+        preset = selected.encoder_key
+        crf = selected.crf
+        sw_preset = selected.sw_preset
+        display_label = selected.name
+
+    console.print(
+        f"[dim]Selected profile:[/dim] {display_label} "
+        f"([dim]encoder:[/dim] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}, "
+        f"[dim]CRF:[/dim] {crf})"
+    )
+    return preset, crf, sw_preset, display_label
+
+
+def _run_analysis_with_progress(
+    files: list[Path],
+    ffprobe: Path,
+    console: Console,
+) -> list[AnalysisItem]:
+    if not files:
+        return []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        console=console,
+        transient=False,
+        expand=True,
+    ) as progress:
+        task = progress.add_task("[dim]Analyzing files (ffprobe + size estimates)...[/dim]", total=len(files))
+
+        def callback(completed: int, total: int, path: Path) -> None:
+            name = path.name if len(path.name) <= 56 else path.name[:53] + "..."
+            progress.update(
+                task,
+                total=total,
+                completed=completed,
+                description=f"[dim]Analyzing files (ffprobe + size estimates)...[/dim] [white]{name}[/white]",
+            )
+
+        items = analyze_files(files, ffprobe, progress_callback=callback)
+        progress.update(task, completed=len(files))
+        return items
+
+
+def _maybe_run_preview(
+    sample_file: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+    preset: str,
+    crf: int,
+    auto: bool,
+    console: Console,
+) -> bool:
+    if auto or not typer.confirm("Test a 2-minute preview clip before the full batch?", default=False):
+        return True
+
+    console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
+    preview_result = encode_preview(
+        source=sample_file,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        duration_minutes=2.0,
+        crf=crf,
+        preset=preset,
+    )
+    from mediashrink.progress import EncodingDisplay
+
+    EncodingDisplay(console).show_summary([preview_result])
+    if preview_result.success and preview_result.job.output.exists():
+        console.print(f"  [dim]Preview saved:[/dim] {preview_result.job.output}")
+        console.print("  [dim]Inspect video quality and verify audio/subtitle playback before continuing.[/dim]")
+        console.print("  [dim]Use the preview clip as a quality check, not as a file-size estimate.[/dim]")
+        return True
+
+    if preview_result.error_message:
+        console.print(f"[red]Preview encode failed:[/red] {preview_result.error_message}")
+    else:
+        console.print("[red]Preview encode failed.[/red]")
+    console.print(
+        "[dim]This is likely an encoder configuration issue, not a problem with your files. "
+        "If it persists, try a software profile (e.g. 'Faster Encode').[/dim]"
+    )
+    return typer.confirm("Continue to full batch anyway?", default=False)
+
+
 def run_wizard(
     directory: Path,
     ffmpeg: Path,
@@ -663,7 +794,7 @@ def run_wizard(
 ) -> tuple[list[EncodeJob], str, bool]:
     """Run the interactive wizard and return (jobs, action)."""
     console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
-    console.print("[dim]Scanning files and detecting hardware...[/dim]\n")
+    console.print("[dim]Discovering supported files...[/dim]\n")
 
     files = scan_directory(directory, recursive=recursive)
     if not files:
@@ -678,11 +809,22 @@ def run_wizard(
         f"([yellow]{_fmt_size(total_input_bytes)}[/yellow] total)\n"
     )
 
-    total_media_seconds = _sum_media_durations(files, ffprobe)
-    sample_file = max(files, key=lambda p: p.stat().st_size)
-    sample_duration = get_duration_seconds(sample_file, ffprobe)
-    if sample_duration <= 0:
-        sample_duration = 3600.0
+    analysis_items = _run_analysis_with_progress(files, ffprobe, console)
+    display_analysis_summary(analysis_items, None, console)
+
+    recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
+    maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
+    if not recommended_items:
+        console.print("[dim]No recommended files were found for automatic compression.[/dim]")
+        return [], "cancel", False
+
+    candidate_items = recommended_items + maybe_items
+    candidate_input_bytes = sum(item.size_bytes for item in candidate_items)
+    candidate_media_seconds = _sum_item_durations(candidate_items)
+    sample_pool = recommended_items or maybe_items or analysis_items
+    sample_item = max(sample_pool, key=lambda item: item.size_bytes)
+    sample_file = sample_item.source
+    sample_duration = sample_item.duration_seconds if sample_item.duration_seconds > 0 else 3600.0
 
     available_hw = detect_available_encoders(
         ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe
@@ -696,17 +838,16 @@ def run_wizard(
     else:
         console.print("[dim]No hardware encoders detected. Software only.[/dim]")
     console.print(
-        f"[dim]Next: benchmark a representative sample, suggest profiles, and optionally preview "
+        f"[dim]Next: benchmark a representative candidate, suggest profiles for likely encode files, and optionally preview "
         f"{sample_file.name} before batch encoding.[/dim]"
     )
     console.print(
-        "[dim]Benchmark and analysis estimates are sample-based and may differ from final encode results.[/dim]"
+        "[dim]Benchmark and profile estimates are sample-based and exclude files already expected to be skipped.[/dim]"
     )
 
     candidates_to_bench = list(available_hw) + ["fast", "faster"]
     benchmark_speeds: dict[str, float | None] = {}
-
-    with console.status("[dim]Benchmarking encoders (this takes ~10s)...[/dim]", spinner="dots"):
+    with console.status("[dim]Benchmarking profiles...[/dim]", spinner="dots"):
         for key in candidates_to_bench:
             benchmark_speeds[key] = benchmark_encoder(
                 encoder_key=key,
@@ -719,10 +860,10 @@ def run_wizard(
     profiles = build_profiles(
         available_hw=available_hw,
         benchmark_speeds=benchmark_speeds,
-        total_media_seconds=total_media_seconds,
-        total_input_bytes=total_input_bytes,
+        total_media_seconds=candidate_media_seconds,
+        total_input_bytes=candidate_input_bytes,
     )
-    display_profiles_table(profiles, total_input_bytes, device_labels, console)
+    display_profiles_table(profiles, candidate_input_bytes, len(candidate_items), device_labels, console)
 
     for hw_key in available_hw:
         if hw_key in _HW_ENCODER_CAVEATS:
@@ -730,144 +871,151 @@ def run_wizard(
                 f"  [dim yellow]Note:[/dim yellow] [dim]{_HW_ENCODER_CAVEATS[hw_key]}[/dim]"
             )
 
-    if auto:
-        selected = next((p for p in profiles if p.is_recommended), profiles[0])
-        console.print(f"[dim]Auto mode: selected profile[/dim] {selected.name}")
-    else:
-        selected = prompt_profile_selection(profiles, console)
-    if selected.is_custom:
-        preset, crf, sw_preset = run_custom_wizard(available_hw, console)
-        display_label = f"Custom ({preset}, CRF {crf})"
-    else:
-        preset = selected.encoder_key
-        crf = selected.crf
-        sw_preset = selected.sw_preset
-        display_label = selected.name
-    console.print(
-        f"[dim]Selected profile:[/dim] {display_label} "
-        f"([dim]encoder:[/dim] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}, "
-        f"[dim]CRF:[/dim] {crf})"
-    )
-
-    if not auto:
-        maybe_save_profile(preset, crf, display_label, console)
-
-    if not auto and typer.confirm(
-        "Test a 2-minute preview clip before the full batch?", default=False
-    ):
-        console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
-        preview_result = encode_preview(
-            source=sample_file,
-            ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
-            duration_minutes=2.0,
-            crf=crf,
-            preset=preset,
-        )
-        from mediashrink.progress import EncodingDisplay
-
-        EncodingDisplay(console).show_summary([preview_result])
-        if preview_result.success and preview_result.job.output.exists():
-            console.print(f"  [dim]Preview saved:[/dim] {preview_result.job.output}")
-            console.print(
-                "  [dim]Inspect video quality and verify audio/subtitle playback before continuing.[/dim]"
-            )
-            console.print(
-                "  [dim]Use the preview clip as a quality check, not as a file-size estimate.[/dim]"
-            )
-        if not preview_result.success:
-            if preview_result.error_message:
-                console.print(f"[red]Preview encode failed:[/red] {preview_result.error_message}")
-            else:
-                console.print("[red]Preview encode failed.[/red]")
-            console.print(
-                "[dim]This is likely an encoder configuration issue, not a problem with your files. "
-                "If it persists, try a software profile (e.g. 'Faster Encode').[/dim]"
-            )
-            if not typer.confirm("Continue to full batch anyway?", default=False):
-                return [], "cancel", False
-
-    analysis_items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
-    estimated_total_encode_seconds = estimate_analysis_encode_seconds(
-        items=analysis_items,
-        preset=preset,
-        crf=crf,
-        ffmpeg=ffmpeg,
-        known_speed=benchmark_speeds.get(preset),
-    )
-    display_analysis_summary(analysis_items, estimated_total_encode_seconds, console)
-
-    recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
-    maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
-    if not recommended_items:
-        console.print("[dim]No recommended files were found for automatic compression.[/dim]")
-        return [], "cancel", False
-
-    action = (
-        "compress_recommended"
-        if auto
-        else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
-    )
-    if action == "cancel":
-        return [], "cancel", False
-    if action == "export":
-        manifest = build_manifest(
-            directory=directory,
-            recursive=recursive,
-            preset=preset,
-            crf=crf,
-            profile_name=None,
-            estimated_total_encode_seconds=estimated_total_encode_seconds,
-            items=analysis_items,
-        )
-        default_manifest_path = directory / "mediashrink-analysis.json"
-        manifest_path = Path(typer.prompt("Manifest path", default=str(default_manifest_path)))
-        save_manifest(manifest, manifest_path)
-        console.print(f"[green]Wrote manifest[/green] {manifest_path}")
-        return [], "export", False
-
+    action_taken = False
+    profile_saved = False
     selected_items = list(recommended_items)
-    if action == "review_maybe" and maybe_items:
-        if review_maybe_items(maybe_items, console):
-            selected_items.extend(maybe_items)
+    estimated_total_encode_seconds: float | None = None
+    while True:
+        preset, crf, sw_preset, display_label = _select_profile_interactively(
+            profiles, available_hw, device_labels, auto, console
+        )
 
-    jobs = build_jobs(
-        files=[item.source for item in selected_items],
-        output_dir=output_dir,
-        overwrite=overwrite,
-        crf=crf,
-        preset=preset,
-        dry_run=False,
-        ffprobe=ffprobe,
-        no_skip=no_skip,
-    )
+        if not auto and not profile_saved:
+            maybe_save_profile(preset, crf, display_label, console)
+            profile_saved = True
 
-    to_encode = [job for job in jobs if not job.skip]
-    if not to_encode:
-        console.print("[dim]Nothing to encode after re-checking the selected files.[/dim]")
-        return [], "cancel", False
+        if not _maybe_run_preview(sample_file, ffmpeg, ffprobe, preset, crf, auto, console):
+            return [], "cancel", False
 
-    preflight_job = max(to_encode, key=lambda job: job.source.stat().st_size)
-    with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
-        preflight_result = preflight_encode_job(
-            preflight_job.source,
-            ffmpeg,
-            ffprobe,
+        if not action_taken:
+            action = (
+                "compress_recommended"
+                if auto
+                else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
+            )
+            if action == "cancel":
+                return [], "cancel", False
+            if action == "export":
+                export_estimate = estimate_analysis_encode_seconds(
+                    items=recommended_items,
+                    preset=preset,
+                    crf=crf,
+                    ffmpeg=ffmpeg,
+                    known_speed=benchmark_speeds.get(preset),
+                )
+                manifest = build_manifest(
+                    directory=directory,
+                    recursive=recursive,
+                    preset=preset,
+                    crf=crf,
+                    profile_name=None,
+                    estimated_total_encode_seconds=export_estimate,
+                    items=analysis_items,
+                )
+                default_manifest_path = directory / "mediashrink-analysis.json"
+                manifest_path = Path(typer.prompt("Manifest path", default=str(default_manifest_path)))
+                save_manifest(manifest, manifest_path)
+                console.print(f"[green]Wrote manifest[/green] {manifest_path}")
+                return [], "export", False
+
+            selected_items = list(recommended_items)
+            if action == "review_maybe" and maybe_items and review_maybe_items(maybe_items, console):
+                selected_items.extend(maybe_items)
+            action_taken = True
+
+        jobs = build_jobs(
+            files=[item.source for item in selected_items],
+            output_dir=output_dir,
+            overwrite=overwrite,
             crf=crf,
             preset=preset,
+            dry_run=False,
+            ffprobe=ffprobe,
+            no_skip=no_skip,
         )
-    if not preflight_result.success:
+        to_encode = [job for job in jobs if not job.skip]
+        if not to_encode:
+            console.print("[dim]Nothing to encode after re-checking the selected files.[/dim]")
+            return [], "cancel", False
+
+        estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+            items=selected_items,
+            preset=preset,
+            crf=crf,
+            ffmpeg=ffmpeg,
+            known_speed=benchmark_speeds.get(preset),
+        )
+
+        preflight_job = max(to_encode, key=lambda job: job.source.stat().st_size)
+        with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
+            preflight_result = preflight_encode_job(
+                preflight_job.source,
+                ffmpeg,
+                ffprobe,
+                crf=crf,
+                preset=preset,
+            )
+        if preflight_result.success:
+            break
+
         console.print()
+        console.print("[red]Selected settings failed a short compatibility check before batch encoding.[/red]")
         console.print(
-            "[red]Selected settings failed a short compatibility check before batch encoding.[/red]"
+            f"[red]Profile:[/red] {display_label} "
+            f"([red]encoder:[/red] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'})"
         )
         if preflight_result.error_message:
             console.print(f"[red]FFmpeg reported:[/red] {preflight_result.error_message}")
+
+        fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = _DEFAULT_FALLBACK_PROFILE
+        if preset != fallback_preset and typer.confirm(
+            f"Switch to {fallback_label} (libx265, CRF {fallback_crf}) and retry?",
+            default=True,
+        ):
+            fallback_jobs = build_jobs(
+                files=[item.source for item in selected_items],
+                output_dir=output_dir,
+                overwrite=overwrite,
+                crf=fallback_crf,
+                preset=fallback_preset,
+                dry_run=False,
+                ffprobe=ffprobe,
+                no_skip=no_skip,
+            )
+            fallback_to_encode = [job for job in fallback_jobs if not job.skip]
+            fallback_job = max(fallback_to_encode, key=lambda job: job.source.stat().st_size)
+            console.print(f"[dim]Retrying with[/dim] {fallback_label}...")
+            with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
+                fallback_result = preflight_encode_job(
+                    fallback_job.source,
+                    ffmpeg,
+                    ffprobe,
+                    crf=fallback_crf,
+                    preset=fallback_preset,
+                )
+            if fallback_result.success:
+                jobs = fallback_jobs
+                to_encode = fallback_to_encode
+                preset = fallback_preset
+                crf = fallback_crf
+                sw_preset = fallback_sw_preset
+                display_label = fallback_label
+                estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+                    items=selected_items,
+                    preset=preset,
+                    crf=crf,
+                    ffmpeg=ffmpeg,
+                    known_speed=benchmark_speeds.get(preset),
+                )
+                break
+            console.print()
+            console.print("[red]Fallback profile also failed compatibility checks.[/red]")
+            if fallback_result.error_message:
+                console.print(f"[red]FFmpeg reported:[/red] {fallback_result.error_message}")
+
         console.print(
-            "[dim]This usually means the chosen encoder or stream/container combination is not valid for these files. "
-            "Try a software profile such as 'Faster Encode' or run `mediashrink preview` on one file to inspect the exact behavior.[/dim]"
+            "[dim]Choose another profile. Software profiles are the safest fallback when hardware encoding is not compatible with the selected files.[/dim]"
         )
-        return [], "cancel", False
 
     console.print()
     console.print("[bold]Ready to encode[/bold]")

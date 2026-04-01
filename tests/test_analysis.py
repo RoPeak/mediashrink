@@ -6,6 +6,7 @@ from unittest.mock import patch
 from rich.console import Console
 
 from mediashrink.analysis import (
+    analyze_files,
     build_analysis_item,
     build_manifest,
     display_analysis_summary,
@@ -88,6 +89,23 @@ def test_build_analysis_item_marks_borderline_candidate(tmp_path: Path) -> None:
 
     assert item.recommendation == "maybe"
     assert item.reason_code == "borderline_candidate"
+
+
+def test_analyze_files_reports_progress_for_each_file(tmp_path: Path) -> None:
+    files = [tmp_path / "a.mkv", tmp_path / "b.mkv"]
+    for file in files:
+        file.write_bytes(b"x")
+
+    reported: list[tuple[int, int, str]] = []
+
+    def callback(completed: int, total: int, path: Path) -> None:
+        reported.append((completed, total, path.name))
+
+    with patch("mediashrink.analysis.build_analysis_item", side_effect=lambda path, _: build_analysis_item_dict_item(source=path, recommendation="recommended")):
+        items = analyze_files(files, FFPROBE, progress_callback=callback)
+
+    assert len(items) == 2
+    assert reported == [(1, 2, "a.mkv"), (2, 2, "b.mkv")]
 
 
 def test_manifest_round_trip_keeps_recommended_only(tmp_path: Path) -> None:

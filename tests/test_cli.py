@@ -252,7 +252,7 @@ def test_analyze_writes_manifest(tmp_path: Path) -> None:
         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
-        patch("mediashrink.cli.analyze_directory", return_value=[item]),
+        patch("mediashrink.cli._analyze_with_optional_progress", return_value=[item]),
         patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0),
     ):
         result = runner.invoke(
@@ -286,7 +286,7 @@ def test_analyze_profile_and_explicit_overrides_apply(tmp_path: Path, monkeypatc
         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
-        patch("mediashrink.cli.analyze_directory", return_value=[item]),
+        patch("mediashrink.cli._analyze_with_optional_progress", return_value=[item]),
         patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0),
         patch("mediashrink.cli.build_manifest") as mock_build_manifest,
         patch("mediashrink.cli.save_manifest") as mock_save_manifest,

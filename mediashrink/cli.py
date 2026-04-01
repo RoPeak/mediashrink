@@ -10,7 +10,7 @@ from rich.console import Console
 from typer.core import TyperGroup
 
 from mediashrink.analysis import (
-    analyze_directory,
+    analyze_files,
     build_manifest,
     display_analysis_summary,
     estimate_analysis_encode_seconds,
@@ -19,7 +19,7 @@ from mediashrink.analysis import (
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import encode_file, encode_preview
-from mediashrink.models import EncodeJob, EncodeResult, SessionManifest
+from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult, SessionManifest
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
 from mediashrink.profiles import delete_profile, get_profile, list_all_profiles
 from mediashrink.progress import EncodingDisplay
@@ -180,6 +180,46 @@ def _prepare_tools(output_dir: Path | None) -> tuple[Path, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     return ffmpeg, ffprobe
+
+
+def _analyze_with_optional_progress(
+    directory: Path,
+    recursive: bool,
+    ffprobe: Path,
+    ui_console: Console,
+    show_progress: bool,
+) -> list[AnalysisItem]:
+    files = scan_directory(directory, recursive=recursive)
+    if not files:
+        return []
+    if not show_progress:
+        return analyze_files(files, ffprobe)
+
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        console=ui_console,
+        transient=False,
+        expand=True,
+    ) as progress:
+        task = progress.add_task("[dim]Analyzing files (ffprobe + size estimates)...[/dim]", total=len(files))
+
+        def callback(completed: int, total: int, path: Path) -> None:
+            name = path.name if len(path.name) <= 56 else path.name[:53] + "..."
+            progress.update(
+                task,
+                total=total,
+                completed=completed,
+                description=f"[dim]Analyzing files (ffprobe + size estimates)...[/dim] [white]{name}[/white]",
+            )
+
+        items = analyze_files(files, ffprobe, progress_callback=callback)
+        progress.update(task, completed=len(files))
+        return items
 
 
 def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> None:
@@ -457,7 +497,13 @@ def analyze(
     ffmpeg, ffprobe = _prepare_tools(None)
     effective_crf, effective_preset, profile_name = _resolve_encode_settings(profile, crf, preset)
 
-    items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
+    items = _analyze_with_optional_progress(
+        directory=directory,
+        recursive=recursive,
+        ffprobe=ffprobe,
+        ui_console=quiet_console,
+        show_progress=not json_output,
+    )
     if not items:
         if json_output:
             print(json.dumps({"exit_code": EXIT_NO_FILES, "items": []}))
