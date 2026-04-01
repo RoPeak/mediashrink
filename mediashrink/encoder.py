@@ -108,7 +108,7 @@ def probe_encoder_available(encoder_key: str, ffmpeg: Path) -> bool:
     cmd = [
         str(ffmpeg),
         "-f", "lavfi",
-        "-i", "color=black:s=64x64:r=1",
+        "-i", "color=black:s=256x256:r=1",
         "-t", "1",
         "-c:v", encoder_name,
     ] + quality_args + extra_flags + [

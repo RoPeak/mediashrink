@@ -81,6 +81,9 @@ The wizard is the main guided workflow. It detects usable encoders with FFmpeg p
 mediashrink wizard /path/to/mkvs
 ```
 
+The wizard scans subdirectories by default, so it works out of the box for libraries organized into per-movie or per-show folders.
+Use `--no-recursive` if you only want the top-level directory.
+
 The wizard:
 
 1. Scans the batch and totals the input size.

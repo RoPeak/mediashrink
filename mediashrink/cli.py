@@ -204,10 +204,13 @@ def encode_cmd(
         help="Load saved CRF/preset defaults from a named profile.",
     ),
     recursive: bool = typer.Option(
-        False,
-        "--recursive",
-        "-r",
-        help=f"Scan subdirectories for supported video files ({supported_formats_label()}).",
+        True,
+        "--recursive/--no-recursive",
+        "-r/-R",
+        help=(
+            f"Scan subdirectories for supported video files ({supported_formats_label()}). "
+            "Enabled by default for the wizard."
+        ),
     ),
     dry_run: bool = typer.Option(
         False,
@@ -284,10 +287,13 @@ def analyze(
         readable=True,
     ),
     recursive: bool = typer.Option(
-        False,
-        "--recursive",
-        "-r",
-        help=f"Scan subdirectories for supported video files ({supported_formats_label()}).",
+        True,
+        "--recursive/--no-recursive",
+        "-r/-R",
+        help=(
+            f"Scan subdirectories for supported video files ({supported_formats_label()}). "
+            "Enabled by default for the wizard."
+        ),
     ),
     profile: Optional[str] = typer.Option(
         None,
@@ -462,10 +468,13 @@ def wizard(
         help="Replace original files after successful encoding.",
     ),
     recursive: bool = typer.Option(
-        False,
-        "--recursive",
-        "-r",
-        help=f"Scan subdirectories for supported video files ({supported_formats_label()}).",
+        True,
+        "--recursive/--no-recursive",
+        "-r/-R",
+        help=(
+            f"Scan subdirectories for supported video files ({supported_formats_label()}). "
+            "Enabled by default for the wizard."
+        ),
     ),
     no_skip: bool = typer.Option(
         False,

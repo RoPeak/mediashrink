@@ -200,6 +200,16 @@ def test_wizard_subcommand_registered() -> None:
     assert "wizard" in result.stdout.lower() or "encoding" in result.stdout.lower()
 
 
+def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
+    with patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)), \
+         patch("mediashrink.cli.EncodingDisplay"), \
+         patch("mediashrink.wizard.run_wizard", return_value=([], "cancel")) as mock_run_wizard:
+        result = runner.invoke(app, ["wizard", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert mock_run_wizard.call_args.kwargs["recursive"] is True
+
+
 def test_analyze_writes_manifest(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
