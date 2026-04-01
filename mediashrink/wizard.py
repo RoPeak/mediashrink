@@ -22,7 +22,7 @@ from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available
 from mediashrink.models import AnalysisItem, EncodeJob
 from mediashrink.platform_utils import detect_device_labels
-from mediashrink.profiles import SavedProfile, upsert_profile
+from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
 from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
 
 _GB = 1024**3
@@ -66,6 +66,7 @@ class EncoderProfile:
     quality_label: str
     is_recommended: bool
     is_custom: bool = False
+    is_builtin: bool = False
 
 
 def detect_available_encoders(ffmpeg: Path, console: Console) -> list[str]:
@@ -278,6 +279,47 @@ def build_profiles(
         )
     )
     idx += 1
+
+    # Built-in intent presets
+    _BUILTIN_QUALITY_LABELS = {
+        "TV Batch":           "Very good",
+        "Archival":           "Visually lossless",
+        "Fast GPU Transcode": "Good",
+        "Smallest Acceptable": "Acceptable",
+    }
+    best_hw = hardware_profiles[0][0] if hardware_profiles else None
+    best_hw_speed = hardware_profiles[0][1] if hardware_profiles else None
+
+    for bp in get_builtin_profiles():
+        # "Fast GPU Transcode" uses the best available HW encoder, or falls back to sw
+        if bp.name == "Fast GPU Transcode":
+            encoder_key = best_hw if best_hw else "faster"
+            speed = best_hw_speed if best_hw else benchmark_speeds.get("faster")
+            sw_preset = None if best_hw else "faster"
+        else:
+            encoder_key = bp.preset
+            speed = benchmark_speeds.get(bp.preset)
+            if encoder_key not in _HW_ENCODERS:
+                # For slow preset use the slow-speed estimate derived from fast
+                if encoder_key == "slow" and benchmark_speeds.get("fast"):
+                    speed = (benchmark_speeds["fast"] or 0) / 4
+            sw_preset = bp.preset if encoder_key not in _HW_ENCODERS else None
+
+        profiles.append(
+            EncoderProfile(
+                index=idx,
+                name=bp.name,
+                encoder_key=encoder_key,
+                crf=bp.crf,
+                sw_preset=sw_preset,
+                estimated_output_bytes=_estimate_output_bytes(total_input_bytes, bp.crf),
+                estimated_encode_seconds=_estimate_time(total_media_seconds, speed),
+                quality_label=_BUILTIN_QUALITY_LABELS.get(bp.name, "Good"),
+                is_recommended=False,
+                is_builtin=True,
+            )
+        )
+        idx += 1
 
     profiles.append(
         EncoderProfile(

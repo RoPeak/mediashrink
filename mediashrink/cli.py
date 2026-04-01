@@ -21,7 +21,7 @@ from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_res
 from mediashrink.encoder import encode_file
 from mediashrink.models import EncodeJob, EncodeResult, SessionManifest
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
-from mediashrink.profiles import delete_profile, get_profile, load_profiles
+from mediashrink.profiles import delete_profile, get_profile, list_all_profiles, load_profiles
 from mediashrink.session import (
     build_session,
     find_resumable_session,
@@ -567,14 +567,19 @@ def wizard(
 @profiles_app.command("list")
 def list_profiles() -> None:
     """List saved encoding profiles."""
-    profiles = load_profiles()
+    profiles = list_all_profiles()
     if not profiles:
         console.print("[dim]No saved profiles.[/dim]")
         raise typer.Exit(code=0)
 
     for profile in profiles:
         label = f" - {profile.label}" if profile.label else ""
-        source = " (wizard)" if profile.created_from_wizard else ""
+        if profile.builtin:
+            source = " [dim](builtin)[/dim]"
+        elif profile.created_from_wizard:
+            source = " (wizard)"
+        else:
+            source = ""
         console.print(f"{profile.name}: preset={profile.preset}, crf={profile.crf}{label}{source}")
 
 

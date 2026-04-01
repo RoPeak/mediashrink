@@ -191,7 +191,9 @@ def test_profiles_list_and_delete(tmp_path: Path, monkeypatch) -> None:
     assert "tv: preset=fast, crf=20 - Balanced (wizard)" in list_result.stdout
     assert delete_result.exit_code == 0
     assert "Deleted profile" in delete_result.stdout
-    assert "No saved profiles" in list_after_delete.stdout
+    # After deleting the only user profile, builtins are still listed
+    assert "tv:" not in list_after_delete.stdout
+    assert "TV Batch" in list_after_delete.stdout
 
 
 def test_wizard_subcommand_registered() -> None:

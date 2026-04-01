@@ -311,6 +311,71 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
     assert mock_build_jobs.call_args.kwargs["files"] == [recommended_path, maybe_path]
 
 
+# ---------------------------------------------------------------------------
+# Built-in profiles in wizard
+# ---------------------------------------------------------------------------
+
+_BUILTIN_NAMES = {"TV Batch", "Archival", "Fast GPU Transcode", "Smallest Acceptable"}
+
+
+def test_build_profiles_includes_builtins() -> None:
+    profiles = build_profiles(
+        available_hw=[],
+        benchmark_speeds={"fast": 0.3},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+    names = {p.name for p in profiles}
+    assert _BUILTIN_NAMES.issubset(names)
+
+
+def test_builtin_profiles_have_is_builtin_flag() -> None:
+    profiles = build_profiles(
+        available_hw=[],
+        benchmark_speeds={"fast": 0.3},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+    builtin_profiles = [p for p in profiles if p.name in _BUILTIN_NAMES]
+    assert len(builtin_profiles) == 4
+    assert all(p.is_builtin for p in builtin_profiles)
+
+
+def test_builtin_fast_gpu_substitutes_sw_when_no_hw() -> None:
+    profiles = build_profiles(
+        available_hw=[],
+        benchmark_speeds={"fast": 0.3, "faster": 0.5},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+    gpu_profile = next(p for p in profiles if p.name == "Fast GPU Transcode")
+    # No HW available — should fall back to software preset
+    assert gpu_profile.encoder_key not in {"qsv", "nvenc", "amf"}
+    assert gpu_profile.sw_preset is not None
+
+
+def test_builtin_fast_gpu_uses_best_hw_when_available() -> None:
+    profiles = build_profiles(
+        available_hw=["qsv", "nvenc"],
+        benchmark_speeds={"qsv": 4.0, "nvenc": 8.0, "fast": 0.3},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+    gpu_profile = next(p for p in profiles if p.name == "Fast GPU Transcode")
+    # Best HW is nvenc (speed 8.0)
+    assert gpu_profile.encoder_key == "nvenc"
+
+
+def test_build_profiles_custom_is_last() -> None:
+    profiles = build_profiles(
+        available_hw=[],
+        benchmark_speeds={"fast": 0.3},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+    assert profiles[-1].is_custom
+
+
 def _analysis_item(source: Path, recommendation: str) -> AnalysisItem:
     source.write_bytes(b"x")
     return AnalysisItem(
