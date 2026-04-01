@@ -55,8 +55,10 @@ def test_benchmark_encoder_returns_speed_on_success(tmp_path: Path) -> None:
     mock_result = MagicMock()
     mock_result.returncode = 0
 
-    with patch("mediashrink.wizard.subprocess.run", return_value=mock_result), \
-         patch("mediashrink.wizard.time.monotonic", side_effect=[0.0, 4.0]):
+    with (
+        patch("mediashrink.wizard.subprocess.run", return_value=mock_result),
+        patch("mediashrink.wizard.time.monotonic", side_effect=[0.0, 4.0]),
+    ):
         speed = benchmark_encoder("fast", sample, 40.0, 20, FFMPEG)
 
     assert speed == pytest.approx(2.0, rel=0.01)
@@ -69,8 +71,10 @@ def test_benchmark_encoder_hardware_key(tmp_path: Path) -> None:
     mock_result = MagicMock()
     mock_result.returncode = 0
 
-    with patch("mediashrink.wizard.subprocess.run", return_value=mock_result) as mock_run, \
-         patch("mediashrink.wizard.time.monotonic", side_effect=[0.0, 2.0]):
+    with (
+        patch("mediashrink.wizard.subprocess.run", return_value=mock_result) as mock_run,
+        patch("mediashrink.wizard.time.monotonic", side_effect=[0.0, 2.0]),
+    ):
         benchmark_encoder("qsv", sample, 40.0, 20, FFMPEG)
 
     cmd = mock_run.call_args[0][0]
@@ -171,8 +175,10 @@ def test_maybe_save_profile_persists_choice(tmp_path: Path, monkeypatch) -> None
     console = Console()
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
 
-    with patch("mediashrink.wizard.typer.confirm", return_value=True), \
-         patch("mediashrink.wizard.typer.prompt", return_value="tv-batch"):
+    with (
+        patch("mediashrink.wizard.typer.confirm", return_value=True),
+        patch("mediashrink.wizard.typer.prompt", return_value="tv-batch"),
+    ):
         maybe_save_profile("slow", 18, "Best Quality", console)
 
     from mediashrink.profiles import get_profile
@@ -203,20 +209,24 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
     fake_job = _job_for(source)
     selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
 
-    with patch("mediashrink.wizard.scan_directory", return_value=[source]), \
-         patch("mediashrink.wizard.get_duration_seconds", return_value=120.0), \
-         patch("mediashrink.wizard.detect_available_encoders", return_value=[]), \
-         patch("mediashrink.wizard.detect_device_labels", return_value={}), \
-         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0), \
-         patch("mediashrink.wizard.display_profiles_table"), \
-         patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
-         patch("mediashrink.wizard.maybe_save_profile"), \
-         patch("mediashrink.wizard.encode_preview", return_value=_fake_preview_result(source)), \
-         patch("mediashrink.wizard.analyze_directory", return_value=[recommended, maybe]) as mock_analyze, \
-         patch("mediashrink.wizard.display_analysis_summary"), \
-         patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"), \
-         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.wizard.typer.confirm", return_value=True):
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard.encode_preview", return_value=_fake_preview_result(source)),
+        patch(
+            "mediashrink.wizard.analyze_directory", return_value=[recommended, maybe]
+        ) as mock_analyze,
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.wizard.typer.confirm", return_value=True),
+    ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, True, None, False, False, console)
 
     assert action == "encode"
@@ -233,22 +243,24 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
     selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
     manifest_path = tmp_path / "analysis.json"
 
-    with patch("mediashrink.wizard.scan_directory", return_value=[source]), \
-         patch("mediashrink.wizard.get_duration_seconds", return_value=120.0), \
-         patch("mediashrink.wizard.detect_available_encoders", return_value=[]), \
-         patch("mediashrink.wizard.detect_device_labels", return_value={}), \
-         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0), \
-         patch("mediashrink.wizard.display_profiles_table"), \
-         patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
-         patch("mediashrink.wizard.maybe_save_profile"), \
-         patch("mediashrink.wizard.encode_preview"), \
-         patch("mediashrink.wizard.typer.confirm", return_value=False), \
-         patch("mediashrink.wizard.analyze_directory", return_value=[recommended]), \
-         patch("mediashrink.wizard.display_analysis_summary"), \
-         patch("mediashrink.wizard.prompt_analysis_action", return_value="export"), \
-         patch("mediashrink.wizard.typer.prompt", return_value=str(manifest_path)), \
-         patch("mediashrink.wizard.save_manifest") as mock_save_manifest, \
-         patch("mediashrink.wizard.build_jobs") as mock_build_jobs:
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard.encode_preview"),
+        patch("mediashrink.wizard.typer.confirm", return_value=False),
+        patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="export"),
+        patch("mediashrink.wizard.typer.prompt", return_value=str(manifest_path)),
+        patch("mediashrink.wizard.save_manifest") as mock_save_manifest,
+        patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
+    ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
 
     assert action == "export"
@@ -264,19 +276,21 @@ def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> 
     maybe = _analysis_item(source, "maybe")
     selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
 
-    with patch("mediashrink.wizard.scan_directory", return_value=[source]), \
-         patch("mediashrink.wizard.get_duration_seconds", return_value=120.0), \
-         patch("mediashrink.wizard.detect_available_encoders", return_value=[]), \
-         patch("mediashrink.wizard.detect_device_labels", return_value={}), \
-         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0), \
-         patch("mediashrink.wizard.display_profiles_table"), \
-         patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
-         patch("mediashrink.wizard.maybe_save_profile"), \
-         patch("mediashrink.wizard.encode_preview"), \
-         patch("mediashrink.wizard.typer.confirm", return_value=False), \
-         patch("mediashrink.wizard.analyze_directory", return_value=[maybe]), \
-         patch("mediashrink.wizard.display_analysis_summary"), \
-         patch("mediashrink.wizard.build_jobs") as mock_build_jobs:
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard.encode_preview"),
+        patch("mediashrink.wizard.typer.confirm", return_value=False),
+        patch("mediashrink.wizard.analyze_directory", return_value=[maybe]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
+    ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
 
     assert action == "cancel"
@@ -295,26 +309,82 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
     fake_job = _job_for(recommended_path)
     selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
 
-    with patch("mediashrink.wizard.scan_directory", return_value=[recommended_path, maybe_path]), \
-         patch("mediashrink.wizard.get_duration_seconds", return_value=120.0), \
-         patch("mediashrink.wizard.detect_available_encoders", return_value=[]), \
-         patch("mediashrink.wizard.detect_device_labels", return_value={}), \
-         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0), \
-         patch("mediashrink.wizard.display_profiles_table"), \
-         patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
-         patch("mediashrink.wizard.maybe_save_profile"), \
-         patch("mediashrink.wizard.encode_preview", return_value=_fake_preview_result(recommended_path)), \
-         patch("mediashrink.wizard.analyze_directory", return_value=[recommended, maybe]), \
-         patch("mediashrink.wizard.display_analysis_summary"), \
-         patch("mediashrink.wizard.prompt_analysis_action", return_value="review_maybe"), \
-         patch("mediashrink.wizard.review_maybe_items", return_value=True), \
-         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs, \
-         patch("mediashrink.wizard.typer.confirm", return_value=True):
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[recommended_path, maybe_path]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch(
+            "mediashrink.wizard.encode_preview", return_value=_fake_preview_result(recommended_path)
+        ),
+        patch("mediashrink.wizard.analyze_directory", return_value=[recommended, maybe]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="review_maybe"),
+        patch("mediashrink.wizard.review_maybe_items", return_value=True),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch("mediashrink.wizard.typer.confirm", return_value=True),
+    ):
         jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
 
     assert action == "encode"
     assert jobs == [fake_job]
     assert mock_build_jobs.call_args.kwargs["files"] == [recommended_path, maybe_path]
+
+
+def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    smaller = tmp_path / "small.mkv"
+    larger = tmp_path / "large.mkv"
+    smaller.write_bytes(b"x" * 1000)
+    larger.write_bytes(b"x" * 2000)
+    recommended = AnalysisItem(
+        source=larger,
+        codec="h264",
+        size_bytes=2 * 1024**3,
+        duration_seconds=120.0,
+        bitrate_kbps=12000.0,
+        estimated_output_bytes=800 * 1024**2,
+        estimated_savings_bytes=(2 * 1024**3) - (800 * 1024**2),
+        recommendation="recommended",
+        reason_code="reason",
+        reason_text="reason text",
+    )
+    fake_job = _job_for(larger)
+    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    preview_result = _fake_preview_result(larger)
+    preview_result.job.output.write_bytes(b"preview")
+
+    with (
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.scan_directory", return_value=[smaller, larger]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard.encode_preview", return_value=preview_result),
+        patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.wizard.typer.confirm", side_effect=[True, False, False]) as mock_confirm,
+    ):
+        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+
+    output = console.export_text()
+
+    assert action == "cancel"
+    assert jobs == []
+    assert f"preview {larger.name}" in output
+    assert "Selected profile:" in output
+    assert "sample-based" in output
+    assert "Use the preview clip as a quality check" in output
+    confirm_prompts = [call.args[0] for call in mock_confirm.call_args_list]
+    assert "Test a 2-minute preview clip before the full batch?" in confirm_prompts
+    assert "  Delete originals only after successful side-by-side encodes?" in confirm_prompts
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +506,7 @@ def _fake_preview_result(source: Path) -> EncodeResult:
 # Stage 9 — --auto mode
 # ---------------------------------------------------------------------------
 
+
 def test_run_wizard_auto_selects_recommended_profile(tmp_path: Path) -> None:
     console = Console()
     source = tmp_path / "ep01.mkv"
@@ -446,18 +517,24 @@ def test_run_wizard_auto_selects_recommended_profile(tmp_path: Path) -> None:
     # Balanced is recommended when no HW available
     selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
 
-    with patch("mediashrink.wizard.scan_directory", return_value=[source]), \
-         patch("mediashrink.wizard.get_duration_seconds", return_value=120.0), \
-         patch("mediashrink.wizard.detect_available_encoders", return_value=[]), \
-         patch("mediashrink.wizard.detect_device_labels", return_value={}), \
-         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0), \
-         patch("mediashrink.wizard.display_profiles_table"), \
-         patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]) as mock_build_profiles, \
-         patch("mediashrink.wizard.analyze_directory", return_value=[recommended]), \
-         patch("mediashrink.wizard.display_analysis_summary"), \
-         patch("mediashrink.wizard.prompt_analysis_action") as mock_action, \
-         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True)
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch(
+            "mediashrink.wizard.build_profiles", return_value=[selected_profile]
+        ) as mock_build_profiles,
+        patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action") as mock_action,
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+    ):
+        jobs, action, _ = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True
+        )
 
     assert action == "encode"
     assert jobs == [fake_job]
@@ -472,19 +549,23 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
     fake_job = _job_for(source)
     selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
 
-    with patch("mediashrink.wizard.scan_directory", return_value=[source]), \
-         patch("mediashrink.wizard.get_duration_seconds", return_value=120.0), \
-         patch("mediashrink.wizard.detect_available_encoders", return_value=[]), \
-         patch("mediashrink.wizard.detect_device_labels", return_value={}), \
-         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0), \
-         patch("mediashrink.wizard.display_profiles_table"), \
-         patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]), \
-         patch("mediashrink.wizard.analyze_directory", return_value=[recommended]), \
-         patch("mediashrink.wizard.display_analysis_summary"), \
-         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]), \
-         patch("mediashrink.wizard.typer.confirm") as mock_confirm, \
-         patch("mediashrink.wizard.typer.prompt") as mock_prompt:
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True)
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard.get_duration_seconds", return_value=120.0),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]),
+        patch("mediashrink.wizard.analyze_directory", return_value=[recommended]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.wizard.typer.confirm") as mock_confirm,
+        patch("mediashrink.wizard.typer.prompt") as mock_prompt,
+    ):
+        jobs, action, _ = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True
+        )
 
     assert action == "encode"
     mock_confirm.assert_not_called()
@@ -494,6 +575,7 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Stage 10 — UX polish regression tests
 # ---------------------------------------------------------------------------
+
 
 def test_next_step_menu_no_maybe_items() -> None:
     """When maybe_count=0, menu should be 1/2/3 not 1/3/4."""
@@ -507,6 +589,7 @@ def test_next_step_menu_no_maybe_items() -> None:
     # Always choose option 1 to avoid looping
     with patch("mediashrink.wizard.typer.prompt", return_value="1"):
         from mediashrink.wizard import prompt_analysis_action
+
         action = prompt_analysis_action(3, 0, CapturingConsole())  # type: ignore[arg-type]
 
     assert action == "compress_recommended"
@@ -516,3 +599,21 @@ def test_next_step_menu_no_maybe_items() -> None:
     assert "2." in joined
     assert "3." in joined
     assert "4." not in joined
+
+
+def test_next_step_menu_includes_counts_when_maybe_present() -> None:
+    output_lines: list[str] = []
+
+    class CapturingConsole:
+        def print(self, msg: str = "", **kwargs: object) -> None:
+            output_lines.append(str(msg))
+
+    with patch("mediashrink.wizard.typer.prompt", return_value="1"):
+        from mediashrink.wizard import prompt_analysis_action
+
+        action = prompt_analysis_action(22, 5, CapturingConsole())  # type: ignore[arg-type]
+
+    assert action == "compress_recommended"
+    joined = "\n".join(output_lines)
+    assert "Compress recommended only (22 file(s))" in joined
+    assert "Review maybe files (5 file(s))" in joined

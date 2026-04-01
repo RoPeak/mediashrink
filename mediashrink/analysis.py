@@ -240,6 +240,8 @@ def display_analysis_summary(
     total_estimated = sum(item.estimated_output_bytes for item in recommended)
     total_saved = sum(item.estimated_savings_bytes for item in recommended)
     total_saved_pct = total_saved / total_current * 100 if total_current else 0.0
+    maybe_total = sum(item.size_bytes for item in maybe)
+    skipped_total = sum(item.size_bytes for item in skipped)
 
     console.print()
     console.print(table)
@@ -248,6 +250,13 @@ def display_analysis_summary(
         f"[green bold]{len(recommended)}[/green bold] recommended, "
         f"[yellow]{len(maybe)}[/yellow] maybe, "
         f"[dim]{len(skipped)}[/dim] skip",
+        highlight=False,
+    )
+    console.print(
+        f"Rollup: "
+        f"[green]recommended {len(recommended)} / {_fmt_size(total_current)}[/green], "
+        f"[yellow]maybe {len(maybe)} / {_fmt_size(maybe_total)}[/yellow], "
+        f"[dim]skip {len(skipped)} / {_fmt_size(skipped_total)}[/dim]",
         highlight=False,
     )
     if recommended:

@@ -113,13 +113,15 @@ def _run_encode_loop(
             # Use input size as the task total so DownloadColumn shows GB-scale numbers
             task_total = max(file_size, 1)
             progress.update(
-                file_task, description=f"[white]{filename}", completed=0, total=task_total
+                file_task,
+                description=f"[dim]In progress:[/dim] [white]{filename}",
+                completed=0,
+                total=task_total,
             )
 
-            def make_callback(ft=file_task, fb=file_size, ot=overall_task, bd=bytes_done):
+            def make_callback(ft=file_task, fb=file_size):
                 def callback(pct: float) -> None:
                     progress.update(ft, completed=fb * pct / 100)
-                    progress.update(ot, completed=bd + fb * pct / 100)
 
                 return callback
 
@@ -157,7 +159,9 @@ def _run_encode_loop(
             if not job.skip:
                 bytes_done += file_size
                 progress.update(overall_task, completed=bytes_done)
-                progress.update(file_task, completed=100)
+                progress.update(file_task, completed=task_total)
+
+        progress.remove_task(file_task)
 
     display.show_summary(results)
     return results

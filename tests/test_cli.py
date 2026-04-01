@@ -870,3 +870,59 @@ def test_progress_bar_nonzero_total(tmp_path: Path) -> None:
     ]
     assert totals, "progress.update was never called with a total="
     assert all(t >= 1 for t in totals), f"Found zero or negative total: {totals}"
+
+
+def test_run_encode_loop_removes_file_task_and_updates_overall_only_on_completion(
+    tmp_path: Path,
+) -> None:
+    from mediashrink.cli import _run_encode_loop
+    from unittest.mock import MagicMock
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 5_000_000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=5_000_000,
+        output_size_bytes=2_500_000,
+        duration_seconds=2.0,
+        media_duration_seconds=120.0,
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    def fake_encode_file(*args: object, **kwargs: object) -> EncodeResult:
+        progress_callback = kwargs["progress_callback"]
+        assert callable(progress_callback)
+        progress_callback(50.0)
+        return ok_result
+
+    with patch("mediashrink.cli.encode_file", side_effect=fake_encode_file):
+        _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
+
+    overall_updates = [
+        kwargs["completed"]
+        for args, kwargs in mock_progress.update.call_args_list
+        if args and args[0] == 0 and "completed" in kwargs
+    ]
+    assert overall_updates == [5_000_000]
+    mock_progress.remove_task.assert_called_once_with(1)
+    mock_display.show_summary.assert_called_once_with([ok_result])

@@ -399,6 +399,7 @@ def display_profiles_table(
     device_labels: dict[str, str],
     console: Console,
 ) -> None:
+    compact = console.width < 120
     table = Table(
         title="Available encoding profiles",
         header_style="bold cyan",
@@ -408,20 +409,21 @@ def display_profiles_table(
     table.add_column("#", justify="right", style="bold", no_wrap=True)
     table.add_column("Profile", no_wrap=True)
     table.add_column("Encoder", style="dim cyan")
-    table.add_column("CRF", justify="center", no_wrap=True)
-    table.add_column("Est. Output", justify="right", style="green", no_wrap=True)
     table.add_column("Est. Saving", justify="right", style="bold green", no_wrap=True)
     table.add_column("Est. Time", justify="right", no_wrap=True)
     table.add_column("Quality", no_wrap=True)
-    table.add_column("", no_wrap=True)
+    if not compact:
+        table.add_column("CRF", justify="center", no_wrap=True)
 
     for profile in profiles:
         if profile.is_custom:
-            table.add_row(str(profile.index), "Custom", "-", "-", "-", "-", "-", "-", "")
+            row: list[str | Text] = [str(profile.index), "Custom", "-", "-", "-", "-"]
+            if not compact:
+                row.append("-")
+            table.add_row(*row)
             continue
 
         encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
-        est_out = _fmt_size(profile.estimated_output_bytes)
         saved = total_input_bytes - profile.estimated_output_bytes
         saved_pct = saved / total_input_bytes * 100 if total_input_bytes else 0
         est_saving = f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
@@ -430,25 +432,29 @@ def display_profiles_table(
             if profile.estimated_encode_seconds > 0
             else "~unknown"
         )
-        tag = Text("RECOMMENDED", style="bold cyan") if profile.is_recommended else Text("")
         quality_style = {
             "Visually lossless": "green bold",
             "Excellent": "green",
             "Very good": "green",
             "Good": "yellow",
         }.get(profile.quality_label, "white")
+        profile_name: str | Text = (
+            Text.assemble(profile.name, " ", ("[recommended]", "bold cyan"))
+            if profile.is_recommended
+            else profile.name
+        )
 
-        table.add_row(
+        row = [
             str(profile.index),
-            profile.name,
+            profile_name,
             encoder_display,
-            str(profile.crf),
-            f"~{est_out}",
             est_saving,
             est_time,
             Text(profile.quality_label, style=quality_style),
-            tag,
-        )
+        ]
+        if not compact:
+            row.append(str(profile.crf))
+        table.add_row(*row)
 
     console.print()
     console.print(table)
@@ -460,6 +466,8 @@ def display_profiles_table(
     console.print(
         "  [dim]For lower wait time, choose Fastest on this device or Faster Encode.[/dim]"
     )
+    if compact:
+        console.print("  [dim]Compact view hides lower-priority columns on narrow terminals.[/dim]")
     console.print()
 
 
@@ -598,9 +606,9 @@ def display_candidate_table(title: str, items: list[AnalysisItem], console: Cons
 
 def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Console) -> str:
     console.print("[bold]Next step:[/bold]")
-    console.print("  1. Compress recommended only")
+    console.print(f"  1. Compress recommended only ({recommended_count} file(s))")
     if maybe_count:
-        console.print("  2. Review maybe files")
+        console.print(f"  2. Review maybe files ({maybe_count} file(s))")
         console.print("  3. Export manifest")
         console.print("  4. Cancel")
         max_choice = 4
@@ -686,6 +694,13 @@ def run_wizard(
             console.print(f"  - {_encoder_display_name(key, device_labels)}")
     else:
         console.print("[dim]No hardware encoders detected. Software only.[/dim]")
+    console.print(
+        f"[dim]Next: benchmark a representative sample, suggest profiles, and optionally preview "
+        f"{sample_file.name} before batch encoding.[/dim]"
+    )
+    console.print(
+        "[dim]Benchmark and analysis estimates are sample-based and may differ from final encode results.[/dim]"
+    )
 
     candidates_to_bench = list(available_hw) + ["fast", "faster"]
     benchmark_speeds: dict[str, float | None] = {}
@@ -727,12 +742,17 @@ def run_wizard(
         crf = selected.crf
         sw_preset = selected.sw_preset
         display_label = selected.name
+    console.print(
+        f"[dim]Selected profile:[/dim] {display_label} "
+        f"([dim]encoder:[/dim] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}, "
+        f"[dim]CRF:[/dim] {crf})"
+    )
 
     if not auto:
         maybe_save_profile(preset, crf, display_label, console)
 
     if not auto and typer.confirm(
-        "Test encode the first 2 minutes before the full batch?", default=False
+        "Test a 2-minute preview clip before the full batch?", default=False
     ):
         console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
         preview_result = encode_preview(
@@ -748,7 +768,12 @@ def run_wizard(
         EncodingDisplay(console).show_summary([preview_result])
         if preview_result.success and preview_result.job.output.exists():
             console.print(f"  [dim]Preview saved:[/dim] {preview_result.job.output}")
-            console.print("  [dim]Inspect the preview before continuing.[/dim]")
+            console.print(
+                "  [dim]Inspect video quality and verify audio/subtitle playback before continuing.[/dim]"
+            )
+            console.print(
+                "  [dim]Use the preview clip as a quality check, not as a file-size estimate.[/dim]"
+            )
         if not preview_result.success:
             if preview_result.error_message:
                 console.print(f"[red]Preview encode failed:[/red] {preview_result.error_message}")
@@ -837,6 +862,11 @@ def run_wizard(
         selected_saved_bytes / selected_input_bytes * 100 if selected_input_bytes else 0.0
     )
     console.print(f"  Input:    {_fmt_size(selected_input_bytes)}")
+    not_selected_count = len(analysis_items) - len(selected_items)
+    if not_selected_count > 0:
+        console.print(
+            f"  [yellow]Not in this run:[/yellow] {not_selected_count} file(s) left out as maybe/skip candidates."
+        )
     if selected_output_bytes > 0:
         console.print(
             f"  Est. out: ~{_fmt_size(selected_output_bytes)}  "
@@ -863,7 +893,10 @@ def run_wizard(
 
     cleanup_after = False
     if not overwrite and output_dir is None and not auto:
-        cleanup_after = typer.confirm("  Delete originals after successful encodes?", default=False)
+        cleanup_after = typer.confirm(
+            "  Delete originals only after successful side-by-side encodes?",
+            default=False,
+        )
     console.print()
 
     if not auto:
