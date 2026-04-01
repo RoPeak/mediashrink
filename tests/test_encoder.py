@@ -46,6 +46,7 @@ def _make_job(tmp_path: Path, **kwargs) -> EncodeJob:
 # build_ffmpeg_command
 # ---------------------------------------------------------------------------
 
+
 def test_build_ffmpeg_command_structure(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
     cmd = build_ffmpeg_command(job, FFMPEG)
@@ -103,6 +104,7 @@ def test_build_ffmpeg_command_nvenc(tmp_path: Path) -> None:
 # Hardware tuning flags
 # ---------------------------------------------------------------------------
 
+
 def test_build_hw_command_qsv_includes_tuning(tmp_path: Path) -> None:
     job = _make_job(tmp_path, crf=20, preset="qsv")
     cmd = build_ffmpeg_command(job, FFMPEG)
@@ -128,10 +130,21 @@ def test_build_hw_command_amf_includes_tuning(tmp_path: Path) -> None:
     job = _make_job(tmp_path, crf=20, preset="amf")
     cmd = build_ffmpeg_command(job, FFMPEG)
     assert "hevc_amf" in cmd
+    assert "-rc" in cmd
+    rc_idx = cmd.index("-rc")
+    assert cmd[rc_idx + 1] == "cqp"
+    assert "-qp_i" in cmd
+    qp_i_idx = cmd.index("-qp_i")
+    assert cmd[qp_i_idx + 1] == "20"
+    assert "-qp_p" in cmd
+    qp_p_idx = cmd.index("-qp_p")
+    assert cmd[qp_p_idx + 1] == "20"
     assert "-quality" in cmd
     quality_idx = cmd.index("-quality")
     assert cmd[quality_idx + 1] == "balanced"
-    assert "-bf_ref" in cmd
+    assert "-bf_ref" not in cmd
+    tag_idx = cmd.index("-tag:v")
+    assert cmd[tag_idx + 1] == "hev1"
 
 
 def test_is_hardware_preset() -> None:
@@ -145,6 +158,7 @@ def test_is_hardware_preset() -> None:
 # ---------------------------------------------------------------------------
 # parse_progress_line
 # ---------------------------------------------------------------------------
+
 
 def test_parse_progress_line_basic() -> None:
     assert parse_progress_line("out_time_ms=5000000") == {"out_time_ms": "5000000"}
@@ -166,6 +180,7 @@ def test_parse_progress_line_progress_end() -> None:
 # encode_file — success path
 # ---------------------------------------------------------------------------
 
+
 def test_encode_file_success(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
 
@@ -177,9 +192,11 @@ def test_encode_file_success(tmp_path: Path) -> None:
         dest.write_bytes(b"compressed output")
         return dest
 
-    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0), \
-         patch("pathlib.Path.rename", fake_rename):
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+        patch("pathlib.Path.rename", fake_rename),
+    ):
         result = encode_file(job, FFMPEG, FFPROBE)
 
     assert result.success is True
@@ -193,19 +210,23 @@ def test_encode_file_reports_progress(tmp_path: Path) -> None:
 
     mock_process = MagicMock()
     mock_process.returncode = 0
-    mock_process.stdout = iter([
-        "out_time_ms=5000000\n",
-        "out_time_ms=10000000\n",
-        "progress=end\n",
-    ])
+    mock_process.stdout = iter(
+        [
+            "out_time_ms=5000000\n",
+            "out_time_ms=10000000\n",
+            "progress=end\n",
+        ]
+    )
 
     def fake_rename(self: Path, dest: Path) -> Path:
         dest.write_bytes(b"x")
         return dest
 
-    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0), \
-         patch("pathlib.Path.rename", fake_rename):
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+        patch("pathlib.Path.rename", fake_rename),
+    ):
         encode_file(job, FFMPEG, FFPROBE, progress_callback=reported.append)
 
     assert len(reported) == 2
@@ -217,6 +238,7 @@ def test_encode_file_reports_progress(tmp_path: Path) -> None:
 # encode_file — failure path
 # ---------------------------------------------------------------------------
 
+
 def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
     job.tmp_output.write_bytes(b"partial")
@@ -225,8 +247,10 @@ def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
     mock_process.returncode = 1
     mock_process.stdout = iter([])
 
-    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0):
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+    ):
         result = encode_file(job, FFMPEG, FFPROBE)
 
     assert result.success is False
@@ -238,6 +262,7 @@ def test_encode_file_failure_cleans_up_tmp(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # encode_file — skip path
 # ---------------------------------------------------------------------------
+
 
 def test_encode_file_skip(tmp_path: Path) -> None:
     job = _make_job(tmp_path, skip=True, skip_reason="already HEVC")
@@ -254,6 +279,7 @@ def test_encode_file_skip(tmp_path: Path) -> None:
 # encode_file — dry run
 # ---------------------------------------------------------------------------
 
+
 def test_encode_file_dry_run_no_subprocess(tmp_path: Path) -> None:
     job = _make_job(tmp_path, dry_run=True)
 
@@ -269,6 +295,7 @@ def test_encode_file_dry_run_no_subprocess(tmp_path: Path) -> None:
 # encode_file — keyboard interrupt
 # ---------------------------------------------------------------------------
 
+
 def test_encode_file_interrupt_cleans_up_tmp(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
     job.tmp_output.write_bytes(b"partial")
@@ -280,8 +307,10 @@ def test_encode_file_interrupt_cleans_up_tmp(tmp_path: Path) -> None:
     mock_process = MagicMock()
     mock_process.stdout = raising_stdout()
 
-    with patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process), \
-         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0):
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+    ):
         with pytest.raises(KeyboardInterrupt):
             encode_file(job, FFMPEG, FFPROBE)
 
@@ -293,8 +322,10 @@ def test_encode_file_interrupt_cleans_up_tmp(tmp_path: Path) -> None:
 # estimate_output_size
 # ---------------------------------------------------------------------------
 
+
 def _mock_ffprobe_responses(duration: float, bitrate_kbps: float, width: int, height: int):
     """Return a side_effect callable for subprocess.run covering duration, bitrate, resolution calls."""
+
     def _run(cmd, **kwargs):
         cmd_str = " ".join(str(c) for c in cmd)
         result = MagicMock()
@@ -308,16 +339,22 @@ def _mock_ffprobe_responses(duration: float, bitrate_kbps: float, width: int, he
         else:
             result.stdout = ""
         return result
+
     return _run
 
 
 def test_estimate_output_size_h264(tmp_path: Path) -> None:
     source = tmp_path / "ep.mkv"
     source.write_bytes(b"x" * 100)
-    source_size = 5 * 1024 ** 3
+    source_size = 5 * 1024**3
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 15000, 1920, 1080)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(2700, 15000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         result = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
 
@@ -330,15 +367,25 @@ def test_estimate_output_size_h264(tmp_path: Path) -> None:
 def test_estimate_output_size_vc1_lower_than_h264(tmp_path: Path) -> None:
     source = tmp_path / "ep.mkv"
     source.write_bytes(b"x" * 100)
-    source_size = 7 * 1024 ** 3
+    source_size = 7 * 1024**3
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 12000, 1920, 1080)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(2700, 12000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         vc1_result = estimate_output_size(source, FFPROBE, codec="vc1", crf=20)
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 12000, 1920, 1080)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(2700, 12000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         h264_result = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
 
@@ -349,15 +396,25 @@ def test_estimate_output_size_vc1_lower_than_h264(tmp_path: Path) -> None:
 def test_estimate_output_size_4k_lower_than_1080p(tmp_path: Path) -> None:
     source = tmp_path / "ep.mkv"
     source.write_bytes(b"x" * 100)
-    source_size = 10 * 1024 ** 3
+    source_size = 10 * 1024**3
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(7200, 20000, 1920, 1080)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(7200, 20000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         result_1080 = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(7200, 20000, 3840, 2160)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(7200, 20000, 3840, 2160),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         result_4k = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
 
@@ -368,15 +425,25 @@ def test_estimate_output_size_4k_lower_than_1080p(tmp_path: Path) -> None:
 def test_estimate_output_size_higher_crf_smaller(tmp_path: Path) -> None:
     source = tmp_path / "ep.mkv"
     source.write_bytes(b"x" * 100)
-    source_size = 5 * 1024 ** 3
+    source_size = 5 * 1024**3
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 10000, 1920, 1080)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(2700, 10000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         result_crf20 = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
 
-    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 10000, 1920, 1080)), \
-         patch("pathlib.Path.stat") as mock_stat:
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(2700, 10000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+    ):
         mock_stat.return_value.st_size = source_size
         result_crf28 = estimate_output_size(source, FFPROBE, codec="h264", crf=28)
 
@@ -407,6 +474,7 @@ def test_codec_base_factor_keys_present() -> None:
 # ---------------------------------------------------------------------------
 # validate_encoder
 # ---------------------------------------------------------------------------
+
 
 def test_validate_encoder_returns_true_on_success(tmp_path: Path) -> None:
     sample = tmp_path / "sample.mkv"
@@ -458,6 +526,7 @@ def test_validate_encoder_returns_false_for_unknown_key(tmp_path: Path) -> None:
 # Stage 6 — encode_preview and duration_limit_seconds
 # ---------------------------------------------------------------------------
 
+
 def test_build_ffmpeg_command_duration_limit(tmp_path: Path) -> None:
     source = tmp_path / "vid.mkv"
     source.write_bytes(b"x")
@@ -506,8 +575,10 @@ def test_encode_preview_output_path(tmp_path: Path) -> None:
         tmp.write_bytes(b"x" * 50)
         return mock_proc
 
-    with patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen), \
-         patch("mediashrink.encoder.get_duration_seconds", return_value=120.0):
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=120.0),
+    ):
         result = encode_preview(source, FFMPEG, FFPROBE, duration_minutes=2.0)
 
     assert result.job.output.stem.endswith("_preview")
@@ -528,8 +599,10 @@ def test_encode_preview_source_unchanged(tmp_path: Path) -> None:
         tmp.write_bytes(b"encoded")
         return mock_proc
 
-    with patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen), \
-         patch("mediashrink.encoder.get_duration_seconds", return_value=60.0):
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=60.0),
+    ):
         encode_preview(source, FFMPEG, FFPROBE)
 
     assert source.read_bytes() == original_data

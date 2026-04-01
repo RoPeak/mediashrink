@@ -160,7 +160,7 @@ def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, cr
 _HW_ENCODERS: dict[str, tuple[str, str, list[str]]] = {
     "qsv": ("hevc_qsv", "-global_quality", ["-preset", "medium", "-look_ahead", "1"]),
     "nvenc": ("hevc_nvenc", "-cq", ["-rc", "vbr", "-preset", "p4", "-tune", "hq", "-bf", "3"]),
-    "amf": ("hevc_amf", "-qp_i", ["-rc", "cqp", "-quality", "balanced", "-bf_ref", "1"]),
+    "amf": ("hevc_amf", "-qp_i", ["-quality", "balanced"]),
 }
 
 
@@ -168,7 +168,7 @@ def _hw_quality_args(encoder_key: str, crf: int) -> list[str]:
     """Return the quality flag(s) for a hardware encoder at the given CRF."""
     _, quality_flag, _ = _HW_ENCODERS[encoder_key]
     if encoder_key == "amf":
-        return ["-qp_i", str(crf), "-qp_p", str(crf)]
+        return ["-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf)]
     return [quality_flag, str(crf)]
 
 
@@ -360,7 +360,7 @@ def _build_hw_command(
         "-c:s",
         "copy",
         "-tag:v",
-        "hvc1",
+        "hev1",  # hvc1 requires inline params (software only); hev1 = container header (hardware)
         "-movflags",
         "+faststart",
         "-loglevel",

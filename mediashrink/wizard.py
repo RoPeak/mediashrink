@@ -670,7 +670,7 @@ def run_wizard(
     )
 
     total_media_seconds = _sum_media_durations(files, ffprobe)
-    sample_file = files[0]
+    sample_file = max(files, key=lambda p: p.stat().st_size)
     sample_duration = get_duration_seconds(sample_file, ffprobe)
     if sample_duration <= 0:
         sample_duration = 3600.0
@@ -746,11 +746,18 @@ def run_wizard(
         from mediashrink.progress import EncodingDisplay
 
         EncodingDisplay(console).show_summary([preview_result])
+        if preview_result.success and preview_result.job.output.exists():
+            console.print(f"  [dim]Preview saved:[/dim] {preview_result.job.output}")
+            console.print("  [dim]Inspect the preview before continuing.[/dim]")
         if not preview_result.success:
             if preview_result.error_message:
                 console.print(f"[red]Preview encode failed:[/red] {preview_result.error_message}")
             else:
                 console.print("[red]Preview encode failed.[/red]")
+            console.print(
+                "[dim]This is likely an encoder configuration issue, not a problem with your files. "
+                "If it persists, try a software profile (e.g. 'Faster Encode').[/dim]"
+            )
             if not typer.confirm("Continue to full batch anyway?", default=False):
                 return [], "cancel", False
 
