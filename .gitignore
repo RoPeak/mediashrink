@@ -34,3 +34,4 @@ Desktop.ini
 *.tmp_*.mkv
 test-output/
 artifacts/
+mediashrink-run-output.txt

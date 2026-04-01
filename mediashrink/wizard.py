@@ -18,6 +18,7 @@ from mediashrink.analysis import (
     estimate_analysis_encode_seconds,
     save_manifest,
 )
+from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available
 from mediashrink.models import AnalysisItem, EncodeJob
 from mediashrink.platform_utils import detect_device_labels
@@ -27,12 +28,7 @@ from mediashrink.scanner import build_jobs, scan_directory, supported_formats_la
 _GB = 1024**3
 _MB = 1024**2
 
-_CRF_COMPRESSION_FACTOR: dict[int, float] = {
-    18: 0.50,
-    20: 0.40,
-    24: 0.30,
-    28: 0.22,
-}
+_CRF_COMPRESSION_FACTOR = CRF_COMPRESSION_FACTOR
 
 _BENCHMARK_SECONDS = 8
 _HARDWARE_DISPLAY_NAMES = {

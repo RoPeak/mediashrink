@@ -101,7 +101,7 @@ def build_jobs(
 
         tmp_output = output.parent / f".tmp_{output.stem}{output.suffix}"
 
-        estimated = estimate_output_size(source, ffprobe) if not skip else 0
+        estimated = estimate_output_size(source, ffprobe, codec=codec, crf=crf) if not skip else 0
 
         jobs.append(
             EncodeJob(

@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from mediashrink.constants import CRF_BASELINE, CRF_COMPRESSION_FACTOR
 from mediashrink.models import EncodeJob, EncodeResult
 
 
@@ -45,36 +46,97 @@ def get_video_bitrate_kbps(path: Path, ffprobe: Path) -> float:
     return 0.0
 
 
-# Approximate bitrate reduction factor for H.265 vs common source codecs at CRF 20.
-# H.265 typically achieves 40-60% of the source bitrate for equivalent quality.
-_HEVC_COMPRESSION_FACTOR = 0.40
+# Per-codec compression factor at CRF_BASELINE (20).
+# Represents the expected output-to-input size ratio after H.265 encoding.
+# Calibrated against real-world encodes (vc1/mpeg2 values from observed runs).
+_CODEC_BASE_FACTOR: dict[str, float] = {
+    "h264":       0.50,
+    "vc1":        0.48,
+    "mpeg2video": 0.48,
+    "hevc":       1.00,  # already H.265 — no meaningful savings expected
+}
+_DEFAULT_CODEC_FACTOR = 0.45  # used for unknown/unlisted codecs
 
 
-def estimate_output_size(path: Path, ffprobe: Path) -> int:
+def get_video_resolution(path: Path, ffprobe: Path) -> tuple[int, int]:
+    """Return (width, height) of the first video stream, or (0, 0) on failure."""
+    cmd = [
+        str(ffprobe),
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "default=nw=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        width = height = 0
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("width="):
+                width = int(line.split("=", 1)[1])
+            elif line.startswith("height="):
+                height = int(line.split("=", 1)[1])
+        return width, height
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return 0, 0
+
+
+def _resolution_factor(width: int, height: int) -> float:
+    """Return a size-estimate multiplier based on resolution.
+
+    4K content tends to compress more efficiently (more spatial redundancy);
+    SD/720p has less room for improvement.
+    """
+    if width > 2000:   # 4K / UHD
+        return 0.85
+    if width >= 1280:  # 1080p / 720p
+        return 1.00
+    return 1.10        # SD — less redundancy, harder to compress
+
+
+def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, crf: int = 20) -> int:
     """
     Estimate the output file size after H.265 encoding.
 
+    Factors in source codec, resolution, CRF value, and video bitrate.
     Uses the video stream bitrate to estimate the new video size, then adds
     the non-video streams (audio, subtitles) which are copied unchanged.
     Returns 0 if estimation is not possible.
     """
     try:
-        # Get total file size and duration
         input_size = path.stat().st_size
         duration = get_duration_seconds(path, ffprobe)
         if duration <= 0:
             return 0
 
-        # Estimate non-video bytes from total bitrate vs video bitrate
+        # Codec factor — how much H.265 compresses this source at CRF baseline
+        codec_factor = _CODEC_BASE_FACTOR.get(codec or "", _DEFAULT_CODEC_FACTOR)
+
+        # CRF scaling — scale relative to the baseline CRF
+        baseline_ratio = CRF_COMPRESSION_FACTOR.get(CRF_BASELINE, 0.40)
+        crf_ratio = CRF_COMPRESSION_FACTOR.get(crf, baseline_ratio)
+        crf_scale = crf_ratio / baseline_ratio
+
+        # Resolution factor
+        width, height = get_video_resolution(path, ffprobe)
+        res_factor = _resolution_factor(width, height)
+
+        combined_factor = codec_factor * crf_scale * res_factor
+
         video_kbps = get_video_bitrate_kbps(path, ffprobe)
         if video_kbps <= 0:
-            # Fall back: assume video is ~85% of file, apply factor to whole file
-            return int(input_size * _HEVC_COMPRESSION_FACTOR)
+            # Fallback: apply factor to whole file
+            return int(input_size * combined_factor)
 
         video_bytes = (video_kbps * 1000 / 8) * duration
         non_video_bytes = max(input_size - video_bytes, 0)
 
-        estimated_video_bytes = video_bytes * _HEVC_COMPRESSION_FACTOR
+        # Extra bonus for very high-bitrate sources (more headroom to compress)
+        if video_kbps > 8000:
+            combined_factor *= 0.90
+
+        estimated_video_bytes = video_bytes * combined_factor
         return int(estimated_video_bytes + non_video_bytes)
     except (OSError, ValueError):
         return 0

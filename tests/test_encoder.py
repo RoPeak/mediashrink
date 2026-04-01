@@ -6,9 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mediashrink.encoder import (
+    _CODEC_BASE_FACTOR,
     build_ffmpeg_command,
     encode_file,
+    estimate_output_size,
     get_duration_seconds,
+    get_video_resolution,
     is_hardware_preset,
     parse_progress_line,
 )
@@ -248,3 +251,118 @@ def test_encode_file_interrupt_cleans_up_tmp(tmp_path: Path) -> None:
 
     assert not job.tmp_output.exists()
     assert job.source.exists()
+
+
+# ---------------------------------------------------------------------------
+# estimate_output_size
+# ---------------------------------------------------------------------------
+
+def _mock_ffprobe_responses(duration: float, bitrate_kbps: float, width: int, height: int):
+    """Return a side_effect callable for subprocess.run covering duration, bitrate, resolution calls."""
+    def _run(cmd, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        result = MagicMock()
+        result.returncode = 0
+        if "format=duration" in cmd_str:
+            result.stdout = f"{duration}\n"
+        elif "stream=bit_rate" in cmd_str:
+            result.stdout = f"{int(bitrate_kbps * 1000)}\n"
+        elif "stream=width,height" in cmd_str:
+            result.stdout = f"width={width}\nheight={height}\n"
+        else:
+            result.stdout = ""
+        return result
+    return _run
+
+
+def test_estimate_output_size_h264(tmp_path: Path) -> None:
+    source = tmp_path / "ep.mkv"
+    source.write_bytes(b"x" * 100)
+    source_size = 5 * 1024 ** 3
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 15000, 1920, 1080)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        result = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
+
+    # h264 factor = 0.50, CRF 20 = baseline scale 1.0, 1080p res factor = 1.0
+    assert result > 0
+    ratio = result / source_size
+    assert 0.40 < ratio < 0.65, f"Expected ~50% ratio, got {ratio:.2f}"
+
+
+def test_estimate_output_size_vc1_lower_than_h264(tmp_path: Path) -> None:
+    source = tmp_path / "ep.mkv"
+    source.write_bytes(b"x" * 100)
+    source_size = 7 * 1024 ** 3
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 12000, 1920, 1080)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        vc1_result = estimate_output_size(source, FFPROBE, codec="vc1", crf=20)
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 12000, 1920, 1080)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        h264_result = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
+
+    # vc1 factor (0.48) < h264 factor (0.50) → vc1 estimate should be smaller
+    assert vc1_result < h264_result
+
+
+def test_estimate_output_size_4k_lower_than_1080p(tmp_path: Path) -> None:
+    source = tmp_path / "ep.mkv"
+    source.write_bytes(b"x" * 100)
+    source_size = 10 * 1024 ** 3
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(7200, 20000, 1920, 1080)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        result_1080 = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(7200, 20000, 3840, 2160)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        result_4k = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
+
+    # 4K has 0.85 resolution factor vs 1.0 for 1080p → 4K estimate should be smaller
+    assert result_4k < result_1080
+
+
+def test_estimate_output_size_higher_crf_smaller(tmp_path: Path) -> None:
+    source = tmp_path / "ep.mkv"
+    source.write_bytes(b"x" * 100)
+    source_size = 5 * 1024 ** 3
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 10000, 1920, 1080)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        result_crf20 = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
+
+    with patch("mediashrink.encoder.subprocess.run", side_effect=_mock_ffprobe_responses(2700, 10000, 1920, 1080)), \
+         patch("pathlib.Path.stat") as mock_stat:
+        mock_stat.return_value.st_size = source_size
+        result_crf28 = estimate_output_size(source, FFPROBE, codec="h264", crf=28)
+
+    assert result_crf28 < result_crf20
+
+
+def test_get_video_resolution(tmp_path: Path) -> None:
+    source = tmp_path / "ep.mkv"
+    source.write_bytes(b"x")
+
+    mock_result = MagicMock()
+    mock_result.stdout = "width=1920\nheight=1080\n"
+
+    with patch("mediashrink.encoder.subprocess.run", return_value=mock_result):
+        w, h = get_video_resolution(source, FFPROBE)
+
+    assert w == 1920
+    assert h == 1080
+
+
+def test_codec_base_factor_keys_present() -> None:
+    assert "h264" in _CODEC_BASE_FACTOR
+    assert "vc1" in _CODEC_BASE_FACTOR
+    assert "hevc" in _CODEC_BASE_FACTOR
+    assert _CODEC_BASE_FACTOR["hevc"] == 1.00
