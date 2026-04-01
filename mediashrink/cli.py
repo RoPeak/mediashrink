@@ -4,7 +4,6 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 import click
 import typer
@@ -23,7 +22,9 @@ from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_res
 from mediashrink.encoder import encode_file, encode_preview
 from mediashrink.models import EncodeJob, EncodeResult, SessionManifest
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
-from mediashrink.profiles import delete_profile, get_profile, list_all_profiles, load_profiles
+from mediashrink.profiles import delete_profile, get_profile, list_all_profiles
+from mediashrink.progress import EncodingDisplay
+from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
 from mediashrink.session import (
     build_session,
     find_resumable_session,
@@ -31,9 +32,6 @@ from mediashrink.session import (
     save_session,
     update_session_entry,
 )
-from mediashrink.progress import EncodingDisplay
-from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
-
 
 EXIT_SUCCESS = 0
 EXIT_NO_FILES = 1
@@ -54,13 +52,15 @@ def _results_to_json(results: list[EncodeResult], exit_code: int) -> str:
             status = "failed"
         saved = r.size_reduction_bytes if r.success else 0
         total_saved += saved
-        files.append({
-            "source": str(r.job.source),
-            "status": status,
-            "input_bytes": r.input_size_bytes,
-            "output_bytes": r.output_size_bytes,
-            "reduction_pct": round(r.size_reduction_pct, 1) if r.success else 0.0,
-        })
+        files.append(
+            {
+                "source": str(r.job.source),
+                "status": status,
+                "input_bytes": r.input_size_bytes,
+                "output_bytes": r.output_size_bytes,
+                "reduction_pct": round(r.size_reduction_pct, 1) if r.success else 0.0,
+            }
+        )
     return json.dumps({"exit_code": exit_code, "files": files, "total_saved_bytes": total_saved})
 
 
@@ -113,7 +113,9 @@ def _run_encode_loop(
             file_size = job.source.stat().st_size
             # Use input size as the task total so DownloadColumn shows GB-scale numbers
             task_total = max(file_size, 1)
-            progress.update(file_task, description=f"[white]{filename}", completed=0, total=task_total)
+            progress.update(
+                file_task, description=f"[white]{filename}", completed=0, total=task_total
+            )
 
             def make_callback(ft=file_task, fb=file_size, ot=overall_task, bd=bytes_done):
                 def callback(pct: float) -> None:
@@ -162,7 +164,7 @@ def _run_encode_loop(
     return results
 
 
-def _prepare_tools(output_dir: Optional[Path]) -> tuple[Path, Path]:
+def _prepare_tools(output_dir: Path | None) -> tuple[Path, Path]:
     ok, err = check_ffmpeg_available()
     if not ok:
         console.print(f"[red bold]Error:[/red bold] {err}")
@@ -197,9 +199,9 @@ def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> 
 
 
 def _resolve_encode_settings(
-    profile: Optional[str],
-    crf: Optional[int],
-    preset: Optional[str],
+    profile: str | None,
+    crf: int | None,
+    preset: str | None,
 ) -> tuple[int, str, str | None]:
     effective_crf = 20
     effective_preset = "fast"
@@ -232,7 +234,7 @@ def encode_cmd(
         dir_okay=True,
         readable=True,
     ),
-    output_dir: Optional[Path] = typer.Option(
+    output_dir: Path | None = typer.Option(
         None,
         "--output-dir",
         "-o",
@@ -243,14 +245,14 @@ def encode_cmd(
         "--overwrite",
         help="Replace original files after successful encoding.",
     ),
-    crf: Optional[int] = typer.Option(
+    crf: int | None = typer.Option(
         None,
         "--crf",
         help="H.265 CRF quality value (0-51, lower = better quality). Default: 20.",
         min=0,
         max=51,
     ),
-    preset: Optional[str] = typer.Option(
+    preset: str | None = typer.Option(
         None,
         "--preset",
         help=(
@@ -259,7 +261,7 @@ def encode_cmd(
             "Default: fast."
         ),
     ),
-    profile: Optional[str] = typer.Option(
+    profile: str | None = typer.Option(
         None,
         "--profile",
         help="Load saved CRF/preset defaults from a named profile.",
@@ -367,7 +369,9 @@ def encode_cmd(
     session_path = get_session_path(directory, output_dir) if not dry_run else None
     active_session = None
     if session_path is not None:
-        active_session = build_session(directory, effective_preset, effective_crf, overwrite, output_dir, jobs)
+        active_session = build_session(
+            directory, effective_preset, effective_crf, overwrite, output_dir, jobs
+        )
         save_session(active_session, session_path)
 
     log_path: Path | None = None
@@ -378,8 +382,12 @@ def encode_cmd(
         console.print(f"[dim]Verbose log:[/dim] {log_path}")
 
     results = _run_encode_loop(
-        jobs, ffmpeg, ffprobe, display,
-        session=active_session, session_path=session_path,
+        jobs,
+        ffmpeg,
+        ffprobe,
+        display,
+        session=active_session,
+        session_path=session_path,
         log_path=log_path,
     )
     if cleanup:
@@ -414,24 +422,24 @@ def analyze(
             "Enabled by default for the wizard."
         ),
     ),
-    profile: Optional[str] = typer.Option(
+    profile: str | None = typer.Option(
         None,
         "--profile",
         help="Load saved CRF/preset defaults from a named profile.",
     ),
-    crf: Optional[int] = typer.Option(
+    crf: int | None = typer.Option(
         None,
         "--crf",
         min=0,
         max=51,
         help="H.265 CRF quality value used for analysis estimates.",
     ),
-    preset: Optional[str] = typer.Option(
+    preset: str | None = typer.Option(
         None,
         "--preset",
         help="Encoding preset used for analysis estimates.",
     ),
-    manifest_out: Optional[Path] = typer.Option(
+    manifest_out: Path | None = typer.Option(
         None,
         "--manifest-out",
         help="Write recommended candidates to a JSON manifest.",
@@ -502,7 +510,7 @@ def apply(
         dir_okay=False,
         readable=True,
     ),
-    output_dir: Optional[Path] = typer.Option(
+    output_dir: Path | None = typer.Option(
         None,
         "--output-dir",
         "-o",
@@ -513,19 +521,19 @@ def apply(
         "--overwrite",
         help="Replace original files after successful encoding.",
     ),
-    profile: Optional[str] = typer.Option(
+    profile: str | None = typer.Option(
         None,
         "--profile",
         help="Override manifest settings using a saved profile.",
     ),
-    crf: Optional[int] = typer.Option(
+    crf: int | None = typer.Option(
         None,
         "--crf",
         min=0,
         max=51,
         help="Override manifest CRF.",
     ),
-    preset: Optional[str] = typer.Option(
+    preset: str | None = typer.Option(
         None,
         "--preset",
         help="Override manifest preset.",
@@ -601,7 +609,7 @@ def wizard(
         dir_okay=True,
         readable=True,
     ),
-    output_dir: Optional[Path] = typer.Option(
+    output_dir: Path | None = typer.Option(
         None,
         "--output-dir",
         "-o",
@@ -693,19 +701,19 @@ def preview(
         help="How many minutes to encode for the preview (default: 2).",
         min=0.1,
     ),
-    crf: Optional[int] = typer.Option(
+    crf: int | None = typer.Option(
         None,
         "--crf",
         help="H.265 CRF quality value. Default: 20.",
         min=0,
         max=51,
     ),
-    preset: Optional[str] = typer.Option(
+    preset: str | None = typer.Option(
         None,
         "--preset",
         help="Encoding preset. Default: fast.",
     ),
-    profile: Optional[str] = typer.Option(
+    profile: str | None = typer.Option(
         None,
         "--profile",
         help="Load CRF/preset from a named profile.",
