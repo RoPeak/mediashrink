@@ -451,7 +451,7 @@ def encode_file(
         def _drain_stderr(src: object, dst: Path) -> None:
             assert hasattr(src, "read")
             with dst.open("a", encoding="utf-8", errors="replace") as fh:
-                for line in src:  # type: ignore[union-attr]
+                for line in src:  # type: ignore[union-attr, attr-defined]
                     fh.write(line)
 
         stderr_thread = threading.Thread(

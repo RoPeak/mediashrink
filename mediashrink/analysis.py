@@ -45,7 +45,9 @@ def build_analysis_item(path: Path, ffprobe: Path) -> AnalysisItem:
     duration_seconds = get_duration_seconds(path, ffprobe)
     bitrate_kbps = get_video_bitrate_kbps(path, ffprobe)
     estimated_output_bytes = 0 if skip else estimate_output_size(path, ffprobe)
-    estimated_savings_bytes = max(size_bytes - estimated_output_bytes, 0) if estimated_output_bytes > 0 else 0
+    estimated_savings_bytes = (
+        max(size_bytes - estimated_output_bytes, 0) if estimated_output_bytes > 0 else 0
+    )
 
     if skip:
         reason_code = "already_hevc" if codec == "hevc" else "already_marked_compressed"
@@ -138,10 +140,12 @@ def estimate_analysis_encode_seconds(
     if not recommended:
         return 0.0
 
+    speed: float | None
     if known_speed is not None and known_speed > 0:
         speed = known_speed
     else:
         from mediashrink.wizard import benchmark_encoder
+
         sample = recommended[0]
         if sample.duration_seconds <= 0:
             return None
@@ -152,10 +156,13 @@ def estimate_analysis_encode_seconds(
             crf=crf,
             ffmpeg=ffmpeg,
         )
-        if not speed or speed <= 0:
-            return None
 
-    total_media_seconds = sum(item.duration_seconds for item in recommended if item.duration_seconds > 0)
+    if speed is None or speed <= 0:
+        return None
+
+    total_media_seconds = sum(
+        item.duration_seconds for item in recommended if item.duration_seconds > 0
+    )
     return total_media_seconds / speed if total_media_seconds > 0 else None
 
 
@@ -212,8 +219,14 @@ def display_analysis_summary(
     table.add_column("Recommendation", justify="center", no_wrap=True)
     table.add_column("Reason")
 
-    for item in sorted(items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True)[:12]:
-        savings_text = "-" if item.estimated_savings_bytes <= 0 else f"~{_fmt_size(item.estimated_savings_bytes)}"
+    for item in sorted(
+        items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True
+    )[:12]:
+        savings_text = (
+            "-"
+            if item.estimated_savings_bytes <= 0
+            else f"~{_fmt_size(item.estimated_savings_bytes)}"
+        )
         table.add_row(
             item.source.name,
             item.codec or "?",
@@ -245,7 +258,11 @@ def display_analysis_summary(
             highlight=False,
         )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
-        console.print(f"Rough encode time: [cyan]~{_fmt_duration(estimated_total_encode_seconds)}[/cyan]")
+        console.print(
+            f"Rough encode time: [cyan]~{_fmt_duration(estimated_total_encode_seconds)}[/cyan]"
+        )
     console.print("[dim]Analysis estimates are approximate.[/dim]")
-    console.print("[dim]Hardware encoders are faster, but source duration, bitrate, and resolution still dominate total runtime.[/dim]")
+    console.print(
+        "[dim]Hardware encoders are faster, but source duration, bitrate, and resolution still dominate total runtime.[/dim]"
+    )
     console.print()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -14,8 +15,8 @@ class EncodeJob:
     dry_run: bool
     skip: bool = False
     skip_reason: str | None = None
-    source_codec: str | None = None          # e.g. "vc1", "h264", "hevc"
-    estimated_output_bytes: int = 0          # 0 means unknown
+    source_codec: str | None = None  # e.g. "vc1", "h264", "hevc"
+    estimated_output_bytes: int = 0  # 0 means unknown
 
 
 @dataclass
@@ -28,7 +29,7 @@ class EncodeResult:
     output_size_bytes: int
     duration_seconds: float
     error_message: str | None = field(default=None)
-    media_duration_seconds: float = 0.0   # source file's playback duration
+    media_duration_seconds: float = 0.0  # source file's playback duration
 
     @property
     def size_reduction_bytes(self) -> int:
@@ -42,7 +43,7 @@ class EncodeResult:
 
     @property
     def size_reduction_gb(self) -> float:
-        return self.size_reduction_bytes / (1024 ** 3)
+        return self.size_reduction_bytes / (1024**3)
 
 
 @dataclass
@@ -73,7 +74,7 @@ class AnalysisItem:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, object]) -> "AnalysisItem":
+    def from_dict(cls, raw: dict[str, Any]) -> "AnalysisItem":
         source = raw.get("source")
         recommendation = raw.get("recommendation")
         reason_code = raw.get("reason_code")
@@ -105,8 +106,8 @@ class AnalysisItem:
 
 @dataclass
 class SessionFileEntry:
-    source: str               # absolute path as string
-    status: str               # "pending" | "success" | "failed" | "skipped"
+    source: str  # absolute path as string
+    status: str  # "pending" | "success" | "failed" | "skipped"
     output: str | None = None
     error: str | None = None
 
@@ -119,7 +120,7 @@ class SessionFileEntry:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, object]) -> "SessionFileEntry":
+    def from_dict(cls, raw: dict[str, Any]) -> "SessionFileEntry":
         source = raw.get("source")
         status = raw.get("status")
         if not isinstance(source, str):
@@ -140,7 +141,7 @@ class SessionFileEntry:
 class SessionManifest:
     version: int
     directory: str
-    timestamp: str            # ISO-8601
+    timestamp: str  # ISO-8601
     preset: str
     crf: int
     overwrite: bool
@@ -160,7 +161,7 @@ class SessionManifest:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, object]) -> "SessionManifest":
+    def from_dict(cls, raw: dict[str, Any]) -> "SessionManifest":
         directory = raw.get("directory")
         preset = raw.get("preset")
         timestamp = raw.get("timestamp")
@@ -210,7 +211,7 @@ class AnalysisManifest:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, object]) -> "AnalysisManifest":
+    def from_dict(cls, raw: dict[str, Any]) -> "AnalysisManifest":
         analyzed_directory = raw.get("analyzed_directory")
         preset = raw.get("preset")
         if not isinstance(analyzed_directory, str):
