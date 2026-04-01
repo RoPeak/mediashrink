@@ -19,9 +19,16 @@ from mediashrink.analysis import (
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import encode_file
-from mediashrink.models import EncodeJob, EncodeResult
+from mediashrink.models import EncodeJob, EncodeResult, SessionManifest
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
 from mediashrink.profiles import delete_profile, get_profile, load_profiles
+from mediashrink.session import (
+    build_session,
+    find_resumable_session,
+    get_session_path,
+    save_session,
+    update_session_entry,
+)
 from mediashrink.progress import EncodingDisplay
 from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
 
@@ -54,6 +61,8 @@ def _run_encode_loop(
     ffmpeg: Path,
     ffprobe: Path,
     display: EncodingDisplay,
+    session: SessionManifest | None = None,
+    session_path: Path | None = None,
 ) -> list[EncodeResult]:
     to_encode = [job for job in jobs if not job.skip]
     total_bytes = sum(job.source.stat().st_size for job in to_encode)
@@ -91,6 +100,23 @@ def _run_encode_loop(
                 sys.exit(1)
 
             results.append(result)
+
+            # Update session after each file so partial progress is persisted
+            if session is not None and session_path is not None:
+                if result.skipped:
+                    status = "skipped"
+                elif result.success:
+                    status = "success"
+                else:
+                    status = "failed"
+                update_session_entry(
+                    session,
+                    source=job.source,
+                    status=status,
+                    output=job.output if result.success else None,
+                    error=result.error_message,
+                )
+                save_session(session, session_path)
 
             if not job.skip:
                 bytes_done += file_size
@@ -233,6 +259,11 @@ def encode_cmd(
         "--cleanup",
         help="After successful side-by-side encodes, delete originals and rename outputs back to the original filenames.",
     ),
+    no_resume: bool = typer.Option(
+        False,
+        "--no-resume",
+        help="Ignore any existing session file and start fresh.",
+    ),
 ) -> None:
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
@@ -257,6 +288,23 @@ def encode_cmd(
         no_skip=no_skip,
     )
 
+    # Resume detection — skip files already completed in a previous session
+    if not dry_run and not no_resume:
+        prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
+        if prior is not None:
+            done = {e.source for e in prior.entries if e.status == "success"}
+            if done:
+                console.print(
+                    f"[cyan]Session found:[/cyan] {len(done)} file(s) already completed. "
+                    "Resume? [Y/n] ",
+                    end="",
+                )
+                if typer.confirm("", default=True):
+                    for job in jobs:
+                        if str(job.source) in done:
+                            job.skip = True
+                            job.skip_reason = "resumed (already done)"
+
     display.show_scan_table(jobs)
 
     to_encode = [job for job in jobs if not job.skip]
@@ -269,7 +317,13 @@ def encode_cmd(
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(code=0)
 
-    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    session_path = get_session_path(directory, output_dir) if not dry_run else None
+    active_session = None
+    if session_path is not None:
+        active_session = build_session(directory, effective_preset, effective_crf, overwrite, output_dir, jobs)
+        save_session(active_session, session_path)
+
+    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display, session=active_session, session_path=session_path)
     if cleanup:
         _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not dry_run and not overwrite and output_dir is None and not yes:
