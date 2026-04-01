@@ -33,6 +33,13 @@ from mediashrink.progress import EncodingDisplay
 from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
 
 
+EXIT_SUCCESS = 0
+EXIT_NO_FILES = 1
+EXIT_ENCODE_FAILURES = 2
+EXIT_USER_CANCELLED = 3
+EXIT_FFMPEG_NOT_FOUND = 4
+
+
 class DefaultCommandGroup(TyperGroup):
     """Route bare `mediashrink ...` invocations to the hidden encode command."""
 
@@ -131,7 +138,7 @@ def _prepare_tools(output_dir: Optional[Path]) -> tuple[Path, Path]:
     ok, err = check_ffmpeg_available()
     if not ok:
         console.print(f"[red bold]Error:[/red bold] {err}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=EXIT_FFMPEG_NOT_FOUND)
 
     ffmpeg = find_ffmpeg()
     ffprobe = find_ffprobe()
@@ -174,7 +181,7 @@ def _resolve_encode_settings(
         saved_profile = get_profile(profile)
         if saved_profile is None:
             console.print(f"[red bold]Error:[/red bold] profile '{profile}' was not found.")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=EXIT_NO_FILES)
         effective_crf = saved_profile.crf
         effective_preset = saved_profile.preset
         profile_name = saved_profile.name
@@ -275,7 +282,7 @@ def encode_cmd(
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
         )
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_NO_FILES)
 
     jobs = build_jobs(
         files=files,
@@ -310,12 +317,12 @@ def encode_cmd(
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
         console.print("[dim]Nothing to encode.[/dim]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
 
     if not dry_run and not yes:
         if not display.confirm_proceed(len(to_encode)):
             console.print("[dim]Aborted.[/dim]")
-            raise typer.Exit(code=0)
+            raise typer.Exit(code=EXIT_USER_CANCELLED)
 
     session_path = get_session_path(directory, output_dir) if not dry_run else None
     active_session = None
@@ -328,6 +335,9 @@ def encode_cmd(
         _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not dry_run and not overwrite and output_dir is None and not yes:
         _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+    if any(not r.success and not r.skipped for r in results):
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 
 @app.command()
@@ -380,7 +390,7 @@ def analyze(
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
         )
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_NO_FILES)
 
     estimated_total_encode_seconds = estimate_analysis_encode_seconds(
         items=items,
@@ -470,7 +480,7 @@ def apply(
 
     if not existing_files:
         console.print("[yellow]No manifest files are available to encode.[/yellow]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_NO_FILES)
 
     jobs = build_jobs(
         files=existing_files,
@@ -487,17 +497,20 @@ def apply(
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
         console.print("[dim]Nothing to encode.[/dim]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
 
     if not yes and not display.confirm_proceed(len(to_encode)):
         console.print("[dim]Aborted.[/dim]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
 
     results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
     if cleanup:
         _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not overwrite and output_dir is None and not yes:
         _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+    if any(not r.success and not r.skipped for r in results):
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 
 @app.command()
@@ -555,13 +568,16 @@ def wizard(
 
     if action == "cancel":
         console.print("[dim]Aborted.[/dim]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
     if action == "export":
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_SUCCESS)
 
     results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
     if not overwrite and output_dir is None:
         _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+    if any(not r.success and not r.skipped for r in results):
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 
 @app.command()
@@ -606,7 +622,7 @@ def preview(
             f"[red bold]Error:[/red bold] {file.name} is not a supported format "
             f"({supported_formats_label()})."
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=EXIT_NO_FILES)
 
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(None)
@@ -624,7 +640,7 @@ def preview(
     display.show_summary([result])
 
     if not result.success:
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 
 @profiles_app.command("list")
@@ -633,7 +649,7 @@ def list_profiles() -> None:
     profiles = list_all_profiles()
     if not profiles:
         console.print("[dim]No saved profiles.[/dim]")
-        raise typer.Exit(code=0)
+        raise typer.Exit(code=EXIT_SUCCESS)
 
     for profile in profiles:
         label = f" - {profile.label}" if profile.label else ""
@@ -651,5 +667,5 @@ def delete_profile_cmd(name: str = typer.Argument(..., help="Profile name to del
     """Delete a saved encoding profile."""
     if not delete_profile(name):
         console.print(f"[red bold]Error:[/red bold] profile '{name}' was not found.")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=EXIT_NO_FILES)
     console.print(f"[green]Deleted profile[/green] {name}")

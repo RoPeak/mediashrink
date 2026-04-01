@@ -54,7 +54,7 @@ def test_ffmpeg_not_found_error(tmp_path: Path) -> None:
     with patch("mediashrink.cli.check_ffmpeg_available", return_value=(False, "ffmpeg not found")):
         result = runner.invoke(app, [str(tmp_path)])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 4
     assert "ffmpeg not found" in result.stdout.lower() or "error" in result.stdout.lower()
 
 
@@ -66,7 +66,7 @@ def test_no_supported_video_files(tmp_path: Path) -> None:
          patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE):
         result = runner.invoke(app, [str(tmp_path)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "No supported video files" in result.stdout
 
 
@@ -128,7 +128,7 @@ def test_all_skipped_no_encoding(tmp_path: Path) -> None:
         result = runner.invoke(app, [str(tmp_path)])
 
     mock_encode.assert_not_called()
-    assert result.exit_code == 0
+    assert result.exit_code == 3
     assert "Nothing to encode" in result.stdout
 
 
@@ -208,7 +208,7 @@ def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
          patch("mediashrink.wizard.run_wizard", return_value=([], "cancel")) as mock_run_wizard:
         result = runner.invoke(app, ["wizard", str(tmp_path)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 3
     assert mock_run_wizard.call_args.kwargs["recursive"] is True
 
 
@@ -551,3 +551,68 @@ def test_preview_command_unsupported_ext(tmp_path: Path) -> None:
         result = runner.invoke(app, ["preview", str(source)])
 
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 — Exit codes
+# ---------------------------------------------------------------------------
+
+def test_exit_no_files_is_1(tmp_path: Path) -> None:
+    from mediashrink.cli import EXIT_NO_FILES
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mediashrink.cli.scan_directory", return_value=[]):
+        result = runner.invoke(app, ["encode", str(tmp_path)])
+    assert result.exit_code == EXIT_NO_FILES
+    assert EXIT_NO_FILES == 1
+
+
+def test_exit_ffmpeg_not_found_is_4(tmp_path: Path) -> None:
+    from mediashrink.cli import EXIT_FFMPEG_NOT_FOUND
+    with patch("mediashrink.cli.check_ffmpeg_available", return_value=(False, "ffmpeg not found")):
+        result = runner.invoke(app, ["encode", str(tmp_path)])
+    assert result.exit_code == EXIT_FFMPEG_NOT_FOUND
+    assert EXIT_FFMPEG_NOT_FOUND == 4
+
+
+def test_exit_success_is_0() -> None:
+    from mediashrink.cli import EXIT_SUCCESS
+    assert EXIT_SUCCESS == 0
+
+
+def test_exit_encode_failures_is_2(tmp_path: Path) -> None:
+    from mediashrink.cli import EXIT_ENCODE_FAILURES
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 100)
+
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    failed_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=False,
+        input_size_bytes=100,
+        output_size_bytes=0,
+        duration_seconds=0.1,
+        error_message="FFmpeg exited with code 1",
+    )
+
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mediashrink.cli.scan_directory", return_value=[source]), \
+         patch("mediashrink.cli.build_jobs", return_value=[job]), \
+         patch("mediashrink.cli._run_encode_loop", return_value=[failed_result]):
+        result = runner.invoke(app, ["encode", str(tmp_path), "--yes"])
+
+    assert result.exit_code == EXIT_ENCODE_FAILURES
+    assert EXIT_ENCODE_FAILURES == 2
