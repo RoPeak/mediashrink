@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from rich.console import Console
 
-from mediashrink.models import AnalysisItem, EncodeJob
+from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.wizard import (
     _sum_media_durations,
     EncoderProfile,
@@ -211,6 +211,7 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
          patch("mediashrink.wizard.display_profiles_table"), \
          patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
          patch("mediashrink.wizard.maybe_save_profile"), \
+         patch("mediashrink.wizard.encode_preview", return_value=_fake_preview_result(source)), \
          patch("mediashrink.wizard.analyze_directory", return_value=[recommended, maybe]) as mock_analyze, \
          patch("mediashrink.wizard.display_analysis_summary"), \
          patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"), \
@@ -240,6 +241,8 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
          patch("mediashrink.wizard.display_profiles_table"), \
          patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
          patch("mediashrink.wizard.maybe_save_profile"), \
+         patch("mediashrink.wizard.encode_preview"), \
+         patch("mediashrink.wizard.typer.confirm", return_value=False), \
          patch("mediashrink.wizard.analyze_directory", return_value=[recommended]), \
          patch("mediashrink.wizard.display_analysis_summary"), \
          patch("mediashrink.wizard.prompt_analysis_action", return_value="export"), \
@@ -269,6 +272,8 @@ def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> 
          patch("mediashrink.wizard.display_profiles_table"), \
          patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
          patch("mediashrink.wizard.maybe_save_profile"), \
+         patch("mediashrink.wizard.encode_preview"), \
+         patch("mediashrink.wizard.typer.confirm", return_value=False), \
          patch("mediashrink.wizard.analyze_directory", return_value=[maybe]), \
          patch("mediashrink.wizard.display_analysis_summary"), \
          patch("mediashrink.wizard.build_jobs") as mock_build_jobs:
@@ -298,6 +303,7 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
          patch("mediashrink.wizard.display_profiles_table"), \
          patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile), \
          patch("mediashrink.wizard.maybe_save_profile"), \
+         patch("mediashrink.wizard.encode_preview", return_value=_fake_preview_result(recommended_path)), \
          patch("mediashrink.wizard.analyze_directory", return_value=[recommended, maybe]), \
          patch("mediashrink.wizard.display_analysis_summary"), \
          patch("mediashrink.wizard.prompt_analysis_action", return_value="review_maybe"), \
@@ -402,4 +408,25 @@ def _job_for(source: Path) -> EncodeJob:
         dry_run=False,
         skip=False,
         skip_reason=None,
+    )
+
+
+def _fake_preview_result(source: Path) -> EncodeResult:
+    job = EncodeJob(
+        source=source,
+        output=source.parent / f"{source.stem}_preview{source.suffix}",
+        tmp_output=source.parent / f".tmp_{source.stem}_preview{source.suffix}",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    return EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=2.0,
     )

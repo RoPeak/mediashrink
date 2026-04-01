@@ -18,7 +18,7 @@ from mediashrink.analysis import (
     save_manifest,
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
-from mediashrink.encoder import encode_file
+from mediashrink.encoder import encode_file, encode_preview
 from mediashrink.models import EncodeJob, EncodeResult, SessionManifest
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
 from mediashrink.profiles import delete_profile, get_profile, list_all_profiles, load_profiles
@@ -562,6 +562,69 @@ def wizard(
     results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
     if not overwrite and output_dir is None:
         _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+
+@app.command()
+def preview(
+    file: Path = typer.Argument(
+        ...,
+        help=f"A supported video file ({supported_formats_label()}) to preview-encode.",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+    ),
+    minutes: float = typer.Option(
+        2.0,
+        "--minutes",
+        help="How many minutes to encode for the preview (default: 2).",
+        min=0.1,
+    ),
+    crf: Optional[int] = typer.Option(
+        None,
+        "--crf",
+        help="H.265 CRF quality value. Default: 20.",
+        min=0,
+        max=51,
+    ),
+    preset: Optional[str] = typer.Option(
+        None,
+        "--preset",
+        help="Encoding preset. Default: fast.",
+    ),
+    profile: Optional[str] = typer.Option(
+        None,
+        "--profile",
+        help="Load CRF/preset from a named profile.",
+    ),
+) -> None:
+    """Test-encode the first N minutes of a single file to check quality before a full batch."""
+    from mediashrink.scanner import SUPPORTED_EXTENSIONS
+
+    if file.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        console.print(
+            f"[red bold]Error:[/red bold] {file.name} is not a supported format "
+            f"({supported_formats_label()})."
+        )
+        raise typer.Exit(code=1)
+
+    display = EncodingDisplay(console)
+    ffmpeg, ffprobe = _prepare_tools(None)
+    effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
+
+    console.print(f"[dim]Preview encoding first {minutes:.1f} minute(s) of[/dim] {file.name}...")
+    result = encode_preview(
+        source=file,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        duration_minutes=minutes,
+        crf=effective_crf,
+        preset=effective_preset,
+    )
+    display.show_summary([result])
+
+    if not result.success:
+        raise typer.Exit(code=1)
 
 
 @profiles_app.command("list")

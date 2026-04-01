@@ -505,3 +505,49 @@ def test_apply_yes_does_not_prompt_for_cleanup_without_flag(tmp_path: Path) -> N
 
     assert result.exit_code == 0
     mock_cleanup_confirm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 — preview command
+# ---------------------------------------------------------------------------
+
+def test_preview_command_exits_zero(tmp_path: Path) -> None:
+    source = tmp_path / "film.mkv"
+    source.write_bytes(b"x" * 1000)
+
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "film_preview.mkv",
+        tmp_output=tmp_path / ".tmp_film_preview.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    fake_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=1.0,
+    )
+
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mediashrink.cli.encode_preview", return_value=fake_result):
+        result = runner.invoke(app, ["preview", str(source)])
+
+    assert result.exit_code == 0
+
+
+def test_preview_command_unsupported_ext(tmp_path: Path) -> None:
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"fake")
+
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE):
+        result = runner.invoke(app, ["preview", str(source)])
+
+    assert result.exit_code != 0

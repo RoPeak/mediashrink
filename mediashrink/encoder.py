@@ -238,14 +238,32 @@ def is_hardware_preset(preset: str) -> bool:
     return preset in _HW_ENCODERS
 
 
-def build_ffmpeg_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
-    """Return the canonical FFmpeg encode command for a job."""
+def build_ffmpeg_command(
+    job: EncodeJob,
+    ffmpeg: Path,
+    duration_limit_seconds: float | None = None,
+) -> list[str]:
+    """Return the canonical FFmpeg encode command for a job.
+
+    If duration_limit_seconds is set, a `-t <seconds>` flag is inserted before
+    the output path so only that many seconds of the source are encoded.
+    """
     if job.preset in _HW_ENCODERS:
-        return _build_hw_command(job, ffmpeg)
-    return _build_sw_command(job, ffmpeg)
+        return _build_hw_command(job, ffmpeg, duration_limit_seconds)
+    return _build_sw_command(job, ffmpeg, duration_limit_seconds)
 
 
-def _build_sw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
+def _duration_flags(duration_limit_seconds: float | None) -> list[str]:
+    if duration_limit_seconds is not None and duration_limit_seconds > 0:
+        return ["-t", str(duration_limit_seconds)]
+    return []
+
+
+def _build_sw_command(
+    job: EncodeJob,
+    ffmpeg: Path,
+    duration_limit_seconds: float | None = None,
+) -> list[str]:
     """Software encode via libx265."""
     return [
         str(ffmpeg),
@@ -261,11 +279,14 @@ def _build_sw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
         "-loglevel", "error",
         "-progress", "pipe:1",
         "-stats_period", "2",
-        str(job.tmp_output),
-    ]
+    ] + _duration_flags(duration_limit_seconds) + [str(job.tmp_output)]
 
 
-def _build_hw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
+def _build_hw_command(
+    job: EncodeJob,
+    ffmpeg: Path,
+    duration_limit_seconds: float | None = None,
+) -> list[str]:
     """Hardware-accelerated encode (QSV / NVENC / AMF)."""
     encoder, _, extra = _HW_ENCODERS[job.preset]
     quality_args = _hw_quality_args(job.preset, job.crf)
@@ -286,8 +307,9 @@ def _build_hw_command(job: EncodeJob, ffmpeg: Path) -> list[str]:
         "-loglevel", "error",
         "-progress", "pipe:1",
         "-stats_period", "2",
-        str(job.tmp_output),
     ]
+    cmd += _duration_flags(duration_limit_seconds)
+    cmd += [str(job.tmp_output)]
     return cmd
 
 
@@ -305,6 +327,7 @@ def encode_file(
     ffmpeg: Path,
     ffprobe: Path,
     progress_callback: Callable[[float], None] | None = None,
+    duration_limit_seconds: float | None = None,
 ) -> EncodeResult:
     """
     Encode a single file.
@@ -340,8 +363,13 @@ def encode_file(
         )
 
     total_duration = get_duration_seconds(job.source, ffprobe)
-    cmd = build_ffmpeg_command(job, ffmpeg)
-    media_duration = total_duration
+    # For progress tracking, use the shorter of total duration and limit
+    media_duration = (
+        min(total_duration, duration_limit_seconds)
+        if duration_limit_seconds is not None and total_duration > 0
+        else total_duration
+    )
+    cmd = build_ffmpeg_command(job, ffmpeg, duration_limit_seconds)
 
     # Ensure output directory exists
     job.tmp_output.parent.mkdir(parents=True, exist_ok=True)
@@ -407,3 +435,31 @@ def encode_file(
         duration_seconds=duration,
         media_duration_seconds=media_duration,
     )
+
+
+def encode_preview(
+    source: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+    duration_minutes: float = 2.0,
+    crf: int = 20,
+    preset: str = "fast",
+) -> EncodeResult:
+    """Encode the first `duration_minutes` of a file to a `_preview` output.
+
+    Output path: `<stem>_preview<suffix>` alongside the source.
+    The source is never modified. The preview is NOT a session entry.
+    """
+    output = source.parent / f"{source.stem}_preview{source.suffix}"
+    tmp_output = source.parent / f".tmp_{source.stem}_preview{source.suffix}"
+    job = EncodeJob(
+        source=source,
+        output=output,
+        tmp_output=tmp_output,
+        crf=crf,
+        preset=preset,
+        dry_run=False,
+        skip=False,
+    )
+    limit = duration_minutes * 60.0
+    return encode_file(job, ffmpeg, ffprobe, duration_limit_seconds=limit)

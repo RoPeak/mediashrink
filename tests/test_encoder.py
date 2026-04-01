@@ -9,6 +9,7 @@ from mediashrink.encoder import (
     _CODEC_BASE_FACTOR,
     build_ffmpeg_command,
     encode_file,
+    encode_preview,
     estimate_output_size,
     get_duration_seconds,
     get_video_resolution,
@@ -16,7 +17,7 @@ from mediashrink.encoder import (
     parse_progress_line,
     validate_encoder,
 )
-from mediashrink.models import EncodeJob
+from mediashrink.models import EncodeJob, EncodeResult
 
 FFMPEG = Path("/usr/bin/ffmpeg")
 FFPROBE = Path("/usr/bin/ffprobe")
@@ -451,3 +452,84 @@ def test_validate_encoder_returns_false_for_unknown_key(tmp_path: Path) -> None:
     ok, err = validate_encoder("unknown_hw", sample, FFMPEG, FFPROBE)
     assert ok is False
     assert err != ""
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 — encode_preview and duration_limit_seconds
+# ---------------------------------------------------------------------------
+
+def test_build_ffmpeg_command_duration_limit(tmp_path: Path) -> None:
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x")
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    cmd = build_ffmpeg_command(job, FFMPEG, duration_limit_seconds=30.0)
+    assert "-t" in cmd
+    t_idx = cmd.index("-t")
+    assert cmd[t_idx + 1] == "30.0"
+
+
+def test_build_ffmpeg_command_no_duration_limit(tmp_path: Path) -> None:
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x")
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-t" not in cmd
+
+
+def test_encode_preview_output_path(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x" * 100)
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stdout = iter([])
+
+    def fake_popen(cmd, **kwargs):
+        # write tmp to simulate successful encode (encoder renames tmp -> output)
+        tmp = tmp_path / ".tmp_movie_preview.mkv"
+        tmp.write_bytes(b"x" * 50)
+        return mock_proc
+
+    with patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen), \
+         patch("mediashrink.encoder.get_duration_seconds", return_value=120.0):
+        result = encode_preview(source, FFMPEG, FFPROBE, duration_minutes=2.0)
+
+    assert result.job.output.stem.endswith("_preview")
+    assert result.job.output != source
+
+
+def test_encode_preview_source_unchanged(tmp_path: Path) -> None:
+    source = tmp_path / "film.mkv"
+    original_data = b"original content"
+    source.write_bytes(original_data)
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.stdout = iter([])
+
+    def fake_popen(cmd, **kwargs):
+        tmp = tmp_path / ".tmp_film_preview.mkv"
+        tmp.write_bytes(b"encoded")
+        return mock_proc
+
+    with patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen), \
+         patch("mediashrink.encoder.get_duration_seconds", return_value=60.0):
+        encode_preview(source, FFMPEG, FFPROBE)
+
+    assert source.read_bytes() == original_data

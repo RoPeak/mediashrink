@@ -19,7 +19,7 @@ from mediashrink.analysis import (
     save_manifest,
 )
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
-from mediashrink.encoder import _HW_ENCODERS, get_duration_seconds, probe_encoder_available, validate_encoder
+from mediashrink.encoder import _HW_ENCODERS, encode_preview, get_duration_seconds, probe_encoder_available, validate_encoder
 from mediashrink.models import AnalysisItem, EncodeJob
 from mediashrink.platform_utils import detect_device_labels
 from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
@@ -692,6 +692,21 @@ def run_wizard(
         display_label = selected.name
 
     maybe_save_profile(preset, crf, display_label, console)
+
+    if typer.confirm("Test encode the first 2 minutes before the full batch?", default=False):
+        console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
+        preview_result = encode_preview(
+            source=sample_file,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            duration_minutes=2.0,
+            crf=crf,
+            preset=preset,
+        )
+        from mediashrink.progress import EncodingDisplay
+        EncodingDisplay(console).show_summary([preview_result])
+        if not preview_result.success:
+            console.print("[yellow]Preview encode failed — continuing with full batch selection.[/yellow]")
 
     analysis_items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
     estimated_total_encode_seconds = estimate_analysis_encode_seconds(
