@@ -22,7 +22,7 @@ from mkv_compress.encoder import _HW_ENCODERS, get_duration_seconds, probe_encod
 from mkv_compress.models import AnalysisItem, EncodeJob
 from mkv_compress.platform_utils import detect_device_labels
 from mkv_compress.profiles import SavedProfile, upsert_profile
-from mkv_compress.scanner import build_jobs, scan_directory
+from mkv_compress.scanner import build_jobs, scan_directory, supported_formats_label
 
 _GB = 1024**3
 _MB = 1024**2
@@ -221,6 +221,22 @@ def build_profiles(
         idx += 1
 
     fast_speed = benchmark_speeds.get("fast")
+    faster_speed = benchmark_speeds.get("faster") or (fast_speed * 1.3 if fast_speed else None)
+    profiles.append(
+        EncoderProfile(
+            index=idx,
+            name="Faster Encode",
+            encoder_key="faster",
+            crf=22,
+            sw_preset="faster",
+            estimated_output_bytes=_estimate_output_bytes(total_input_bytes, 22),
+            estimated_encode_seconds=_estimate_time(total_media_seconds, faster_speed),
+            quality_label="Very good",
+            is_recommended=False,
+        )
+    )
+    idx += 1
+
     profiles.append(
         EncoderProfile(
             index=idx,
@@ -338,6 +354,7 @@ def display_profiles_table(
         quality_style = {
             "Visually lossless": "green bold",
             "Excellent": "green",
+            "Very good": "green",
             "Good": "yellow",
         }.get(profile.quality_label, "white")
 
@@ -357,6 +374,8 @@ def display_profiles_table(
     console.print(table)
     console.print(f"  [dim]Total input: {_fmt_size(total_input_bytes)}[/dim]")
     console.print("  [dim]Time and size numbers are approximate estimates.[/dim]")
+    console.print("  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]")
+    console.print("  [dim]For lower wait time, choose Fastest on this device or Faster Encode.[/dim]")
     console.print()
 
 
@@ -544,7 +563,9 @@ def run_wizard(
 
     files = scan_directory(directory, recursive=recursive)
     if not files:
-        console.print(f"[yellow]No .mkv files found in[/yellow] {directory}")
+        console.print(
+            f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
+        )
         return [], "cancel"
 
     total_input_bytes = sum(path.stat().st_size for path in files)
@@ -569,7 +590,7 @@ def run_wizard(
     else:
         console.print("[dim]No hardware encoders detected. Software only.[/dim]")
 
-    candidates_to_bench = list(available_hw) + ["fast"]
+    candidates_to_bench = list(available_hw) + ["fast", "faster"]
     benchmark_speeds: dict[str, float | None] = {}
 
     with console.status("[dim]Benchmarking encoders (this takes ~10s)...[/dim]", spinner="dots"):
@@ -674,6 +695,12 @@ def run_wizard(
         )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
+    if preset in _HW_ENCODERS:
+        console.print("  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]")
+    elif preset in {"faster", "ultrafast"}:
+        console.print("  [dim]This favors faster completion over maximum compression efficiency.[/dim]")
+    else:
+        console.print("  [dim]Slower software presets trade more time for slightly smaller files.[/dim]")
 
     if not to_encode[0].output.parent.exists():
         console.print(f"  Output:   {to_encode[0].output.parent}")

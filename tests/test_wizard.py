@@ -331,7 +331,7 @@ def _job_for(source: Path) -> EncodeJob:
     return EncodeJob(
         source=source,
         output=source.with_stem(source.stem + "_compressed"),
-        tmp_output=source.parent / f".tmp_{source.stem}_compressed.mkv",
+        tmp_output=source.parent / f".tmp_{source.stem}_compressed{source.suffix}",
         crf=20,
         preset="fast",
         dry_run=False,

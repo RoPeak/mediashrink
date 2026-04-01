@@ -34,7 +34,7 @@ def _make_job(source: Path) -> EncodeJob:
     return EncodeJob(
         source=source,
         output=source.with_stem(source.stem + "_compressed"),
-        tmp_output=source.parent / f".tmp_{source.stem}_compressed.mkv",
+        tmp_output=source.parent / f".tmp_{source.stem}_compressed{source.suffix}",
         crf=20,
         preset="slow",
         dry_run=False,
@@ -58,8 +58,8 @@ def test_ffmpeg_not_found_error(tmp_path: Path) -> None:
     assert "ffmpeg not found" in result.stdout.lower() or "error" in result.stdout.lower()
 
 
-def test_no_mkv_files(tmp_path: Path) -> None:
-    (tmp_path / "movie.mp4").touch()
+def test_no_supported_video_files(tmp_path: Path) -> None:
+    (tmp_path / "cover.jpg").touch()
 
     with patch("mkv_compress.cli.check_ffmpeg_available", return_value=(True, "")), \
          patch("mkv_compress.cli.find_ffmpeg", return_value=FFMPEG), \
@@ -67,7 +67,7 @@ def test_no_mkv_files(tmp_path: Path) -> None:
         result = runner.invoke(app, [str(tmp_path)])
 
     assert result.exit_code == 0
-    assert "No .mkv files" in result.stdout
+    assert "No supported video files" in result.stdout
 
 
 def test_dry_run_no_encoding(tmp_path: Path) -> None:
@@ -102,10 +102,12 @@ def test_yes_flag_skips_prompt(tmp_path: Path) -> None:
          patch("mkv_compress.cli.scan_directory", return_value=[mkv]), \
          patch("mkv_compress.cli.build_jobs", return_value=[fake_job]), \
          patch("mkv_compress.cli.encode_file", return_value=fake_result), \
-         patch("mkv_compress.progress.typer.confirm") as mock_confirm:
+         patch("mkv_compress.progress.typer.confirm") as mock_confirm, \
+         patch("mkv_compress.cli.typer.confirm") as mock_cleanup_confirm:
         result = runner.invoke(app, [str(tmp_path), "--yes"])
 
     mock_confirm.assert_not_called()
+    mock_cleanup_confirm.assert_not_called()
     assert result.exit_code == 0
 
 
@@ -403,3 +405,91 @@ def test_apply_reports_missing_manifest_files(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert mock_build_jobs.call_args.kwargs["files"] == [existing]
     assert "Missing file from manifest" in result.stdout
+
+
+def test_encode_prompts_for_cleanup_after_successful_side_by_side_run(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    fake_result = _make_result(fake_job)
+    fake_job.output.write_bytes(b"compressed")
+
+    with patch("mkv_compress.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mkv_compress.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mkv_compress.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mkv_compress.cli.scan_directory", return_value=[source]), \
+         patch("mkv_compress.cli.build_jobs", return_value=[fake_job]), \
+         patch("mkv_compress.cli.encode_file", return_value=fake_result), \
+         patch("mkv_compress.progress.EncodingDisplay.confirm_proceed", return_value=True), \
+         patch("mkv_compress.cli.typer.confirm", return_value=False) as mock_cleanup_confirm, \
+         patch("mkv_compress.cli.cleanup_successful_results") as mock_cleanup:
+        result = runner.invoke(app, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    mock_cleanup_confirm.assert_called_once()
+    mock_cleanup.assert_not_called()
+
+
+def test_encode_cleanup_flag_runs_without_prompt(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    fake_result = _make_result(fake_job)
+    fake_job.output.write_bytes(b"compressed")
+
+    with patch("mkv_compress.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mkv_compress.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mkv_compress.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mkv_compress.cli.scan_directory", return_value=[source]), \
+         patch("mkv_compress.cli.build_jobs", return_value=[fake_job]), \
+         patch("mkv_compress.cli.encode_file", return_value=fake_result), \
+         patch("mkv_compress.progress.EncodingDisplay.confirm_proceed", return_value=True), \
+         patch("mkv_compress.cli.typer.confirm") as mock_cleanup_confirm, \
+         patch("mkv_compress.cli.cleanup_successful_results", return_value=[source]) as mock_cleanup:
+        result = runner.invoke(app, [str(tmp_path), "--cleanup", "--yes"])
+
+    assert result.exit_code == 0
+    mock_cleanup_confirm.assert_not_called()
+    mock_cleanup.assert_called_once()
+
+
+def test_apply_yes_does_not_prompt_for_cleanup_without_flag(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mp4"
+    source.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    fake_result = _make_result(fake_job)
+    manifest = build_manifest(
+        directory=tmp_path,
+        recursive=False,
+        preset="fast",
+        crf=20,
+        profile_name=None,
+        estimated_total_encode_seconds=None,
+        items=[
+            AnalysisItem(
+                source=source,
+                codec="h264",
+                size_bytes=1000,
+                duration_seconds=120.0,
+                bitrate_kbps=12000.0,
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+                recommendation="recommended",
+                reason_code="strong_savings_candidate",
+                reason_text="legacy codec with strong projected space savings",
+            )
+        ],
+    )
+    manifest_path = tmp_path / "analysis.json"
+    save_manifest(manifest, manifest_path)
+
+    with patch("mkv_compress.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mkv_compress.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mkv_compress.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mkv_compress.cli.build_jobs", return_value=[fake_job]), \
+         patch("mkv_compress.cli.encode_file", return_value=fake_result), \
+         patch("mkv_compress.cli.typer.confirm") as mock_cleanup_confirm:
+        result = runner.invoke(app, ["apply", str(manifest_path), "--yes"])
+
+    assert result.exit_code == 0
+    mock_cleanup_confirm.assert_not_called()

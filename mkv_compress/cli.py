@@ -17,12 +17,13 @@ from mkv_compress.analysis import (
     load_manifest,
     save_manifest,
 )
+from mkv_compress.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mkv_compress.encoder import encode_file
-from mkv_compress.models import EncodeJob
+from mkv_compress.models import EncodeJob, EncodeResult
 from mkv_compress.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
 from mkv_compress.profiles import delete_profile, get_profile, load_profiles
 from mkv_compress.progress import EncodingDisplay
-from mkv_compress.scanner import build_jobs, scan_directory
+from mkv_compress.scanner import build_jobs, scan_directory, supported_formats_label
 
 
 class DefaultCommandGroup(TyperGroup):
@@ -38,7 +39,7 @@ class DefaultCommandGroup(TyperGroup):
 
 app = typer.Typer(
     name="mkvcompress",
-    help="Re-encode MKV files to H.265/HEVC to reduce file size.",
+    help=f"Re-encode supported video files ({supported_formats_label()}) to H.265/HEVC to reduce file size.",
     add_completion=False,
     cls=DefaultCommandGroup,
 )
@@ -53,7 +54,7 @@ def _run_encode_loop(
     ffmpeg: Path,
     ffprobe: Path,
     display: EncodingDisplay,
-) -> None:
+) -> list[EncodeResult]:
     to_encode = [job for job in jobs if not job.skip]
     total_bytes = sum(job.source.stat().st_size for job in to_encode)
     results = []
@@ -97,6 +98,7 @@ def _run_encode_loop(
                 progress.update(file_task, completed=100)
 
     display.show_summary(results)
+    return results
 
 
 def _prepare_tools(output_dir: Optional[Path]) -> tuple[Path, Path]:
@@ -112,6 +114,25 @@ def _prepare_tools(output_dir: Optional[Path]) -> tuple[Path, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     return ffmpeg, ffprobe
+
+
+def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> None:
+    candidates = eligible_cleanup_results(results)
+    if not candidates:
+        return
+
+    if not assume_yes:
+        if not typer.confirm(
+            "Delete the original source files for successful encodes and rename the compressed outputs back to the original filenames?",
+            default=False,
+        ):
+            return
+
+    cleaned = cleanup_successful_results(results)
+    if cleaned:
+        console.print(
+            f"[green]Cleanup complete:[/green] restored original names for {len(cleaned)} file(s)."
+        )
 
 
 def _resolve_encode_settings(
@@ -144,7 +165,7 @@ def _resolve_encode_settings(
 def encode_cmd(
     directory: Path = typer.Argument(
         ...,
-        help="Directory containing .mkv files to compress.",
+        help=f"Directory containing supported video files ({supported_formats_label()}) to compress.",
         exists=True,
         file_okay=False,
         dir_okay=True,
@@ -186,7 +207,7 @@ def encode_cmd(
         False,
         "--recursive",
         "-r",
-        help="Scan subdirectories for .mkv files.",
+        help=f"Scan subdirectories for supported video files ({supported_formats_label()}).",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -204,6 +225,11 @@ def encode_cmd(
         "-y",
         help="Skip the confirmation prompt.",
     ),
+    cleanup: bool = typer.Option(
+        False,
+        "--cleanup",
+        help="After successful side-by-side encodes, delete originals and rename outputs back to the original filenames.",
+    ),
 ) -> None:
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
@@ -212,7 +238,9 @@ def encode_cmd(
 
     files = scan_directory(directory, recursive=recursive)
     if not files:
-        console.print(f"[yellow]No .mkv files found in[/yellow] {directory}")
+        console.print(
+            f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
+        )
         raise typer.Exit(code=0)
 
     jobs = build_jobs(
@@ -238,14 +266,18 @@ def encode_cmd(
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(code=0)
 
-    _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    if cleanup:
+        _maybe_prompt_for_cleanup(results, assume_yes=True)
+    elif not dry_run and not overwrite and output_dir is None and not yes:
+        _maybe_prompt_for_cleanup(results, assume_yes=False)
 
 
 @app.command()
 def analyze(
     directory: Path = typer.Argument(
         ...,
-        help="Directory containing .mkv files to analyze.",
+        help=f"Directory containing supported video files ({supported_formats_label()}) to analyze.",
         exists=True,
         file_okay=False,
         dir_okay=True,
@@ -255,7 +287,7 @@ def analyze(
         False,
         "--recursive",
         "-r",
-        help="Scan subdirectories for .mkv files.",
+        help=f"Scan subdirectories for supported video files ({supported_formats_label()}).",
     ),
     profile: Optional[str] = typer.Option(
         None,
@@ -285,7 +317,9 @@ def analyze(
 
     items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
     if not items:
-        console.print(f"[yellow]No .mkv files found in[/yellow] {directory}")
+        console.print(
+            f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
+        )
         raise typer.Exit(code=0)
 
     estimated_total_encode_seconds = estimate_analysis_encode_seconds(
@@ -354,6 +388,11 @@ def apply(
         "-y",
         help="Skip the confirmation prompt.",
     ),
+    cleanup: bool = typer.Option(
+        False,
+        "--cleanup",
+        help="After successful side-by-side encodes, delete originals and rename outputs back to the original filenames.",
+    ),
 ) -> None:
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
@@ -394,14 +433,18 @@ def apply(
         console.print("[dim]Aborted.[/dim]")
         raise typer.Exit(code=0)
 
-    _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    if cleanup:
+        _maybe_prompt_for_cleanup(results, assume_yes=True)
+    elif not overwrite and output_dir is None and not yes:
+        _maybe_prompt_for_cleanup(results, assume_yes=False)
 
 
 @app.command()
 def wizard(
     directory: Path = typer.Argument(
         ...,
-        help="Directory containing .mkv files to compress.",
+        help=f"Directory containing supported video files ({supported_formats_label()}) to compress.",
         exists=True,
         file_okay=False,
         dir_okay=True,
@@ -422,7 +465,7 @@ def wizard(
         False,
         "--recursive",
         "-r",
-        help="Scan subdirectories for .mkv files.",
+        help=f"Scan subdirectories for supported video files ({supported_formats_label()}).",
     ),
     no_skip: bool = typer.Option(
         False,
@@ -453,7 +496,9 @@ def wizard(
     if action == "export":
         raise typer.Exit(code=0)
 
-    _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    if not overwrite and output_dir is None:
+        _maybe_prompt_for_cleanup(results, assume_yes=False)
 
 
 @profiles_app.command("list")

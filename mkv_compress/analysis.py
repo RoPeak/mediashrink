@@ -245,4 +245,5 @@ def display_analysis_summary(
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"Rough encode time: [cyan]~{_fmt_duration(estimated_total_encode_seconds)}[/cyan]")
     console.print("[dim]Analysis estimates are approximate.[/dim]")
+    console.print("[dim]Hardware encoders are faster, but source duration, bitrate, and resolution still dominate total runtime.[/dim]")
     console.print()

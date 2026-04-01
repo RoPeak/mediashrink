@@ -1,6 +1,6 @@
 # mkv-compress
 
-A CLI tool to re-encode `.mkv` files to H.265/HEVC, keeping all audio and subtitle streams while cutting file sizes substantially.
+A CLI tool to re-encode supported video files (`.mkv`, `.mp4`, `.m4v`) to H.265/HEVC, keeping all audio and subtitle streams while cutting file sizes substantially.
 
 For Blu-ray-era H.264 or VC-1 sources, CRF 20 often lands around a 50-70% reduction with little visible loss in normal TV/movie viewing. Files already using HEVC are skipped by default.
 
@@ -47,6 +47,9 @@ Advanced/manual flows are still available below.
 ```bash
 # Encode in-place with a _compressed suffix
 mkvcompress /path/to/mkvs
+
+# Encode and then clean up originals after success
+mkvcompress /path/to/mkvs --cleanup
 
 # Analyze a library and write a candidate manifest
 mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
@@ -102,7 +105,7 @@ mkvcompress analyze /path/to/library --recursive --manifest-out candidates.json
 
 The analysis flow:
 
-1. Scans `.mkv` files in the target directory tree.
+1. Scans supported video files (`.mkv`, `.mp4`, `.m4v`) in the target directory tree.
 2. Probes codec, duration, bitrate, and projected output size.
 3. Classifies each file as `recommended`, `maybe`, or `skip`.
 4. Prints a summary of likely savings and rough encode time using the chosen profile/settings.
@@ -179,6 +182,7 @@ If `--profile` is supplied together with `--crf` or `--preset`, the explicit CLI
 | `--dry-run` | `False` | Preview jobs without encoding |
 | `--no-skip` | `False` | Encode files even if they already appear to be HEVC |
 | `--yes`, `-y` | `False` | Skip the confirmation prompt |
+| `--cleanup` | `False` | After successful side-by-side encodes, delete originals and rename outputs back to the original filename |
 
 ## Quality Guide
 
@@ -211,15 +215,25 @@ Hardware presets are much faster when supported:
 
 FFmpeg probe success determines whether a hardware encoder is offered. If a hardware option is unavailable or unstable on a system, use a software preset such as `fast`.
 
+Even with hardware acceleration, this is still a full video re-encode. Source duration, bitrate, and resolution dominate runtime, so multi-hour runs for large TV seasons are normal.
+
 ## How It Works
 
-1. Scan the target directory for `.mkv` files.
+1. Scan the target directory for supported video files (`.mkv`, `.mp4`, `.m4v`).
 2. Probe the source codec with `ffprobe`.
 3. Skip already-compressed HEVC files unless `--no-skip` is set.
-4. Encode to a temporary `.tmp_<stem>.mkv` file first.
+4. Encode to a temporary `.tmp_<stem><suffix>` file first.
 5. Rename the temp file only after a successful encode.
 6. Delete temp files on failure or interruption.
 7. Never replace originals unless `--overwrite` is explicitly requested.
+
+Re-runs are conservative by default:
+
+- files whose names already contain `_compressed` are skipped
+- files whose first video stream is already HEVC/H.265 are skipped
+- this means re-running on a half-finished season folder should normally target only the newly added, still-uncompressed files
+
+If you encode side-by-side instead of using `--overwrite`, the interactive flows can offer a cleanup step at the end to delete the originals and restore the compressed outputs to the original filenames.
 
 The optional analyze/apply flow sits in front of this to help you choose which files are worth compressing before any encode begins.
 

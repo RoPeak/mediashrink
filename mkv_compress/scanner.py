@@ -6,6 +6,8 @@ from pathlib import Path
 
 from mkv_compress.models import EncodeJob
 
+SUPPORTED_EXTENSIONS = (".mkv", ".mp4", ".m4v")
+
 
 def _natural_sort_key(path: Path) -> list[int | str]:
     """Sort key that orders '2' before '10' (natural/human sort)."""
@@ -16,9 +18,15 @@ def _natural_sort_key(path: Path) -> list[int | str]:
 
 
 def scan_directory(directory: Path, recursive: bool = False) -> list[Path]:
-    """Return naturally sorted list of .mkv files in directory."""
-    pattern = "**/*.mkv" if recursive else "*.mkv"
-    return sorted(directory.glob(pattern), key=_natural_sort_key)
+    """Return naturally sorted list of supported video files in directory."""
+    patterns = [f"**/*{ext}" if recursive else f"*{ext}" for ext in SUPPORTED_EXTENSIONS]
+    files = [path for pattern in patterns for path in directory.glob(pattern) if path.is_file()]
+    return sorted(files, key=_natural_sort_key)
+
+
+def supported_formats_label() -> str:
+    """Return a user-facing list of supported input formats."""
+    return ", ".join(SUPPORTED_EXTENSIONS)
 
 
 def probe_video_codec(path: Path, ffprobe: Path) -> str | None:
@@ -49,12 +57,12 @@ def is_already_compressed(
     if no_skip:
         return False, ""
 
-    if "_compressed" in path.stem:
+    if "_compressed" in path.stem.lower():
         return True, "filename contains '_compressed'"
 
     if codec is None:
         codec = probe_video_codec(path, ffprobe)
-    if codec == "hevc":
+    if codec in {"hevc", "h265"}:
         return True, "video stream is already H.265/HEVC"
 
     return False, ""
@@ -86,7 +94,7 @@ def build_jobs(
         else:
             output = source.with_stem(source.stem + "_compressed")
 
-        tmp_output = output.parent / f".tmp_{output.stem}.mkv"
+        tmp_output = output.parent / f".tmp_{output.stem}{output.suffix}"
 
         estimated = estimate_output_size(source, ffprobe) if not skip else 0
 
