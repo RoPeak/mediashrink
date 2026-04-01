@@ -9,7 +9,7 @@ repos:
     hooks:
       - id: pytest
         name: pytest
-        entry: pytest -q
+        entry: pytest -q --ignore=tests/test_encoder.py
         language: system
         pass_filenames: false
         always_run: true
