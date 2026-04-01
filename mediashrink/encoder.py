@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -328,6 +329,7 @@ def encode_file(
     ffprobe: Path,
     progress_callback: Callable[[float], None] | None = None,
     duration_limit_seconds: float | None = None,
+    log_path: Path | None = None,
 ) -> EncodeResult:
     """
     Encode a single file.
@@ -374,12 +376,27 @@ def encode_file(
     # Ensure output directory exists
     job.tmp_output.parent.mkdir(parents=True, exist_ok=True)
 
+    stderr_target = subprocess.PIPE if log_path is not None else subprocess.DEVNULL
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_target,
         text=True,
     )
+
+    stderr_thread: threading.Thread | None = None
+    if log_path is not None and process.stderr is not None:
+        def _drain_stderr(src: object, dst: Path) -> None:
+            import io
+            assert hasattr(src, "read")
+            with dst.open("a", encoding="utf-8", errors="replace") as fh:
+                for line in src:  # type: ignore[union-attr]
+                    fh.write(line)
+
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(process.stderr, log_path), daemon=True
+        )
+        stderr_thread.start()
 
     try:
         assert process.stdout is not None
@@ -396,9 +413,13 @@ def encode_file(
                     pass
 
         process.wait()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=5)
     except KeyboardInterrupt:
         process.kill()
         process.wait()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=2)
         if job.tmp_output.exists():
             job.tmp_output.unlink()
         raise

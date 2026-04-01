@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,28 @@ EXIT_USER_CANCELLED = 3
 EXIT_FFMPEG_NOT_FOUND = 4
 
 
+def _results_to_json(results: list[EncodeResult], exit_code: int) -> str:
+    files = []
+    total_saved = 0
+    for r in results:
+        if r.skipped:
+            status = "skipped"
+        elif r.success:
+            status = "success"
+        else:
+            status = "failed"
+        saved = r.size_reduction_bytes if r.success else 0
+        total_saved += saved
+        files.append({
+            "source": str(r.job.source),
+            "status": status,
+            "input_bytes": r.input_size_bytes,
+            "output_bytes": r.output_size_bytes,
+            "reduction_pct": round(r.size_reduction_pct, 1) if r.success else 0.0,
+        })
+    return json.dumps({"exit_code": exit_code, "files": files, "total_saved_bytes": total_saved})
+
+
 class DefaultCommandGroup(TyperGroup):
     """Route bare `mediashrink ...` invocations to the hidden encode command."""
 
@@ -70,6 +94,7 @@ def _run_encode_loop(
     display: EncodingDisplay,
     session: SessionManifest | None = None,
     session_path: Path | None = None,
+    log_path: Path | None = None,
 ) -> list[EncodeResult]:
     to_encode = [job for job in jobs if not job.skip]
     total_bytes = sum(job.source.stat().st_size for job in to_encode)
@@ -101,6 +126,7 @@ def _run_encode_loop(
                     ffmpeg=ffmpeg,
                     ffprobe=ffprobe,
                     progress_callback=make_callback() if not job.skip else None,
+                    log_path=log_path,
                 )
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted.[/yellow]")
@@ -271,8 +297,20 @@ def encode_cmd(
         "--no-resume",
         help="Ignore any existing session file and start fresh.",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a single JSON blob instead of Rich terminal output.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Write FFmpeg stderr to a log file alongside the output.",
+    ),
 ) -> None:
-    display = EncodingDisplay(console)
+    quiet_console = Console(quiet=True) if json_output else console
+    display = EncodingDisplay(quiet_console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
 
     effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
@@ -330,13 +368,28 @@ def encode_cmd(
         active_session = build_session(directory, effective_preset, effective_crf, overwrite, output_dir, jobs)
         save_session(active_session, session_path)
 
-    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display, session=active_session, session_path=session_path)
+    log_path: Path | None = None
+    if verbose and not dry_run:
+        log_dir = output_dir if output_dir is not None else directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"mediashrink_{timestamp}.log"
+        console.print(f"[dim]Verbose log:[/dim] {log_path}")
+
+    results = _run_encode_loop(
+        jobs, ffmpeg, ffprobe, display,
+        session=active_session, session_path=session_path,
+        log_path=log_path,
+    )
     if cleanup:
         _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not dry_run and not overwrite and output_dir is None and not yes:
         _maybe_prompt_for_cleanup(results, assume_yes=False)
 
-    if any(not r.success and not r.skipped for r in results):
+    has_failures = any(not r.success and not r.skipped for r in results)
+    exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
+    if json_output:
+        print(_results_to_json(results, exit_code))
+    if has_failures:
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 
@@ -381,15 +434,24 @@ def analyze(
         "--manifest-out",
         help="Write recommended candidates to a JSON manifest.",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit analysis results as a JSON blob instead of Rich terminal output.",
+    ),
 ) -> None:
+    quiet_console = Console(quiet=True) if json_output else console
     ffmpeg, ffprobe = _prepare_tools(None)
     effective_crf, effective_preset, profile_name = _resolve_encode_settings(profile, crf, preset)
 
     items = analyze_directory(directory, recursive=recursive, ffprobe=ffprobe)
     if not items:
-        console.print(
-            f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
-        )
+        if json_output:
+            print(json.dumps({"exit_code": EXIT_NO_FILES, "items": []}))
+        else:
+            console.print(
+                f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
+            )
         raise typer.Exit(code=EXIT_NO_FILES)
 
     estimated_total_encode_seconds = estimate_analysis_encode_seconds(
@@ -398,7 +460,20 @@ def analyze(
         crf=effective_crf,
         ffmpeg=ffmpeg,
     )
-    display_analysis_summary(items, estimated_total_encode_seconds, console)
+
+    if json_output:
+        manifest = build_manifest(
+            directory=directory,
+            recursive=recursive,
+            preset=effective_preset,
+            crf=effective_crf,
+            profile_name=profile_name,
+            estimated_total_encode_seconds=estimated_total_encode_seconds,
+            items=items,
+        )
+        print(json.dumps(manifest.to_dict()))
+    else:
+        display_analysis_summary(items, estimated_total_encode_seconds, quiet_console)
 
     if manifest_out is not None:
         manifest = build_manifest(
@@ -411,7 +486,8 @@ def analyze(
             items=items,
         )
         save_manifest(manifest, manifest_out)
-        console.print(f"[green]Wrote manifest[/green] {manifest_out}")
+        if not json_output:
+            console.print(f"[green]Wrote manifest[/green] {manifest_out}")
 
 
 @app.command()
@@ -548,12 +624,18 @@ def wizard(
         "--no-skip",
         help="Encode files even if they appear to already be H.265.",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit encode results as a JSON blob instead of Rich terminal output.",
+    ),
 ) -> None:
     """Interactively detect hardware, choose settings, and optionally save a profile."""
     from mediashrink.wizard import run_wizard
 
     ffmpeg, ffprobe = _prepare_tools(output_dir)
-    display = EncodingDisplay(console)
+    quiet_console = Console(quiet=True) if json_output else console
+    display = EncodingDisplay(quiet_console)
 
     jobs, action = run_wizard(
         directory=directory,
@@ -563,20 +645,25 @@ def wizard(
         output_dir=output_dir,
         overwrite=overwrite,
         no_skip=no_skip,
-        console=console,
+        console=quiet_console,
     )
 
     if action == "cancel":
-        console.print("[dim]Aborted.[/dim]")
+        if not json_output:
+            console.print("[dim]Aborted.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
     if action == "export":
         raise typer.Exit(code=EXIT_SUCCESS)
 
     results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
-    if not overwrite and output_dir is None:
+    if not json_output and not overwrite and output_dir is None:
         _maybe_prompt_for_cleanup(results, assume_yes=False)
 
-    if any(not r.success and not r.skipped for r in results):
+    has_failures = any(not r.success and not r.skipped for r in results)
+    exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
+    if json_output:
+        print(_results_to_json(results, exit_code))
+    if has_failures:
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 

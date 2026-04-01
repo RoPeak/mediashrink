@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -616,3 +617,96 @@ def test_exit_encode_failures_is_2(tmp_path: Path) -> None:
 
     assert result.exit_code == EXIT_ENCODE_FAILURES
     assert EXIT_ENCODE_FAILURES == 2
+
+
+# ---------------------------------------------------------------------------
+# Stage 8 — JSON output and verbose logging
+# ---------------------------------------------------------------------------
+
+def test_json_flag_outputs_valid_json(tmp_path: Path) -> None:
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 1000)
+
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20, preset="fast", dry_run=False, skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job, skipped=False, skip_reason=None, success=True,
+        input_size_bytes=1000, output_size_bytes=500, duration_seconds=1.0,
+    )
+
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mediashrink.cli.scan_directory", return_value=[source]), \
+         patch("mediashrink.cli.build_jobs", return_value=[job]), \
+         patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]):
+        result = runner.invoke(app, ["encode", str(tmp_path), "--yes", "--json"])
+
+    assert result.exit_code == 0
+    parsed = json.loads(result.stdout)
+    assert parsed["exit_code"] == 0
+    assert len(parsed["files"]) == 1
+    assert parsed["files"][0]["status"] == "success"
+
+
+def test_json_flag_suppresses_rich_markup(tmp_path: Path) -> None:
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 1000)
+
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20, preset="fast", dry_run=False, skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job, skipped=False, skip_reason=None, success=True,
+        input_size_bytes=1000, output_size_bytes=500, duration_seconds=1.0,
+    )
+
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mediashrink.cli.scan_directory", return_value=[source]), \
+         patch("mediashrink.cli.build_jobs", return_value=[job]), \
+         patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]):
+        result = runner.invoke(app, ["encode", str(tmp_path), "--yes", "--json"])
+
+    # Output should be a single JSON line — no Rich markup tags
+    assert "[" not in result.stdout.split("\n")[0].replace("[", "").replace("]", "") or result.stdout.strip().startswith("{")
+    assert result.stdout.strip().startswith("{")
+
+
+def test_verbose_flag_creates_log_file(tmp_path: Path) -> None:
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 1000)
+
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20, preset="fast", dry_run=False, skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job, skipped=False, skip_reason=None, success=True,
+        input_size_bytes=1000, output_size_bytes=500, duration_seconds=1.0,
+    )
+
+    with patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG), \
+         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE), \
+         patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")), \
+         patch("mediashrink.cli.scan_directory", return_value=[source]), \
+         patch("mediashrink.cli.build_jobs", return_value=[job]), \
+         patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]) as mock_loop:
+        result = runner.invoke(app, ["encode", str(tmp_path), "--yes", "--verbose"])
+
+    assert result.exit_code == 0
+    # log_path should have been passed as a keyword arg to _run_encode_loop
+    call_kwargs = mock_loop.call_args.kwargs
+    assert call_kwargs.get("log_path") is not None
+    assert str(call_kwargs["log_path"]).endswith(".log")
+    assert "mediashrink_" in str(call_kwargs["log_path"])
