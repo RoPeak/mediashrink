@@ -206,10 +206,15 @@ def _sum_media_durations(files: list[Path], ffprobe: Path) -> float:
     return total
 
 
-def _encoder_display_name(encoder_key: str, device_labels: dict[str, str]) -> str:
+_ENCODER_LABEL_MAX_CHARS = 22
+
+
+def _encoder_display_name(encoder_key: str, device_labels: dict[str, str], truncate: bool = False) -> str:
     if encoder_key in _HW_ENCODERS:
         label = device_labels.get(encoder_key)
         if label:
+            if truncate and len(label) > _ENCODER_LABEL_MAX_CHARS:
+                label = label[:_ENCODER_LABEL_MAX_CHARS].rstrip() + "…"
             return f"{_HARDWARE_DISPLAY_NAMES[encoder_key]} ({label})"
         return _HARDWARE_DISPLAY_NAMES[encoder_key]
     return f"libx265 ({encoder_key})"
@@ -406,7 +411,7 @@ def display_profiles_table(
             table.add_row(str(profile.index), "Custom", "-", "-", "-", "-", "-", "-", "")
             continue
 
-        encoder_display = _encoder_display_name(profile.encoder_key, device_labels)
+        encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
         est_out = _fmt_size(profile.estimated_output_bytes)
         saved = total_input_bytes - profile.estimated_output_bytes
         saved_pct = saved / total_input_bytes * 100 if total_input_bytes else 0
@@ -622,7 +627,8 @@ def run_wizard(
     overwrite: bool,
     no_skip: bool,
     console: Console,
-) -> tuple[list[EncodeJob], str]:
+    auto: bool = False,
+) -> tuple[list[EncodeJob], str, bool]:
     """Run the interactive wizard and return (jobs, action)."""
     console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
     console.print("[dim]Scanning files and detecting hardware...[/dim]\n")
@@ -632,7 +638,7 @@ def run_wizard(
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
         )
-        return [], "cancel"
+        return [], "cancel", False
 
     total_input_bytes = sum(path.stat().st_size for path in files)
     console.print(
@@ -681,7 +687,11 @@ def run_wizard(
         if hw_key in _HW_ENCODER_CAVEATS:
             console.print(f"  [dim yellow]Note:[/dim yellow] [dim]{_HW_ENCODER_CAVEATS[hw_key]}[/dim]")
 
-    selected = prompt_profile_selection(profiles, console)
+    if auto:
+        selected = next((p for p in profiles if p.is_recommended), profiles[0])
+        console.print(f"[dim]Auto mode: selected profile[/dim] {selected.name}")
+    else:
+        selected = prompt_profile_selection(profiles, console)
     if selected.is_custom:
         preset, crf, sw_preset = run_custom_wizard(available_hw, console)
         display_label = f"Custom ({preset}, CRF {crf})"
@@ -691,9 +701,10 @@ def run_wizard(
         sw_preset = selected.sw_preset
         display_label = selected.name
 
-    maybe_save_profile(preset, crf, display_label, console)
+    if not auto:
+        maybe_save_profile(preset, crf, display_label, console)
 
-    if typer.confirm("Test encode the first 2 minutes before the full batch?", default=False):
+    if not auto and typer.confirm("Test encode the first 2 minutes before the full batch?", default=False):
         console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
         preview_result = encode_preview(
             source=sample_file,
@@ -714,6 +725,7 @@ def run_wizard(
         preset=preset,
         crf=crf,
         ffmpeg=ffmpeg,
+        known_speed=benchmark_speeds.get(preset),
     )
     display_analysis_summary(analysis_items, estimated_total_encode_seconds, console)
 
@@ -721,11 +733,11 @@ def run_wizard(
     maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
     if not recommended_items:
         console.print("[dim]No recommended files were found for automatic compression.[/dim]")
-        return [], "cancel"
+        return [], "cancel", False
 
-    action = prompt_analysis_action(len(recommended_items), len(maybe_items), console)
+    action = "compress_recommended" if auto else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
     if action == "cancel":
-        return [], "cancel"
+        return [], "cancel", False
     if action == "export":
         manifest = build_manifest(
             directory=directory,
@@ -740,7 +752,7 @@ def run_wizard(
         manifest_path = Path(typer.prompt("Manifest path", default=str(default_manifest_path)))
         save_manifest(manifest, manifest_path)
         console.print(f"[green]Wrote manifest[/green] {manifest_path}")
-        return [], "export"
+        return [], "export", False
 
     selected_items = list(recommended_items)
     if action == "review_maybe" and maybe_items:
@@ -761,7 +773,7 @@ def run_wizard(
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
         console.print("[dim]Nothing to encode after re-checking the selected files.[/dim]")
-        return [], "cancel"
+        return [], "cancel", False
 
     console.print()
     console.print("[bold]Ready to encode[/bold]")
@@ -790,9 +802,15 @@ def run_wizard(
     if not to_encode[0].output.parent.exists():
         console.print(f"  Output:   {to_encode[0].output.parent}")
     console.print("  [dim]Estimates are approximate.[/dim]")
+
+    cleanup_after = False
+    if not overwrite and output_dir is None and not auto:
+        cleanup_after = typer.confirm(
+            "  Delete originals after successful encodes?", default=False
+        )
     console.print()
 
-    confirmed = typer.confirm("Start encoding?", default=True)
-    if not confirmed:
-        return [], "cancel"
-    return jobs, "encode"
+    if not auto:
+        if not typer.confirm("Start encoding?", default=True):
+            return [], "cancel", False
+    return jobs, "encode", cleanup_after

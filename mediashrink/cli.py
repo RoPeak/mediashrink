@@ -106,16 +106,18 @@ def _run_encode_loop(
             f"[cyan]Overall ({len(to_encode)} file(s))",
             total=total_bytes,
         )
-        file_task = progress.add_task("", total=100)
+        file_task = progress.add_task("", total=1)
 
         for job in jobs:
             filename = job.source.name
             file_size = job.source.stat().st_size
-            progress.update(file_task, description=f"[white]{filename}", completed=0)
+            # Use input size as the task total so DownloadColumn shows GB-scale numbers
+            task_total = max(file_size, 1)
+            progress.update(file_task, description=f"[white]{filename}", completed=0, total=task_total)
 
             def make_callback(ft=file_task, fb=file_size, ot=overall_task, bd=bytes_done):
                 def callback(pct: float) -> None:
-                    progress.update(ft, completed=pct)
+                    progress.update(ft, completed=fb * pct / 100)
                     progress.update(ot, completed=bd + fb * pct / 100)
 
                 return callback
@@ -629,6 +631,11 @@ def wizard(
         "--json",
         help="Emit encode results as a JSON blob instead of Rich terminal output.",
     ),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Non-interactive mode: auto-select the recommended profile, skip all prompts.",
+    ),
 ) -> None:
     """Interactively detect hardware, choose settings, and optionally save a profile."""
     from mediashrink.wizard import run_wizard
@@ -637,7 +644,7 @@ def wizard(
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
 
-    jobs, action = run_wizard(
+    jobs, action, wizard_cleanup = run_wizard(
         directory=directory,
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
@@ -646,6 +653,7 @@ def wizard(
         overwrite=overwrite,
         no_skip=no_skip,
         console=quiet_console,
+        auto=auto,
     )
 
     if action == "cancel":
@@ -656,8 +664,10 @@ def wizard(
         raise typer.Exit(code=EXIT_SUCCESS)
 
     results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
-    if not json_output and not overwrite and output_dir is None:
-        _maybe_prompt_for_cleanup(results, assume_yes=False)
+    if wizard_cleanup:
+        _maybe_prompt_for_cleanup(results, assume_yes=True)
+    elif not json_output and not overwrite and output_dir is None:
+        pass  # cleanup was already asked upfront; no second prompt
 
     has_failures = any(not r.success and not r.skipped for r in results)
     exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS

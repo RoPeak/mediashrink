@@ -206,7 +206,7 @@ def test_wizard_subcommand_registered() -> None:
 def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
     with patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)), \
          patch("mediashrink.cli.EncodingDisplay"), \
-         patch("mediashrink.wizard.run_wizard", return_value=([], "cancel")) as mock_run_wizard:
+         patch("mediashrink.wizard.run_wizard", return_value=([], "cancel", False)) as mock_run_wizard:
         result = runner.invoke(app, ["wizard", str(tmp_path)])
 
     assert result.exit_code == 3
@@ -710,3 +710,48 @@ def test_verbose_flag_creates_log_file(tmp_path: Path) -> None:
     assert call_kwargs.get("log_path") is not None
     assert str(call_kwargs["log_path"]).endswith(".log")
     assert "mediashrink_" in str(call_kwargs["log_path"])
+
+
+# ---------------------------------------------------------------------------
+# Stage 10 — UX polish regression tests
+# ---------------------------------------------------------------------------
+
+def test_progress_bar_nonzero_total(tmp_path: Path) -> None:
+    """Per-file task total passed to progress.update must never be zero."""
+    from mediashrink.cli import _run_encode_loop
+    from unittest.mock import MagicMock, call
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 5_000_000)  # 5 MB
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20, preset="fast", dry_run=False, skip=True,
+        skip_reason="already HEVC",
+    )
+    ok_result = EncodeResult(
+        job=job, skipped=True, skip_reason="already HEVC", success=False,
+        input_size_bytes=5_000_000, output_size_bytes=0, duration_seconds=0.0,
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]  # overall_task=0, file_task=1
+
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    with patch("mediashrink.cli.encode_file", return_value=ok_result):
+        _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
+
+    # Collect all 'total' kwargs passed to progress.update
+    totals = [
+        kwargs["total"]
+        for _, kwargs in mock_progress.update.call_args_list
+        if "total" in kwargs
+    ]
+    assert totals, "progress.update was never called with a total="
+    assert all(t >= 1 for t in totals), f"Found zero or negative total: {totals}"

@@ -132,26 +132,28 @@ def estimate_analysis_encode_seconds(
     preset: str,
     crf: int,
     ffmpeg: Path,
+    known_speed: float | None = None,
 ) -> float | None:
-    from mediashrink.wizard import benchmark_encoder
-
     recommended = [item for item in items if item.recommendation == "recommended"]
     if not recommended:
         return 0.0
 
-    sample = recommended[0]
-    if sample.duration_seconds <= 0:
-        return None
-
-    speed = benchmark_encoder(
-        encoder_key=preset,
-        sample_file=sample.source,
-        sample_duration=sample.duration_seconds,
-        crf=crf,
-        ffmpeg=ffmpeg,
-    )
-    if not speed or speed <= 0:
-        return None
+    if known_speed is not None and known_speed > 0:
+        speed = known_speed
+    else:
+        from mediashrink.wizard import benchmark_encoder
+        sample = recommended[0]
+        if sample.duration_seconds <= 0:
+            return None
+        speed = benchmark_encoder(
+            encoder_key=preset,
+            sample_file=sample.source,
+            sample_duration=sample.duration_seconds,
+            crf=crf,
+            ffmpeg=ffmpeg,
+        )
+        if not speed or speed <= 0:
+            return None
 
     total_media_seconds = sum(item.duration_seconds for item in recommended if item.duration_seconds > 0)
     return total_media_seconds / speed if total_media_seconds > 0 else None
