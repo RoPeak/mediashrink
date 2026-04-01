@@ -2,6 +2,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import click
 import typer
@@ -232,7 +233,7 @@ def encode_cmd(
         dir_okay=True,
         readable=True,
     ),
-    output_dir: Path | None = typer.Option(
+    output_dir: Optional[Path] = typer.Option(
         None,
         "--output-dir",
         "-o",
@@ -243,14 +244,14 @@ def encode_cmd(
         "--overwrite",
         help="Replace original files after successful encoding.",
     ),
-    crf: int | None = typer.Option(
+    crf: Optional[int] = typer.Option(
         None,
         "--crf",
         help="H.265 CRF quality value (0-51, lower = better quality). Default: 20.",
         min=0,
         max=51,
     ),
-    preset: str | None = typer.Option(
+    preset: Optional[str] = typer.Option(
         None,
         "--preset",
         help=(
@@ -259,7 +260,7 @@ def encode_cmd(
             "Default: fast."
         ),
     ),
-    profile: str | None = typer.Option(
+    profile: Optional[str] = typer.Option(
         None,
         "--profile",
         help="Load saved CRF/preset defaults from a named profile.",
@@ -420,24 +421,24 @@ def analyze(
             "Enabled by default for the wizard."
         ),
     ),
-    profile: str | None = typer.Option(
+    profile: Optional[str] = typer.Option(
         None,
         "--profile",
         help="Load saved CRF/preset defaults from a named profile.",
     ),
-    crf: int | None = typer.Option(
+    crf: Optional[int] = typer.Option(
         None,
         "--crf",
         min=0,
         max=51,
         help="H.265 CRF quality value used for analysis estimates.",
     ),
-    preset: str | None = typer.Option(
+    preset: Optional[str] = typer.Option(
         None,
         "--preset",
         help="Encoding preset used for analysis estimates.",
     ),
-    manifest_out: Path | None = typer.Option(
+    manifest_out: Optional[Path] = typer.Option(
         None,
         "--manifest-out",
         help="Write recommended candidates to a JSON manifest.",
@@ -508,7 +509,7 @@ def apply(
         dir_okay=False,
         readable=True,
     ),
-    output_dir: Path | None = typer.Option(
+    output_dir: Optional[Path] = typer.Option(
         None,
         "--output-dir",
         "-o",
@@ -519,19 +520,19 @@ def apply(
         "--overwrite",
         help="Replace original files after successful encoding.",
     ),
-    profile: str | None = typer.Option(
+    profile: Optional[str] = typer.Option(
         None,
         "--profile",
         help="Override manifest settings using a saved profile.",
     ),
-    crf: int | None = typer.Option(
+    crf: Optional[int] = typer.Option(
         None,
         "--crf",
         min=0,
         max=51,
         help="Override manifest CRF.",
     ),
-    preset: str | None = typer.Option(
+    preset: Optional[str] = typer.Option(
         None,
         "--preset",
         help="Override manifest preset.",
@@ -607,7 +608,7 @@ def wizard(
         dir_okay=True,
         readable=True,
     ),
-    output_dir: Path | None = typer.Option(
+    output_dir: Optional[Path] = typer.Option(
         None,
         "--output-dir",
         "-o",
@@ -699,19 +700,19 @@ def preview(
         help="How many minutes to encode for the preview (default: 2).",
         min=0.1,
     ),
-    crf: int | None = typer.Option(
+    crf: Optional[int] = typer.Option(
         None,
         "--crf",
         help="H.265 CRF quality value. Default: 20.",
         min=0,
         max=51,
     ),
-    preset: str | None = typer.Option(
+    preset: Optional[str] = typer.Option(
         None,
         "--preset",
         help="Encoding preset. Default: fast.",
     ),
-    profile: str | None = typer.Option(
+    profile: Optional[str] = typer.Option(
         None,
         "--profile",
         help="Load CRF/preset from a named profile.",
