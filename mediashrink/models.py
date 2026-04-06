@@ -13,6 +13,7 @@ class EncodeAttempt:
     duration_seconds: float
     progress_pct: float
     error_message: str | None = None
+    retry_kind: str | None = None
 
     def to_dict(self) -> dict[str, str | int | float | bool | None]:
         return {
@@ -22,6 +23,7 @@ class EncodeAttempt:
             "duration_seconds": self.duration_seconds,
             "progress_pct": self.progress_pct,
             "error_message": self.error_message,
+            "retry_kind": self.retry_kind,
         }
 
     @classmethod
@@ -38,6 +40,7 @@ class EncodeAttempt:
             error_message=(
                 raw.get("error_message") if isinstance(raw.get("error_message"), str) else None
             ),
+            retry_kind=raw.get("retry_kind") if isinstance(raw.get("retry_kind"), str) else None,
         )
 
 
@@ -68,6 +71,7 @@ class EncodeResult:
     raw_error_message: str | None = field(default=None)
     media_duration_seconds: float = 0.0  # source file's playback duration
     fallback_used: bool = False
+    retry_kind: str | None = None
     attempts: list[EncodeAttempt] = field(default_factory=list)
 
     @property
@@ -83,6 +87,24 @@ class EncodeResult:
     @property
     def size_reduction_gb(self) -> float:
         return self.size_reduction_bytes / (1024**3)
+
+    @property
+    def retry_count(self) -> int:
+        return max(len(self.attempts) - 1, 0)
+
+    @property
+    def first_error(self) -> str | None:
+        for attempt in self.attempts:
+            if attempt.error_message:
+                return attempt.error_message
+        return self.error_message
+
+    @property
+    def last_error(self) -> str | None:
+        for attempt in reversed(self.attempts):
+            if attempt.error_message:
+                return attempt.error_message
+        return self.error_message
 
 
 @dataclass
@@ -155,6 +177,10 @@ class SessionFileEntry:
     started_at: str | None = None
     finished_at: str | None = None
     fallback_used: bool = False
+    retry_count: int = 0
+    first_error: str | None = None
+    last_error: str | None = None
+    cleanup_result: str | None = None
     attempt_history: list[EncodeAttempt] = field(default_factory=list)
 
     def to_dict(
@@ -171,6 +197,10 @@ class SessionFileEntry:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "fallback_used": self.fallback_used,
+            "retry_count": self.retry_count,
+            "first_error": self.first_error,
+            "last_error": self.last_error,
+            "cleanup_result": self.cleanup_result,
             "attempt_history": [attempt.to_dict() for attempt in self.attempt_history],
         }
 
@@ -190,6 +220,10 @@ class SessionFileEntry:
         started_at = raw.get("started_at")
         finished_at = raw.get("finished_at")
         fallback_used = raw.get("fallback_used", False)
+        retry_count = raw.get("retry_count", 0)
+        first_error = raw.get("first_error")
+        last_error = raw.get("last_error")
+        cleanup_result = raw.get("cleanup_result")
         raw_attempt_history = raw.get("attempt_history", [])
         if not isinstance(raw_attempt_history, list):
             raw_attempt_history = []
@@ -206,6 +240,10 @@ class SessionFileEntry:
             started_at=started_at if isinstance(started_at, str) else None,
             finished_at=finished_at if isinstance(finished_at, str) else None,
             fallback_used=bool(fallback_used),
+            retry_count=int(retry_count) if isinstance(retry_count, (int, float)) else 0,
+            first_error=first_error if isinstance(first_error, str) else None,
+            last_error=last_error if isinstance(last_error, str) else None,
+            cleanup_result=cleanup_result if isinstance(cleanup_result, str) else None,
             attempt_history=[
                 EncodeAttempt.from_dict(item)
                 for item in raw_attempt_history

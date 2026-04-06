@@ -6,7 +6,8 @@ from pathlib import Path
 
 from mediashrink.models import EncodeAttempt, EncodeJob, SessionFileEntry, SessionManifest
 
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+_SUPPORTED_SESSION_VERSIONS = {1, 2}
 _SESSION_FILENAME = ".mediashrink-session.json"
 
 
@@ -21,7 +22,7 @@ def load_session(path: Path) -> SessionManifest | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         manifest = SessionManifest.from_dict(raw)
-        if manifest.version != SESSION_VERSION:
+        if manifest.version not in _SUPPORTED_SESSION_VERSIONS:
             return None
         return manifest
     except (OSError, json.JSONDecodeError, ValueError):
@@ -74,6 +75,10 @@ def update_session_entry(
     started_at: str | None = None,
     finished_at: str | None = None,
     fallback_used: bool | None = None,
+    retry_count: int | None = None,
+    first_error: str | None = None,
+    last_error: str | None = None,
+    cleanup_result: str | None = None,
     attempt_history: list[EncodeAttempt] | None = None,
 ) -> None:
     """Mutate the entry matching `source` in place."""
@@ -96,6 +101,14 @@ def update_session_entry(
                 entry.finished_at = finished_at
             if fallback_used is not None:
                 entry.fallback_used = fallback_used
+            if retry_count is not None:
+                entry.retry_count = retry_count
+            if first_error is not None:
+                entry.first_error = first_error
+            if last_error is not None:
+                entry.last_error = last_error
+            if cleanup_result is not None:
+                entry.cleanup_result = cleanup_result
             if attempt_history is not None:
                 entry.attempt_history = list(attempt_history)
             return

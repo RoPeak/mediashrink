@@ -275,6 +275,32 @@ def describe_estimate_confidence(
     return detail
 
 
+def select_representative_items(items: list[AnalysisItem], limit: int = 3) -> list[AnalysisItem]:
+    if limit <= 0 or not items:
+        return []
+
+    remaining = sorted(items, key=lambda item: item.size_bytes, reverse=True)
+    selected: list[AnalysisItem] = []
+
+    def take_first(predicate: Callable[[AnalysisItem], bool]) -> None:
+        for item in remaining:
+            if predicate(item) and item not in selected:
+                selected.append(item)
+                return
+
+    take_first(lambda item: (item.codec or "") in {"vc1", "mpeg2video"})
+    take_first(lambda item: (item.codec or "") == "h264")
+    take_first(lambda item: item.recommendation == "maybe")
+
+    for item in remaining:
+        if item not in selected:
+            selected.append(item)
+        if len(selected) >= limit:
+            break
+
+    return selected[:limit]
+
+
 def save_manifest(manifest: AnalysisManifest, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest.to_dict(), indent=2), encoding="utf-8")

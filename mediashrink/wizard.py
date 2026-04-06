@@ -20,6 +20,7 @@ from mediashrink.analysis import (
     estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
     save_manifest,
+    select_representative_items,
 )
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import (
@@ -32,7 +33,7 @@ from mediashrink.encoder import (
     output_drops_subtitles,
     validate_encoder,
 )
-from mediashrink.models import AnalysisItem, EncodeJob
+from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.platform_utils import detect_device_labels
 from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
 from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
@@ -928,7 +929,7 @@ def _run_analysis_with_progress(
 
 
 def _maybe_run_preview(
-    sample_file: Path,
+    preview_items: list[AnalysisItem],
     ffmpeg: Path,
     ffprobe: Path,
     preset: str,
@@ -941,20 +942,32 @@ def _maybe_run_preview(
     ):
         return True
 
-    console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
-    preview_result = encode_preview(
-        source=sample_file,
-        ffmpeg=ffmpeg,
-        ffprobe=ffprobe,
-        duration_minutes=2.0,
-        crf=crf,
-        preset=preset,
-    )
+    if not preview_items:
+        return True
+
+    preview_results: list[EncodeResult] = []
+    console.print(f"[dim]Preview encoding {len(preview_items)} representative clip(s)...[/dim]")
+    for item in preview_items:
+        console.print(f"  [dim]Preview:[/dim] {item.source.name}")
+        preview_results.append(
+            encode_preview(
+                source=item.source,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                duration_minutes=2.0,
+                crf=crf,
+                preset=preset,
+            )
+        )
     from mediashrink.progress import EncodingDisplay
 
-    EncodingDisplay(console).show_summary([preview_result])
-    if preview_result.success and preview_result.job.output.exists():
-        console.print(f"  [dim]Preview saved:[/dim] {preview_result.job.output}")
+    EncodingDisplay(console).show_summary(preview_results)
+    successful_previews = [
+        result for result in preview_results if result.success and result.job.output.exists()
+    ]
+    if successful_previews and all(result.success for result in preview_results):
+        for result in successful_previews:
+            console.print(f"  [dim]Preview saved:[/dim] {result.job.output}")
         console.print(
             "  [dim]Inspect video quality and verify audio/subtitle playback before continuing.[/dim]"
         )
@@ -963,8 +976,9 @@ def _maybe_run_preview(
         )
         return True
 
-    if preview_result.error_message:
-        console.print(f"[red]Preview encode failed:[/red] {preview_result.error_message}")
+    failed_preview = next((result for result in preview_results if not result.success), None)
+    if failed_preview and failed_preview.error_message:
+        console.print(f"[red]Preview encode failed:[/red] {failed_preview.error_message}")
     else:
         console.print("[red]Preview encode failed.[/red]")
     console.print(
@@ -1025,6 +1039,7 @@ def run_wizard(
     sample_item = max(sample_pool, key=lambda item: item.size_bytes)
     sample_file = sample_item.source
     sample_duration = sample_item.duration_seconds if sample_item.duration_seconds > 0 else 3600.0
+    preview_items = select_representative_items(candidate_items or sample_pool, limit=3)
 
     available_hw = detect_available_encoders(
         ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe
@@ -1095,7 +1110,7 @@ def run_wizard(
             maybe_save_profile(preset, crf, display_label, console)
             profile_saved = True
 
-        if not _maybe_run_preview(sample_file, ffmpeg, ffprobe, preset, crf, auto, console):
+        if not _maybe_run_preview(preview_items, ffmpeg, ffprobe, preset, crf, auto, console):
             return [], "cancel", False
 
         if not action_taken:

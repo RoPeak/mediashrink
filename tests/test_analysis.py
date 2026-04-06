@@ -15,6 +15,7 @@ from mediashrink.analysis import (
     estimate_analysis_encode_seconds,
     load_manifest,
     save_manifest,
+    select_representative_items,
 )
 
 FFMPEG = Path("/usr/bin/ffmpeg")
@@ -226,6 +227,25 @@ def test_describe_estimate_confidence_mentions_benchmark_and_codecs(tmp_path: Pa
 
     assert "1 benchmark sample" in detail
     assert "1 codec group" in detail
+
+
+def test_select_representative_items_prefers_legacy_h264_and_maybe(tmp_path: Path) -> None:
+    legacy = build_analysis_item_dict_item(
+        source=tmp_path / "legacy.mkv", recommendation="recommended"
+    )
+    legacy.codec = "vc1"
+    h264 = build_analysis_item_dict_item(source=tmp_path / "h264.mkv", recommendation="recommended")
+    h264.codec = "h264"
+    maybe = build_analysis_item_dict_item(source=tmp_path / "maybe.mkv", recommendation="maybe")
+    maybe.codec = "hevc"
+    extras = build_analysis_item_dict_item(
+        source=tmp_path / "other.mkv", recommendation="recommended"
+    )
+    extras.codec = "mpeg4"
+
+    selected = select_representative_items([extras, maybe, h264, legacy], limit=3)
+
+    assert [item.source.name for item in selected] == ["legacy.mkv", "h264.mkv", "maybe.mkv"]
 
 
 def build_analysis_item_dict_item(

@@ -119,8 +119,30 @@ def test_update_session_entry_records_attempt_history(tmp_path: Path) -> None:
 
     entry = manifest.entries[0]
     assert entry.fallback_used is True
+    assert entry.retry_count == 0
     assert len(entry.attempt_history) == 2
     assert entry.attempt_history[0].preset == "amf"
+
+
+def test_update_session_entry_records_retry_and_cleanup_metadata(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    manifest = build_session(tmp_path, "fast", 20, False, None, [job])
+
+    update_session_entry(
+        manifest,
+        job.source,
+        "success",
+        retry_count=1,
+        first_error="device busy",
+        last_error="device busy",
+        cleanup_result="compressed output kept side-by-side",
+    )
+
+    entry = manifest.entries[0]
+    assert entry.retry_count == 1
+    assert entry.first_error == "device busy"
+    assert entry.last_error == "device busy"
+    assert entry.cleanup_result == "compressed output kept side-by-side"
 
 
 def test_find_resumable_session_returns_none_when_settings_differ(tmp_path: Path) -> None:
@@ -184,6 +206,17 @@ def test_load_session_returns_none_for_wrong_version(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert load_session(path) is None
+
+
+def test_load_session_accepts_prior_supported_version(tmp_path: Path) -> None:
+    path = tmp_path / ".mediashrink-session.json"
+    path.write_text(
+        '{"version": 1, "directory": "/x", "timestamp": "t", "preset": "fast", "crf": 20, "overwrite": false, "output_dir": null, "entries": []}',
+        encoding="utf-8",
+    )
+    loaded = load_session(path)
+    assert loaded is not None
+    assert loaded.version == 1
 
 
 def test_session_skipped_jobs_marked_skipped(tmp_path: Path) -> None:

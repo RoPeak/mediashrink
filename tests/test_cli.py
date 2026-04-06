@@ -661,6 +661,49 @@ def test_preview_command_exits_zero(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
+def test_preview_directory_uses_representative_files(tmp_path: Path) -> None:
+    legacy = tmp_path / "legacy.mkv"
+    h264 = tmp_path / "h264.mkv"
+    maybe = tmp_path / "maybe.mkv"
+    for path in (legacy, h264, maybe):
+        path.write_bytes(b"x" * 1000)
+
+    def _item(path: Path, codec: str, recommendation: str) -> AnalysisItem:
+        return AnalysisItem(
+            source=path,
+            codec=codec,
+            size_bytes=1000,
+            duration_seconds=120.0,
+            bitrate_kbps=1000.0,
+            estimated_output_bytes=500,
+            estimated_savings_bytes=500,
+            recommendation=recommendation,
+            reason_code="reason",
+            reason_text="reason",
+        )
+
+    fake_result = _make_result(_make_job(legacy))
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[legacy, h264, maybe]),
+        patch(
+            "mediashrink.cli.analyze_files",
+            return_value=[
+                _item(legacy, "vc1", "recommended"),
+                _item(h264, "h264", "recommended"),
+                _item(maybe, "hevc", "maybe"),
+            ],
+        ),
+        patch("mediashrink.cli.encode_preview", return_value=fake_result) as mock_preview,
+    ):
+        result = runner.invoke(app, ["preview", "--directory", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert mock_preview.call_count == 3
+
+
 def test_preview_command_unsupported_ext(tmp_path: Path) -> None:
     source = tmp_path / "image.jpg"
     source.write_bytes(b"fake")
@@ -1147,6 +1190,7 @@ def test_encode_writes_json_and_text_reports(tmp_path: Path) -> None:
     report_payload = json.loads(report_json.read_text(encoding="utf-8"))
     assert report_payload["mode"] == "encode"
     assert "warnings" in report_payload
+    assert "retry_count" in report_payload["files"][0]
     assert report_payload["files"][0]["source"].endswith("ep01.mkv")
     assert "mediashrink batch report" in report_text.read_text(encoding="utf-8")
 
@@ -1280,6 +1324,77 @@ def test_run_encode_loop_normalizes_common_failure_message(tmp_path: Path) -> No
         results = _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
 
     assert results[0].error_message == "Disk full: no space left on device."
+
+
+def test_run_encode_loop_retries_transient_software_failure_once(tmp_path: Path) -> None:
+    from mediashrink.cli import _run_encode_loop
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 1000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    failed = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=False,
+        input_size_bytes=1000,
+        output_size_bytes=0,
+        duration_seconds=2.0,
+        error_message="Resource temporarily unavailable",
+        raw_error_message="Resource temporarily unavailable",
+        attempts=[
+            EncodeAttempt(
+                preset="fast",
+                crf=20,
+                success=False,
+                duration_seconds=2.0,
+                progress_pct=0.0,
+                error_message="Resource temporarily unavailable",
+            )
+        ],
+    )
+    succeeded = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=8.0,
+        attempts=[
+            EncodeAttempt(
+                preset="fast",
+                crf=20,
+                success=True,
+                duration_seconds=8.0,
+                progress_pct=100.0,
+            )
+        ],
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    with patch("mediashrink.cli.encode_file", side_effect=[failed, succeeded]):
+        results = _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
+
+    assert results[0].success is True
+    assert results[0].retry_kind == "io_temporary"
+    assert results[0].retry_count == 1
+    assert len(results[0].attempts) == 2
 
 
 def test_encode_passes_custom_stall_warning_seconds(tmp_path: Path) -> None:

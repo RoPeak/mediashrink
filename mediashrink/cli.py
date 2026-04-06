@@ -22,6 +22,7 @@ from mediashrink.analysis import (
     estimate_analysis_encode_seconds,
     load_manifest,
     save_manifest,
+    select_representative_items,
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import (
@@ -64,6 +65,27 @@ _FALLBACK_PRESET = "faster"
 _FALLBACK_CRF = 22
 _FALLBACK_PROGRESS_THRESHOLD = 5.0
 _FALLBACK_DURATION_THRESHOLD = 60.0
+_TRANSIENT_RETRY_PATTERNS: dict[str, tuple[str, ...]] = {
+    "hardware_api_startup": (
+        "device busy",
+        "device lost",
+        "resource busy",
+        "cannot init",
+        "cannot load libcuda",
+        "initialization failed",
+    ),
+    "io_temporary": (
+        "input/output error",
+        "resource temporarily unavailable",
+        "broken pipe",
+        "temporarily unavailable",
+        "i/o error",
+    ),
+    "timeout": (
+        "timed out",
+        "timeout",
+    ),
+}
 _DISK_ESTIMATE_FALLBACK_RATIO = 0.70
 _GB = 1024**3
 _MB = 1024**2
@@ -133,6 +155,7 @@ def _apply_failure_diagnostics(result: EncodeResult) -> EncodeResult:
             duration_seconds=last_attempt.duration_seconds,
             progress_pct=last_attempt.progress_pct,
             error_message=normalized,
+            retry_kind=last_attempt.retry_kind,
         )
     return result
 
@@ -293,6 +316,19 @@ def _write_batch_reports(
                 "output_bytes": result.output_size_bytes,
                 "reduction_pct": round(result.size_reduction_pct, 1) if result.success else 0.0,
                 "fallback_used": result.fallback_used,
+                "retry_kind": result.retry_kind,
+                "retry_count": result.retry_count,
+                "first_error": result.first_error,
+                "last_error": result.last_error,
+                "cleanup_result": (
+                    "original removed; compressed file restored to original name"
+                    if result.job.source in cleaned_paths
+                    else (
+                        "compressed output kept side-by-side"
+                        if result.success and result.job.output != result.job.source
+                        else None
+                    )
+                ),
                 "attempts": [attempt.to_dict() for attempt in result.attempts],
             }
         )
@@ -360,8 +396,35 @@ def _write_batch_reports(
             lines.append(f"  Reason: {result.skip_reason}")
         if result.error_message:
             lines.append(f"  Error: {result.error_message}")
+        if result.retry_count:
+            lines.append(
+                f"  Retries: {result.retry_count}"
+                + (f" ({result.retry_kind})" if result.retry_kind else "")
+            )
+        if result.first_error and result.first_error != result.error_message:
+            lines.append(f"  First error: {result.first_error}")
+        if result.last_error and result.last_error != result.error_message:
+            lines.append(f"  Last error: {result.last_error}")
         if result.fallback_used:
             lines.append("  Fallback: hardware retry switched to libx265 faster / CRF 22")
+        cleanup_result = (
+            "original removed; compressed file restored to original name"
+            if result.job.source in cleaned_paths
+            else (
+                "compressed output kept side-by-side"
+                if result.success and result.job.output != result.job.source
+                else None
+            )
+        )
+        if cleanup_result:
+            lines.append(f"  Cleanup: {cleanup_result}")
+        if result.attempts:
+            for index, attempt in enumerate(result.attempts, start=1):
+                status = "ok" if attempt.success else "failed"
+                extra = f", retry={attempt.retry_kind}" if attempt.retry_kind else ""
+                lines.append(
+                    f"  Attempt {index}: {attempt.preset} / CRF {attempt.crf} - {status}{extra}"
+                )
     text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return json_path, text_path
 
@@ -391,6 +454,81 @@ def _should_retry_hardware_failure(result: EncodeResult) -> bool:
         progress_pct <= _FALLBACK_PROGRESS_THRESHOLD
         or result.duration_seconds <= _FALLBACK_DURATION_THRESHOLD
     )
+
+
+def _classify_transient_failure(result: EncodeResult) -> str | None:
+    if result.success or result.skipped:
+        return None
+    messages = [result.error_message or "", result.raw_error_message or "", result.last_error or ""]
+    haystack = "\n".join(messages).lower()
+    if not haystack.strip():
+        return None
+    for retry_kind, patterns in _TRANSIENT_RETRY_PATTERNS.items():
+        if any(pattern in haystack for pattern in patterns):
+            return retry_kind
+    return None
+
+
+def _should_retry_transient_failure(result: EncodeResult) -> str | None:
+    retry_kind = _classify_transient_failure(result)
+    if retry_kind is None:
+        return None
+    if result.retry_count >= 1:
+        return None
+    if is_hardware_preset(result.job.preset):
+        return retry_kind
+    if retry_kind == "io_temporary":
+        return retry_kind
+    return None
+
+
+def _attempts_with_retry_kind(
+    attempts: list[EncodeAttempt], retry_kind: str
+) -> list[EncodeAttempt]:
+    if not attempts:
+        return attempts
+    patched = list(attempts)
+    last = patched[-1]
+    patched[-1] = EncodeAttempt(
+        preset=last.preset,
+        crf=last.crf,
+        success=last.success,
+        duration_seconds=last.duration_seconds,
+        progress_pct=last.progress_pct,
+        error_message=last.error_message,
+        retry_kind=retry_kind,
+    )
+    return patched
+
+
+def _record_cleanup_results(
+    session: SessionManifest | None,
+    session_path: Path | None,
+    results: list[EncodeResult],
+    cleaned_paths: list[Path],
+) -> None:
+    if session is None or session_path is None:
+        return
+    cleaned_sources = {path for path in cleaned_paths}
+    for result in results:
+        if not result.success or result.skipped:
+            continue
+        cleanup_result = (
+            "original removed; compressed file restored to original name"
+            if result.job.source in cleaned_sources
+            else (
+                "compressed output kept side-by-side"
+                if result.job.output != result.job.source
+                else "output replaced original in place"
+            )
+        )
+        update_session_entry(
+            session,
+            source=result.job.source,
+            status="success",
+            cleanup_result=cleanup_result,
+        )
+    save_session(session, session_path)
 
 
 def _results_to_json(results: list[EncodeResult], exit_code: int) -> str:
@@ -565,6 +703,43 @@ def _run_encode_loop(
                     log_path=log_path,
                 )
                 result = _apply_failure_diagnostics(result)
+                transient_retry_kind = _should_retry_transient_failure(result)
+                if transient_retry_kind is not None:
+                    console.print(
+                        f"[yellow]Retrying {filename} after transient {transient_retry_kind.replace('_', ' ')} failure[/yellow]"
+                    )
+                    retried_result = encode_file(
+                        job,
+                        ffmpeg=ffmpeg,
+                        ffprobe=ffprobe,
+                        progress_callback=make_callback(),
+                        log_path=log_path,
+                    )
+                    retried_result = _apply_failure_diagnostics(retried_result)
+                    attempts = _attempts_with_retry_kind(
+                        result.attempts, transient_retry_kind
+                    ) + list(retried_result.attempts)
+                    result = EncodeResult(
+                        job=retried_result.job,
+                        skipped=retried_result.skipped,
+                        skip_reason=retried_result.skip_reason,
+                        success=retried_result.success,
+                        input_size_bytes=retried_result.input_size_bytes,
+                        output_size_bytes=retried_result.output_size_bytes,
+                        duration_seconds=retried_result.duration_seconds,
+                        error_message=retried_result.error_message,
+                        raw_error_message="\n".join(
+                            filter(
+                                None,
+                                [result.raw_error_message, retried_result.raw_error_message],
+                            )
+                        )
+                        or retried_result.raw_error_message,
+                        media_duration_seconds=retried_result.media_duration_seconds,
+                        fallback_used=retried_result.fallback_used,
+                        retry_kind=transient_retry_kind,
+                        attempts=attempts,
+                    )
                 if allow_hardware_fallback and _should_retry_hardware_failure(result):
                     console.print(
                         f"[yellow]Retrying {filename} with software fallback[/yellow] [dim](libx265 faster, CRF {_FALLBACK_CRF})[/dim]"
@@ -594,6 +769,7 @@ def _run_encode_loop(
                             raw_error_message=result.raw_error_message,
                             media_duration_seconds=fallback_result.media_duration_seconds,
                             fallback_used=True,
+                            retry_kind=result.retry_kind,
                             attempts=attempts,
                         )
                     else:
@@ -619,6 +795,7 @@ def _run_encode_loop(
                             or None,
                             media_duration_seconds=fallback_result.media_duration_seconds,
                             fallback_used=True,
+                            retry_kind=result.retry_kind,
                             attempts=attempts,
                         )
             except KeyboardInterrupt:
@@ -635,6 +812,7 @@ def _run_encode_loop(
                         last_progress_at=_now_iso(),
                         error="Interrupted by user",
                         fallback_used=False,
+                        retry_count=0,
                     )
                     save_session(session, session_path)
                 if results:
@@ -675,6 +853,9 @@ def _run_encode_loop(
                     last_progress_at=_now_iso() if not job.skip else None,
                     finished_at=_now_iso() if not job.skip else None,
                     fallback_used=result.fallback_used,
+                    retry_count=result.retry_count,
+                    first_error=result.first_error,
+                    last_error=result.last_error,
                     attempt_history=result.attempts,
                 )
                 save_session(session, session_path)
@@ -1029,6 +1210,7 @@ def encode_cmd(
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not dry_run and not overwrite and output_dir is None and not yes:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+    _record_cleanup_results(active_session, session_path, results, cleaned_paths)
 
     if not dry_run:
         json_report, text_report = _write_batch_reports(
@@ -1571,6 +1753,7 @@ def resume(
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not session.overwrite and output_dir is None and not yes:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+    _record_cleanup_results(session, session_path, results, cleaned_paths)
 
     json_report, text_report = _write_batch_reports(
         mode="resume",
@@ -1603,12 +1786,20 @@ def resume(
 
 @app.command()
 def preview(
-    file: Path = typer.Argument(
-        ...,
+    file: Optional[Path] = typer.Argument(
+        None,
         help=f"A supported video file ({supported_formats_label()}) to preview-encode.",
-        exists=True,
         file_okay=True,
         dir_okay=False,
+        readable=True,
+    ),
+    directory: Optional[Path] = typer.Option(
+        None,
+        "--directory",
+        help="Preview up to three representative files from this directory instead of a single file.",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
         readable=True,
     ),
     minutes: float = typer.Option(
@@ -1635,10 +1826,19 @@ def preview(
         help="Load CRF/preset from a named profile.",
     ),
 ) -> None:
-    """Test-encode the first N minutes of a single file to check quality before a full batch."""
+    """Test-encode a single file or a representative set before a full batch."""
     from mediashrink.scanner import SUPPORTED_EXTENSIONS
 
-    if file.suffix.lower() not in SUPPORTED_EXTENSIONS:
+    if file is None and directory is None:
+        console.print("[red bold]Error:[/red bold] provide a file or --directory.")
+        raise typer.Exit(code=EXIT_NO_FILES)
+    if file is not None and directory is not None:
+        console.print("[red bold]Error:[/red bold] use either a file or --directory, not both.")
+        raise typer.Exit(code=EXIT_NO_FILES)
+    if file is not None and not file.exists():
+        console.print(f"[red bold]Error:[/red bold] {file} does not exist.")
+        raise typer.Exit(code=EXIT_NO_FILES)
+    if file is not None and file.suffix.lower() not in SUPPORTED_EXTENSIONS:
         console.print(
             f"[red bold]Error:[/red bold] {file.name} is not a supported format "
             f"({supported_formats_label()})."
@@ -1648,7 +1848,35 @@ def preview(
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(None)
     effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
+    if directory is not None:
+        files = scan_directory(directory, recursive=True)
+        if not files:
+            console.print(
+                f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
+            )
+            raise typer.Exit(code=EXIT_NO_FILES)
+        items = analyze_files(files, ffprobe)
+        representative = select_representative_items(items, limit=3)
+        console.print(
+            f"[dim]Preview encoding first {minutes:.1f} minute(s) of {len(representative)} representative file(s) from[/dim] {directory}..."
+        )
+        results = [
+            encode_preview(
+                source=item.source,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                duration_minutes=minutes,
+                crf=effective_crf,
+                preset=effective_preset,
+            )
+            for item in representative
+        ]
+        display.show_summary(results)
+        if any(not result.success for result in results):
+            raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+        return
 
+    assert file is not None
     console.print(f"[dim]Preview encoding first {minutes:.1f} minute(s) of[/dim] {file.name}...")
     result = encode_preview(
         source=file,
