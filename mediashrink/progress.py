@@ -106,6 +106,15 @@ def _preview_duration_note(results: list[EncodeResult]) -> str | None:
     return _fmt_duration(min(preview_durations))
 
 
+def _skip_bucket(result: EncodeResult) -> str:
+    reason = result.skip_reason or ""
+    if reason.startswith("incompatible:"):
+        return "incompatible"
+    if reason.startswith("skipped_by_policy:"):
+        return "policy"
+    return "other"
+
+
 class EncodingDisplay:
     def __init__(self, console: Console | None = None) -> None:
         self.console = console or Console()
@@ -251,6 +260,13 @@ class EncodingDisplay:
         successful_results = [result for result in results if result.success and not result.skipped]
         failed_results = [result for result in results if not result.success and not result.skipped]
         skipped_results = [result for result in results if result.skipped]
+        skipped_incompatible = [
+            result for result in skipped_results if _skip_bucket(result) == "incompatible"
+        ]
+        skipped_by_policy = [
+            result for result in skipped_results if _skip_bucket(result) == "policy"
+        ]
+        skipped_other = [result for result in skipped_results if _skip_bucket(result) == "other"]
         total_input = 0
         total_output = 0
         total_saved = 0
@@ -352,6 +368,18 @@ class EncodingDisplay:
             f"[dim]{len(skipped_results)}[/dim] skipped",
             highlight=False,
         )
+        if skipped_results:
+            details: list[str] = []
+            if skipped_incompatible:
+                details.append(f"{len(skipped_incompatible)} incompatible")
+            if skipped_by_policy:
+                details.append(f"{len(skipped_by_policy)} skipped by policy")
+            if skipped_other:
+                details.append(f"{len(skipped_other)} other skipped")
+            self.console.print(
+                f"[dim]Skip breakdown:[/dim] {', '.join(details)}",
+                highlight=False,
+            )
         self.console.print(table)
 
         if total_input > 0:
@@ -395,4 +423,10 @@ class EncodingDisplay:
             for result in failed_results:
                 message = result.error_message or "unknown ffmpeg error"
                 self.console.print(f"  [red]-[/red] {result.job.source.name}: {message}")
+        if skipped_incompatible:
+            self.console.print("\n[bold yellow]Incompatible files skipped[/bold yellow]")
+            for result in skipped_incompatible:
+                self.console.print(
+                    f"  [yellow]-[/yellow] {result.job.source.name}: {result.skip_reason or 'incompatible with current output settings'}"
+                )
         self.console.print()

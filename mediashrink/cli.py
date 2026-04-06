@@ -457,6 +457,12 @@ def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
         "succeeded": len(succeeded),
         "failed": len(failed),
         "skipped": len(skipped),
+        "skipped_incompatible": sum(
+            1 for result in skipped if _classify_result_status(result) == "skipped_incompatible"
+        ),
+        "skipped_by_policy": sum(
+            1 for result in skipped if _classify_result_status(result) == "skipped_by_policy"
+        ),
         "input_bytes": input_total,
         "output_bytes": output_total,
         "saved_bytes": input_total - output_total,
@@ -578,6 +584,8 @@ def _write_batch_reports(
             f"  Succeeded: {totals['succeeded']}",
             f"  Failed: {totals['failed']}",
             f"  Skipped: {totals['skipped']}",
+            f"  Skipped incompatible: {totals['skipped_incompatible']}",
+            f"  Skipped by policy: {totals['skipped_by_policy']}",
             f"  Input: {_fmt_size(int(totals['input_bytes']))}",
             f"  Output: {_fmt_size(int(totals['output_bytes']))}",
             f"  Saved: {_fmt_size(int(totals['saved_bytes']))}",

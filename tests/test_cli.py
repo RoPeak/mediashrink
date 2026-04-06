@@ -1195,6 +1195,59 @@ def test_encode_writes_json_and_text_reports(tmp_path: Path) -> None:
     assert "mediashrink batch report" in report_text.read_text(encoding="utf-8")
 
 
+def test_write_batch_reports_include_skip_breakdown(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    incompatible_job = _make_job(tmp_path / "bad.mp4")
+    policy_job = _make_job(tmp_path / "policy.mkv")
+    for job in (incompatible_job, policy_job):
+        job.source.write_bytes(b"x" * 1000)
+
+    incompatible = _make_result(
+        incompatible_job,
+        skipped=True,
+        success=False,
+        skip_reason="incompatible: unsupported container/stream combination",
+        output_size_bytes=0,
+    )
+    skipped_by_policy = _make_result(
+        policy_job,
+        skipped=True,
+        success=False,
+        skip_reason="skipped_by_policy: disk full",
+        output_size_bytes=0,
+    )
+
+    json_path, text_path = _write_batch_reports(
+        mode="encode",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[incompatible, skipped_by_policy],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["totals"]["skipped_incompatible"] == 1
+    assert payload["totals"]["skipped_by_policy"] == 1
+    assert "Skipped incompatible: 1" in text
+    assert "Skipped by policy: 1" in text
+
+
 def test_run_encode_loop_retries_early_hardware_failure_with_software_fallback(
     tmp_path: Path,
 ) -> None:
