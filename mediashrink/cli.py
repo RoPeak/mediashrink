@@ -16,13 +16,21 @@ from typer.core import TyperGroup
 from mediashrink.analysis import (
     analyze_files,
     build_manifest,
+    describe_estimate_confidence,
     display_analysis_summary,
+    estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
     load_manifest,
     save_manifest,
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
-from mediashrink.encoder import encode_file, encode_preview, is_hardware_preset
+from mediashrink.encoder import (
+    encode_file,
+    encode_preview,
+    is_hardware_preset,
+    output_drops_subtitles,
+    source_has_subtitle_streams,
+)
 from mediashrink.models import (
     AnalysisItem,
     EncodeAttempt,
@@ -172,6 +180,42 @@ def _maybe_warn_low_disk_space(
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
 
+def _collect_preflight_warnings(jobs: list[EncodeJob], ffprobe: Path) -> list[str]:
+    subtitle_examples: list[str] = []
+    subtitle_count = 0
+    for job in jobs:
+        if job.skip or not output_drops_subtitles(job.output):
+            continue
+        if source_has_subtitle_streams(job.source, ffprobe):
+            subtitle_count += 1
+            if len(subtitle_examples) < 3:
+                subtitle_examples.append(job.source.name)
+
+    warnings: list[str] = []
+    if subtitle_count:
+        container = next(
+            (
+                job.output.suffix.lower()
+                for job in jobs
+                if not job.skip and output_drops_subtitles(job.output)
+            ),
+            ".mp4/.m4v",
+        )
+        warning = (
+            f"Subtitle warning: {subtitle_count} file(s) contain subtitle streams that will be "
+            f"dropped because {container} outputs use '-sn' for compatibility."
+        )
+        if subtitle_examples:
+            warning += f" Examples: {', '.join(subtitle_examples)}."
+        warnings.append(warning)
+    return warnings
+
+
+def _print_preflight_warnings(warnings: list[str]) -> None:
+    for warning in warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+
 def _reconcile_session_with_jobs(session: SessionManifest, jobs: list[EncodeJob]) -> None:
     known_sources = {entry.source for entry in session.entries}
     for job in jobs:
@@ -225,6 +269,7 @@ def _write_batch_reports(
     results: list[EncodeResult],
     cleaned_paths: list[Path],
     log_path: Path | None,
+    warnings: list[str] | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -268,6 +313,7 @@ def _write_batch_reports(
         "resumed_from_session": resumed_from_session,
         "session_path": str(session_path) if session_path is not None else None,
         "totals": totals,
+        "warnings": warnings or [],
         "files": files,
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -287,16 +333,26 @@ def _write_batch_reports(
         f"Started: {started_at}",
         f"Finished: {finished_at}",
         "",
-        "Totals",
-        f"  Succeeded: {totals['succeeded']}",
-        f"  Failed: {totals['failed']}",
-        f"  Skipped: {totals['skipped']}",
-        f"  Input: {_fmt_size(int(totals['input_bytes']))}",
-        f"  Output: {_fmt_size(int(totals['output_bytes']))}",
-        f"  Saved: {_fmt_size(int(totals['saved_bytes']))}",
-        "",
-        "Files",
+        "Warnings",
     ]
+    if warnings:
+        lines.extend(f"  - {warning}" for warning in warnings)
+    else:
+        lines.append("  - none")
+    lines.extend(
+        [
+            "",
+            "Totals",
+            f"  Succeeded: {totals['succeeded']}",
+            f"  Failed: {totals['failed']}",
+            f"  Skipped: {totals['skipped']}",
+            f"  Input: {_fmt_size(int(totals['input_bytes']))}",
+            f"  Output: {_fmt_size(int(totals['output_bytes']))}",
+            f"  Saved: {_fmt_size(int(totals['saved_bytes']))}",
+            "",
+            "Files",
+        ]
+    )
     for result in results:
         status = "SKIPPED" if result.skipped else "OK" if result.success else "FAILED"
         lines.append(f"- {result.job.source.name}: {status}")
@@ -361,6 +417,14 @@ def _results_to_json(results: list[EncodeResult], exit_code: int) -> str:
     return json.dumps({"exit_code": exit_code, "files": files, "total_saved_bytes": total_saved})
 
 
+def _resume_summary_counts(session: SessionManifest | None) -> tuple[int, int]:
+    if session is None:
+        return 0, 0
+    completed = sum(1 for entry in session.entries if entry.status == "success")
+    skipped = sum(1 for entry in session.entries if entry.status == "skipped")
+    return completed, skipped
+
+
 class DefaultCommandGroup(TyperGroup):
     """Route bare `mediashrink ...` invocations to the hidden encode command."""
 
@@ -394,6 +458,9 @@ def _run_encode_loop(
     log_path: Path | None = None,
     stall_warning_seconds: float | None = None,
     allow_hardware_fallback: bool = True,
+    resumed_from_session: bool = False,
+    previously_completed: int = 0,
+    previously_skipped: int = 0,
 ) -> list[EncodeResult]:
     if stall_warning_seconds is None:
         stall_warning_seconds = STALL_WARNING_SECONDS
@@ -412,6 +479,8 @@ def _run_encode_loop(
         for job in jobs:
             filename = job.source.name
             file_size = job.source.stat().st_size
+            files_done = len(results)
+            files_remaining = max(len(jobs) - files_done - 1, 0)
             # Use input size as the task total so DownloadColumn shows GB-scale numbers
             task_total = max(file_size, 1)
             progress.update(
@@ -419,6 +488,10 @@ def _run_encode_loop(
                 description=f"[dim]In progress:[/dim] [white]{filename}",
                 completed=0,
                 total=task_total,
+                completed_files=files_done,
+                remaining_files=files_remaining,
+                last_update_at=time.monotonic(),
+                stall_warning_seconds=stall_warning_seconds,
             )
             started_at = _now_iso()
             stall_state = {
@@ -463,7 +536,14 @@ def _run_encode_loop(
                 def callback(pct: float) -> None:
                     stall_state["last_update"] = time.monotonic()
                     stall_state["last_percent"] = pct
-                    progress.update(ft, completed=fb * pct / 100)
+                    progress.update(
+                        ft,
+                        completed=fb * pct / 100,
+                        completed_files=files_done,
+                        remaining_files=files_remaining,
+                        last_update_at=stall_state["last_update"],
+                        stall_warning_seconds=stall_warning_seconds,
+                    )
                     if session is not None and session_path is not None:
                         update_session_entry(
                             session,
@@ -558,7 +638,12 @@ def _run_encode_loop(
                     )
                     save_session(session, session_path)
                 if results:
-                    display.show_summary(results)
+                    display.show_summary(
+                        results,
+                        resumed_from_session=resumed_from_session,
+                        previously_completed=previously_completed,
+                        previously_skipped=previously_skipped,
+                    )
                 console.print("\n[yellow]Interrupted.[/yellow]")
                 if session_path is not None:
                     console.print(
@@ -601,7 +686,12 @@ def _run_encode_loop(
 
         progress.remove_task(file_task)
 
-    display.show_summary(results)
+    display.show_summary(
+        results,
+        resumed_from_session=resumed_from_session,
+        previously_completed=previously_completed,
+        previously_skipped=previously_skipped,
+    )
     return results
 
 
@@ -883,10 +973,12 @@ def encode_cmd(
     if not to_encode:
         console.print("[dim]Nothing to encode.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
+    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
 
     if not dry_run and not yes:
         if not json_output:
             _print_safe_interrupt_guidance()
+            _print_preflight_warnings(preflight_warnings)
         _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=json_output)
         if not display.confirm_proceed(len(to_encode)):
             console.print("[dim]Aborted.[/dim]")
@@ -894,6 +986,7 @@ def encode_cmd(
     elif not dry_run:
         if not json_output:
             _print_safe_interrupt_guidance()
+            _print_preflight_warnings(preflight_warnings)
         _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=True)
 
     session_path = get_session_path(directory, output_dir) if not dry_run else None
@@ -914,6 +1007,10 @@ def encode_cmd(
         log_path = log_dir / f"mediashrink_{timestamp}.log"
         console.print(f"[dim]Verbose log:[/dim] {log_path}")
 
+    resume_completed, resume_skipped = _resume_summary_counts(
+        prior if resumed_from_session else None
+    )
+
     results = _run_encode_loop(
         jobs,
         ffmpeg,
@@ -923,6 +1020,9 @@ def encode_cmd(
         session_path=session_path,
         log_path=log_path,
         stall_warning_seconds=float(stall_warning_seconds),
+        resumed_from_session=resumed_from_session,
+        previously_completed=resume_completed,
+        previously_skipped=resume_skipped,
     )
     cleaned_paths: list[Path] = []
     if cleanup:
@@ -947,6 +1047,7 @@ def encode_cmd(
             results=results,
             cleaned_paths=cleaned_paths,
             log_path=log_path,
+            warnings=preflight_warnings,
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -1032,6 +1133,8 @@ def analyze(
         crf=effective_crf,
         ffmpeg=ffmpeg,
     )
+    estimate_confidence = estimate_analysis_confidence(items)
+    estimate_confidence_detail = describe_estimate_confidence(items)
 
     if json_output:
         manifest = build_manifest(
@@ -1041,11 +1144,18 @@ def analyze(
             crf=effective_crf,
             profile_name=profile_name,
             estimated_total_encode_seconds=estimated_total_encode_seconds,
+            estimate_confidence=estimate_confidence,
             items=items,
         )
         print(json.dumps(manifest.to_dict()))
     else:
-        display_analysis_summary(items, estimated_total_encode_seconds, quiet_console)
+        display_analysis_summary(
+            items,
+            estimated_total_encode_seconds,
+            quiet_console,
+            estimate_confidence=estimate_confidence,
+            estimate_confidence_detail=estimate_confidence_detail,
+        )
 
     if manifest_out is not None:
         manifest = build_manifest(
@@ -1055,6 +1165,7 @@ def analyze(
             crf=effective_crf,
             profile_name=profile_name,
             estimated_total_encode_seconds=estimated_total_encode_seconds,
+            estimate_confidence=estimate_confidence,
             items=items,
         )
         save_manifest(manifest, manifest_out)
@@ -1153,8 +1264,10 @@ def apply(
     if not to_encode:
         console.print("[dim]Nothing to encode.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
+    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
 
     _print_safe_interrupt_guidance()
+    _print_preflight_warnings(preflight_warnings)
     _maybe_warn_low_disk_space(
         jobs,
         output_dir or loaded_manifest.analyzed_directory,
@@ -1194,6 +1307,7 @@ def apply(
         results=results,
         cleaned_paths=cleaned_paths,
         log_path=None,
+        warnings=preflight_warnings,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
@@ -1282,6 +1396,9 @@ def wizard(
 
     if not json_output:
         _print_safe_interrupt_guidance()
+    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    if not json_output:
+        _print_preflight_warnings(preflight_warnings)
     _maybe_warn_low_disk_space(
         jobs,
         output_dir or directory,
@@ -1318,6 +1435,7 @@ def wizard(
         results=results,
         cleaned_paths=cleaned_paths,
         log_path=None,
+        warnings=preflight_warnings,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -1407,8 +1525,10 @@ def resume(
     )
     console.print(f"[dim]Session path:[/dim] {session_path}")
     display.show_scan_table(jobs)
+    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
     if not json_output:
         _print_safe_interrupt_guidance()
+        _print_preflight_warnings(preflight_warnings)
     _maybe_warn_low_disk_space(
         jobs,
         output_dir or directory,
@@ -1431,6 +1551,8 @@ def resume(
         log_path = log_dir / f"mediashrink_{timestamp}.log"
         console.print(f"[dim]Verbose log:[/dim] {log_path}")
 
+    resume_completed, resume_skipped = _resume_summary_counts(session)
+
     results = _run_encode_loop(
         jobs,
         ffmpeg,
@@ -1440,6 +1562,9 @@ def resume(
         session_path=session_path,
         log_path=log_path,
         stall_warning_seconds=float(stall_warning_seconds),
+        resumed_from_session=True,
+        previously_completed=resume_completed,
+        previously_skipped=resume_skipped,
     )
     cleaned_paths: list[Path] = []
     if cleanup:
@@ -1463,6 +1588,7 @@ def resume(
         results=results,
         cleaned_paths=cleaned_paths,
         log_path=log_path,
+        warnings=preflight_warnings,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")

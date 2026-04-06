@@ -273,6 +273,7 @@ class AnalysisManifest:
     crf: int
     profile_name: str | None
     estimated_total_encode_seconds: float | None
+    estimate_confidence: str | None
     items: list[AnalysisItem]
 
     def to_dict(self) -> dict[str, object]:
@@ -284,6 +285,7 @@ class AnalysisManifest:
             "crf": self.crf,
             "profile_name": self.profile_name,
             "estimated_total_encode_seconds": self.estimated_total_encode_seconds,
+            "estimate_confidence": self.estimate_confidence,
             "items": [item.to_dict() for item in self.items],
         }
 
@@ -304,6 +306,9 @@ class AnalysisManifest:
         estimated_total = raw.get("estimated_total_encode_seconds")
         if estimated_total is not None:
             estimated_total = float(estimated_total)
+        estimate_confidence = raw.get("estimate_confidence")
+        if estimate_confidence is not None and not isinstance(estimate_confidence, str):
+            raise ValueError("manifest estimate_confidence must be a string or null")
         return cls(
             version=int(raw.get("version", 0)),
             analyzed_directory=Path(analyzed_directory),
@@ -312,5 +317,6 @@ class AnalysisManifest:
             crf=int(raw.get("crf", 0)),
             profile_name=profile_name,
             estimated_total_encode_seconds=estimated_total,
+            estimate_confidence=estimate_confidence,
             items=[AnalysisItem.from_dict(item) for item in raw_items],
         )

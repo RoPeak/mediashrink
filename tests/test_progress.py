@@ -100,3 +100,33 @@ def test_make_progress_bar_uses_stable_columns() -> None:
     assert "DownloadColumn" not in column_names
     assert "_CompletedSizeColumn" in column_names
     assert "_EtaColumn" in column_names
+    assert "_FileCountsColumn" in column_names
+    assert "_HeartbeatColumn" in column_names
+    assert "_LastUpdateColumn" in column_names
+
+
+def test_show_summary_mentions_resumed_context(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "movie.mkv"
+    source.write_bytes(b"x" * 1000)
+    result = EncodeResult(
+        job=_job(source),
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=2.0,
+        media_duration_seconds=120.0,
+    )
+
+    EncodingDisplay(console).show_summary(
+        [result],
+        resumed_from_session=True,
+        previously_completed=3,
+        previously_skipped=1,
+    )
+    output = console.export_text()
+
+    assert "Resumed run:" in output
+    assert "3 file(s) were already complete, 1 already skipped" in output

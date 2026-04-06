@@ -11,16 +11,16 @@ from mediashrink.profiles import (
     upsert_profile,
 )
 
-_BUILTIN_NAMES = {"TV Batch", "Archival", "Fast GPU Transcode", "Smallest Acceptable"}
+_BUILTIN_NAMES = {"Fast Batch", "Archival", "GPU Offload", "Smallest Acceptable"}
 
 
 def test_builtin_profiles_not_persisted(tmp_path: Path) -> None:
     profiles_file = tmp_path / "profiles.json"
-    builtin = SavedProfile(name="TV Batch", preset="faster", crf=22, builtin=True)
+    builtin = SavedProfile(name="Fast Batch", preset="faster", crf=22, builtin=True)
     upsert_profile(builtin, profiles_file)
     raw = json.loads(profiles_file.read_text(encoding="utf-8"))
     names = {item["name"] for item in raw}
-    assert "TV Batch" not in names
+    assert "Fast Batch" not in names
 
 
 def test_list_all_profiles_includes_builtins(tmp_path: Path) -> None:
@@ -37,7 +37,9 @@ def test_get_builtin_profiles_returns_four() -> None:
 
 
 def test_session_manifest_round_trip() -> None:
-    entry = SessionFileEntry(source="/video/a.mkv", status="success", output="/video/a_compressed.mkv")
+    entry = SessionFileEntry(
+        source="/video/a.mkv", status="success", output="/video/a_compressed.mkv"
+    )
     manifest = SessionManifest(
         version=1,
         directory="/video",

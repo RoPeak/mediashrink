@@ -9,7 +9,9 @@ from mediashrink.analysis import (
     analyze_files,
     build_analysis_item,
     build_manifest,
+    describe_estimate_confidence,
     display_analysis_summary,
+    estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
     load_manifest,
     save_manifest,
@@ -101,7 +103,12 @@ def test_analyze_files_reports_progress_for_each_file(tmp_path: Path) -> None:
     def callback(completed: int, total: int, path: Path) -> None:
         reported.append((completed, total, path.name))
 
-    with patch("mediashrink.analysis.build_analysis_item", side_effect=lambda path, _: build_analysis_item_dict_item(source=path, recommendation="recommended")):
+    with patch(
+        "mediashrink.analysis.build_analysis_item",
+        side_effect=lambda path, _: build_analysis_item_dict_item(
+            source=path, recommendation="recommended"
+        ),
+    ):
         items = analyze_files(files, FFPROBE, progress_callback=callback)
 
     assert len(items) == 2
@@ -127,6 +134,7 @@ def test_manifest_round_trip_keeps_recommended_only(tmp_path: Path) -> None:
         crf=20,
         profile_name="tv",
         estimated_total_encode_seconds=1234.0,
+        estimate_confidence="Medium",
         items=[recommended, maybe],
     )
     path = tmp_path / "analysis.json"
@@ -135,6 +143,7 @@ def test_manifest_round_trip_keeps_recommended_only(tmp_path: Path) -> None:
 
     assert loaded.version == 1
     assert loaded.profile_name == "tv"
+    assert loaded.estimate_confidence == "Medium"
     assert loaded.preset == "fast"
     assert loaded.crf == 20
     assert len(loaded.items) == 1
@@ -182,7 +191,13 @@ def test_display_analysis_summary_prints_counts(tmp_path: Path) -> None:
         build_analysis_item_dict_item(source=tmp_path / "c.mkv", recommendation="skip"),
     ]
 
-    display_analysis_summary(items, 600.0, console)
+    display_analysis_summary(
+        items,
+        600.0,
+        console,
+        estimate_confidence="High",
+        estimate_confidence_detail="1 benchmark sample, 3/3 file durations known, 1 codec group",
+    )
     output = console.export_text()
 
     assert "recommended" in output.lower()
@@ -190,6 +205,27 @@ def test_display_analysis_summary_prints_counts(tmp_path: Path) -> None:
     assert "maybe 1" in output
     assert "skip 1" in output
     assert "Rough encode time" in output
+    assert "Estimate confidence: High" in output
+
+
+def test_estimate_analysis_confidence_prefers_known_durations_and_low_codec_mix(
+    tmp_path: Path,
+) -> None:
+    items = [
+        build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended"),
+        build_analysis_item_dict_item(source=tmp_path / "b.mkv", recommendation="recommended"),
+    ]
+
+    assert estimate_analysis_confidence(items, benchmarked_files=1) == "High"
+
+
+def test_describe_estimate_confidence_mentions_benchmark_and_codecs(tmp_path: Path) -> None:
+    items = [build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")]
+
+    detail = describe_estimate_confidence(items, benchmarked_files=1)
+
+    assert "1 benchmark sample" in detail
+    assert "1 codec group" in detail
 
 
 def build_analysis_item_dict_item(

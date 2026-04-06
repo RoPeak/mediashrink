@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import typer
 from rich.console import Console
 from rich.progress import (
@@ -51,6 +53,40 @@ class _EtaColumn(ProgressColumn):
         if remaining is None:
             return Text("ETA unavailable", style="progress.remaining")
         return Text(_fmt_duration(remaining), style="progress.remaining")
+
+
+class _FileCountsColumn(ProgressColumn):
+    def render(self, task) -> Text:
+        completed_files = task.fields.get("completed_files")
+        remaining_files = task.fields.get("remaining_files")
+        if completed_files is None or remaining_files is None:
+            return Text("-", style="dim")
+        return Text(f"{completed_files} done / {remaining_files} left", style="dim")
+
+
+class _HeartbeatColumn(ProgressColumn):
+    def render(self, task) -> Text:
+        last_update_at = task.fields.get("last_update_at")
+        stall_warning_seconds = task.fields.get("stall_warning_seconds")
+        if not isinstance(last_update_at, (int, float)):
+            return Text("-", style="dim")
+        if not isinstance(stall_warning_seconds, (int, float)):
+            stall_warning_seconds = 90.0
+        idle_for = max(time.monotonic() - last_update_at, 0.0)
+        if idle_for >= stall_warning_seconds:
+            return Text("stalled warning", style="yellow")
+        if idle_for >= min(15.0, stall_warning_seconds / 2):
+            return Text("quiet but alive", style="cyan")
+        return Text("active", style="green")
+
+
+class _LastUpdateColumn(ProgressColumn):
+    def render(self, task) -> Text:
+        last_update_at = task.fields.get("last_update_at")
+        if not isinstance(last_update_at, (int, float)):
+            return Text("-", style="dim")
+        idle_for = max(time.monotonic() - last_update_at, 0.0)
+        return Text(f"{int(idle_for)}s ago", style="dim")
 
 
 def _is_preview_result(result: EncodeResult) -> bool:
@@ -161,6 +197,9 @@ class EncodingDisplay:
             TextColumn("[progress.description]{task.description}", table_column=None),
             BarColumn(bar_width=bar_width),
             TaskProgressColumn(),
+            _FileCountsColumn(),
+            _HeartbeatColumn(),
+            _LastUpdateColumn(),
             _CompletedSizeColumn(),
             TimeElapsedColumn(),
             _EtaColumn(),
@@ -170,7 +209,14 @@ class EncodingDisplay:
             disable=not self.console.is_terminal,
         )
 
-    def show_summary(self, results: list[EncodeResult]) -> None:
+    def show_summary(
+        self,
+        results: list[EncodeResult],
+        *,
+        resumed_from_session: bool = False,
+        previously_completed: int = 0,
+        previously_skipped: int = 0,
+    ) -> None:
         is_dry_run = any(result.job.dry_run for result in results)
         is_preview = bool(results) and all(_is_preview_result(result) for result in results)
         preview_duration = _preview_duration_note(results)
@@ -293,6 +339,13 @@ class EncodingDisplay:
             total_time += result.duration_seconds
 
         self.console.print()
+        if resumed_from_session:
+            self.console.print(
+                f"[dim]Resumed run:[/dim] {previously_completed} file(s) were already complete"
+                + (f", {previously_skipped} already skipped" if previously_skipped > 0 else "")
+                + " before this run started.",
+                highlight=False,
+            )
         self.console.print(
             f"[bold]{len(successful_results)}[/bold] succeeded, "
             f"[red bold]{len(failed_results)}[/red bold] failed, "

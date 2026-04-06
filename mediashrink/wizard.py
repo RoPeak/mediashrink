@@ -15,7 +15,9 @@ from rich.text import Text
 from mediashrink.analysis import (
     analyze_files,
     build_manifest,
+    describe_estimate_confidence,
     display_analysis_summary,
+    estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
     save_manifest,
 )
@@ -26,6 +28,8 @@ from mediashrink.encoder import (
     get_duration_seconds,
     preflight_encode_job,
     probe_encoder_available,
+    source_has_subtitle_streams,
+    output_drops_subtitles,
     validate_encoder,
 )
 from mediashrink.models import AnalysisItem, EncodeJob
@@ -48,7 +52,7 @@ _HW_ENCODER_CAVEATS: dict[str, str] = {
     "nvenc": "NVENC: consumer GPUs allow max 3 concurrent encode sessions.",
     "amf": "AMF: quality may vary on older Radeon GPUs; test output before batch use.",
 }
-_DEFAULT_FALLBACK_PROFILE = ("faster", 22, "Faster Encode", "faster")
+_DEFAULT_FALLBACK_PROFILE = ("faster", 22, "Fast", "faster")
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -70,6 +74,7 @@ def _fmt_duration(seconds: float) -> str:
 @dataclass
 class EncoderProfile:
     index: int
+    intent_label: str
     name: str
     encoder_key: str
     crf: int
@@ -318,11 +323,13 @@ def _profile_why_choose(profile: EncoderProfile, recommended: EncoderProfile | N
         return "Best default from the current time, size, and quality estimates."
     if profile.encoder_key in _HW_ENCODERS:
         return "Uses GPU hardware to reduce CPU load and keep the encode on the hardware path."
+    if profile.intent_label == "GPU offload":
+        return "Uses GPU hardware to reduce CPU load and stay on the hardware path."
     if profile.name == "Balanced":
         return "Higher quality at a moderate speed cost."
-    if profile.name in {"Best Quality", "Archival"}:
+    if profile.name in {"Archival", "Archival+"}:
         return "Prioritizes retention over runtime."
-    if profile.name in {"Smallest File", "Smallest Acceptable"}:
+    if profile.name in {"Smallest", "Smallest Acceptable"}:
         return "Pushes harder for smaller output sizes."
     return "Alternative trade-off if you prefer this balance."
 
@@ -345,6 +352,7 @@ def build_profiles(
         profiles.append(
             EncoderProfile(
                 index=idx,
+                intent_label="GPU offload",
                 name="Fastest GPU encode",
                 encoder_key=key,
                 crf=20,
@@ -363,7 +371,8 @@ def build_profiles(
     profiles.append(
         EncoderProfile(
             index=idx,
-            name="Faster Encode",
+            intent_label="Fast",
+            name="Fast",
             encoder_key="faster",
             crf=22,
             sw_preset="faster",
@@ -379,6 +388,7 @@ def build_profiles(
     profiles.append(
         EncoderProfile(
             index=idx,
+            intent_label="Balanced",
             name="Balanced",
             encoder_key="fast",
             crf=20,
@@ -396,7 +406,8 @@ def build_profiles(
     profiles.append(
         EncoderProfile(
             index=idx,
-            name="Best Quality",
+            intent_label="Archival",
+            name="Archival",
             encoder_key="slow",
             crf=18,
             sw_preset="slow",
@@ -412,7 +423,8 @@ def build_profiles(
     profiles.append(
         EncoderProfile(
             index=idx,
-            name="Smallest File",
+            intent_label="Smallest",
+            name="Smallest",
             encoder_key="slow",
             crf=28,
             sw_preset="slow",
@@ -427,17 +439,23 @@ def build_profiles(
 
     # Built-in intent presets
     _BUILTIN_QUALITY_LABELS = {
-        "TV Batch": "Very good",
+        "Fast Batch": "Very good",
         "Archival": "Visually lossless",
-        "Fast GPU Transcode": "Good",
+        "GPU Offload": "Good",
         "Smallest Acceptable": "Acceptable",
+    }
+    _BUILTIN_INTENTS = {
+        "Fast Batch": "Fast",
+        "Archival": "Archival",
+        "GPU Offload": "GPU offload",
+        "Smallest Acceptable": "Smallest",
     }
     best_hw = hardware_profiles[0][0] if hardware_profiles else None
     best_hw_speed = hardware_profiles[0][1] if hardware_profiles else None
 
     for bp in get_builtin_profiles():
-        # "Fast GPU Transcode" uses the best available HW encoder, or falls back to sw
-        if bp.name == "Fast GPU Transcode":
+        # "GPU Offload" uses the best available HW encoder, or falls back to sw
+        if bp.name == "GPU Offload":
             encoder_key = best_hw if best_hw else "faster"
             speed = best_hw_speed if best_hw else benchmark_speeds.get("faster")
             sw_preset = None if best_hw else "faster"
@@ -453,6 +471,7 @@ def build_profiles(
         profiles.append(
             EncoderProfile(
                 index=idx,
+                intent_label=_BUILTIN_INTENTS.get(bp.name, "Balanced"),
                 name=bp.name,
                 encoder_key=encoder_key,
                 crf=bp.crf,
@@ -470,6 +489,7 @@ def build_profiles(
     profiles.append(
         EncoderProfile(
             index=idx,
+            intent_label="Custom",
             name="Custom",
             encoder_key="",
             crf=20,
@@ -531,6 +551,8 @@ def display_profiles_table(
     candidate_count: int,
     device_labels: dict[str, str],
     console: Console,
+    estimate_confidence: str | None = None,
+    estimate_confidence_detail: str | None = None,
 ) -> None:
     compact = console.width < 120
     table = Table(
@@ -540,6 +562,7 @@ def display_profiles_table(
         show_lines=False,
     )
     table.add_column("#", justify="right", style="bold", no_wrap=True)
+    table.add_column("Intent", no_wrap=True)
     table.add_column("Profile", no_wrap=True)
     table.add_column("Encoder", style="dim cyan")
     table.add_column("Est. Saving", justify="right", style="bold green", no_wrap=True)
@@ -553,6 +576,7 @@ def display_profiles_table(
         if profile.is_custom:
             row: list[str | Text] = [
                 str(profile.index),
+                profile.intent_label,
                 "Custom",
                 "-",
                 "-",
@@ -588,6 +612,7 @@ def display_profiles_table(
 
         row = [
             str(profile.index),
+            profile.intent_label,
             profile_name,
             encoder_display,
             est_saving,
@@ -621,6 +646,12 @@ def display_profiles_table(
     console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
+    if estimate_confidence is not None:
+        console.print(
+            f"  [dim]Estimate confidence: {estimate_confidence}"
+            + (f" ({estimate_confidence_detail})" if estimate_confidence_detail else "")
+            + ".[/dim]"
+        )
     if fastest is not None:
         console.print(
             f"  [dim]Lowest estimated wait: {fastest.name} (~{_fmt_duration(fastest.estimated_encode_seconds)}).[/dim]"
@@ -812,6 +843,23 @@ def review_maybe_items(maybe_items: list[AnalysisItem], console: Console) -> boo
     return typer.confirm("Include maybe files in this run?", default=False)
 
 
+def _subtitle_drop_warning(jobs: list[EncodeJob], ffprobe: Path) -> str | None:
+    affected: list[str] = []
+    for job in jobs:
+        if job.skip or not output_drops_subtitles(job.output):
+            continue
+        if source_has_subtitle_streams(job.source, ffprobe):
+            affected.append(job.source.name)
+    if not affected:
+        return None
+    examples = ", ".join(affected[:3])
+    return (
+        f"{len(affected)} file(s) with subtitle streams will lose subtitles because "
+        f"{jobs[0].output.suffix.lower()} outputs use '-sn' for compatibility."
+        + (f" Examples: {examples}." if examples else "")
+    )
+
+
 def _select_profile_interactively(
     profiles: list[EncoderProfile],
     available_hw: list[str],
@@ -921,7 +969,7 @@ def _maybe_run_preview(
         console.print("[red]Preview encode failed.[/red]")
     console.print(
         "[dim]This is likely an encoder configuration issue, not a problem with your files. "
-        "If it persists, try a software profile (e.g. 'Faster Encode').[/dim]"
+        "If it persists, try a software profile (e.g. 'Fast').[/dim]"
     )
     return typer.confirm("Continue to full batch anyway?", default=False)
 
@@ -955,7 +1003,14 @@ def run_wizard(
     )
 
     analysis_items = _run_analysis_with_progress(files, ffprobe, console)
-    display_analysis_summary(analysis_items, None, console)
+    initial_confidence = estimate_analysis_confidence(analysis_items)
+    display_analysis_summary(
+        analysis_items,
+        None,
+        console,
+        estimate_confidence=initial_confidence,
+        estimate_confidence_detail=describe_estimate_confidence(analysis_items),
+    )
 
     recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
     maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
@@ -1008,8 +1063,17 @@ def run_wizard(
         total_media_seconds=candidate_media_seconds,
         total_input_bytes=candidate_input_bytes,
     )
+    profile_estimate_confidence = estimate_analysis_confidence(candidate_items, benchmarked_files=1)
     display_profiles_table(
-        profiles, candidate_input_bytes, len(candidate_items), device_labels, console
+        profiles,
+        candidate_input_bytes,
+        len(candidate_items),
+        device_labels,
+        console,
+        estimate_confidence=profile_estimate_confidence,
+        estimate_confidence_detail=describe_estimate_confidence(
+            candidate_items, benchmarked_files=1
+        ),
     )
 
     for hw_key in available_hw:
@@ -1057,6 +1121,9 @@ def run_wizard(
                     crf=crf,
                     profile_name=None,
                     estimated_total_encode_seconds=export_estimate,
+                    estimate_confidence=estimate_analysis_confidence(
+                        recommended_items, benchmarked_files=1
+                    ),
                     items=analysis_items,
                 )
                 default_manifest_path = directory / "mediashrink-analysis.json"
@@ -1202,6 +1269,9 @@ def run_wizard(
         )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
+    console.print(
+        f"  Estimate confidence: {estimate_analysis_confidence(selected_items, benchmarked_files=1)}"
+    )
     if preset in _HW_ENCODERS:
         console.print(
             "  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]"
@@ -1217,6 +1287,9 @@ def run_wizard(
 
     if not to_encode[0].output.parent.exists():
         console.print(f"  Output:   {to_encode[0].output.parent}")
+    subtitle_warning = _subtitle_drop_warning(to_encode, ffprobe)
+    if subtitle_warning:
+        console.print(f"  [yellow]{subtitle_warning}[/yellow]")
     console.print("  [dim]Estimates are approximate.[/dim]")
     console.print(
         "  [dim]Safe to stop with Ctrl+C: completed files stay done, the current temp output is discarded, and you can resume unfinished files later.[/dim]"

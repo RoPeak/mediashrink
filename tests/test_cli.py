@@ -213,7 +213,7 @@ def test_profiles_list_and_delete(tmp_path: Path, monkeypatch) -> None:
     assert "Deleted profile" in delete_result.stdout
     # After deleting the only user profile, builtins are still listed
     assert "tv:" not in list_after_delete.stdout
-    assert "TV Batch" in list_after_delete.stdout
+    assert "Fast Batch" in list_after_delete.stdout
 
 
 def test_wizard_subcommand_registered() -> None:
@@ -331,6 +331,7 @@ def test_apply_uses_manifest_settings(tmp_path: Path) -> None:
         crf=20,
         profile_name=None,
         estimated_total_encode_seconds=100.0,
+        estimate_confidence=None,
         items=[
             AnalysisItem(
                 source=source,
@@ -377,6 +378,7 @@ def test_apply_explicit_overrides_manifest(tmp_path: Path, monkeypatch) -> None:
         crf=20,
         profile_name=None,
         estimated_total_encode_seconds=None,
+        estimate_confidence=None,
         items=[
             AnalysisItem(
                 source=source,
@@ -435,6 +437,7 @@ def test_apply_reports_missing_manifest_files(tmp_path: Path) -> None:
         crf=20,
         profile_name=None,
         estimated_total_encode_seconds=None,
+        estimate_confidence=None,
         items=[
             AnalysisItem(
                 source=existing,
@@ -477,6 +480,51 @@ def test_apply_reports_missing_manifest_files(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert mock_build_jobs.call_args.kwargs["files"] == [existing]
     assert "Missing file from manifest" in result.stdout
+
+
+def test_apply_warns_when_output_container_drops_subtitles(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    fake_result = _make_result(fake_job)
+    manifest = build_manifest(
+        directory=tmp_path,
+        recursive=False,
+        preset="fast",
+        crf=20,
+        profile_name=None,
+        estimated_total_encode_seconds=None,
+        estimate_confidence=None,
+        items=[
+            AnalysisItem(
+                source=source,
+                codec="h264",
+                size_bytes=1000,
+                duration_seconds=120.0,
+                bitrate_kbps=12000.0,
+                estimated_output_bytes=400,
+                estimated_savings_bytes=600,
+                recommendation="recommended",
+                reason_code="strong_savings_candidate",
+                reason_text="legacy codec with strong projected space savings",
+            )
+        ],
+    )
+    manifest_path = tmp_path / "analysis.json"
+    save_manifest(manifest, manifest_path)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.source_has_subtitle_streams", return_value=True),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
+        result = runner.invoke(app, ["apply", str(manifest_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "Subtitle warning:" in result.stdout
 
 
 def test_encode_prompts_for_cleanup_after_successful_side_by_side_run(tmp_path: Path) -> None:
@@ -541,6 +589,7 @@ def test_apply_yes_does_not_prompt_for_cleanup_without_flag(tmp_path: Path) -> N
         crf=20,
         profile_name=None,
         estimated_total_encode_seconds=None,
+        estimate_confidence=None,
         items=[
             AnalysisItem(
                 source=source,
@@ -930,7 +979,12 @@ def test_run_encode_loop_removes_file_task_and_updates_overall_only_on_completio
     ]
     assert overall_updates == [5_000_000]
     mock_progress.remove_task.assert_called_once_with(1)
-    mock_display.show_summary.assert_called_once_with([ok_result])
+    mock_display.show_summary.assert_called_once_with(
+        [ok_result],
+        resumed_from_session=False,
+        previously_completed=0,
+        previously_skipped=0,
+    )
 
 
 def test_run_encode_loop_interrupt_preserves_session_and_prints_resume_guidance(
@@ -1092,6 +1146,7 @@ def test_encode_writes_json_and_text_reports(tmp_path: Path) -> None:
     report_text = next(tmp_path.glob("mediashrink_report_*.txt"))
     report_payload = json.loads(report_json.read_text(encoding="utf-8"))
     assert report_payload["mode"] == "encode"
+    assert "warnings" in report_payload
     assert report_payload["files"][0]["source"].endswith("ep01.mkv")
     assert "mediashrink batch report" in report_text.read_text(encoding="utf-8")
 

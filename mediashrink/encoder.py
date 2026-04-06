@@ -317,6 +317,30 @@ def _subtitle_args(output_path: Path) -> list[str]:
     return ["-c:s", "copy"]
 
 
+def output_drops_subtitles(output_path: Path) -> bool:
+    return output_path.suffix.lower() in _MP4_CONTAINERS
+
+
+def source_has_subtitle_streams(path: Path, ffprobe: Path) -> bool:
+    cmd = [
+        str(ffprobe),
+        "-v",
+        "error",
+        "-select_streams",
+        "s",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return any(line.strip() for line in result.stdout.splitlines())
+
+
 def _build_sw_command(
     job: EncodeJob,
     ffmpeg: Path,

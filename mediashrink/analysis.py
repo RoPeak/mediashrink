@@ -188,6 +188,7 @@ def build_manifest(
     crf: int,
     profile_name: str | None,
     estimated_total_encode_seconds: float | None,
+    estimate_confidence: str | None,
     items: list[AnalysisItem],
 ) -> AnalysisManifest:
     return AnalysisManifest(
@@ -198,8 +199,80 @@ def build_manifest(
         crf=crf,
         profile_name=profile_name,
         estimated_total_encode_seconds=estimated_total_encode_seconds,
+        estimate_confidence=estimate_confidence,
         items=[item for item in items if item.recommendation == "recommended"],
     )
+
+
+def estimate_analysis_confidence(
+    items: list[AnalysisItem],
+    *,
+    benchmarked_files: int = 0,
+) -> str:
+    if not items:
+        return "Low"
+
+    total = len(items)
+    known_durations = sum(1 for item in items if item.duration_seconds > 0)
+    known_ratio = known_durations / total
+    codec_count = len({item.codec or "unknown" for item in items})
+    fallback_estimates = sum(
+        1 for item in items if item.recommendation != "skip" and item.estimated_output_bytes <= 0
+    )
+
+    score = 0
+    if benchmarked_files >= 1:
+        score += 1
+    if known_ratio >= 0.9:
+        score += 2
+    elif known_ratio >= 0.6:
+        score += 1
+    else:
+        score -= 1
+    if codec_count <= 2:
+        score += 1
+    elif codec_count >= 4:
+        score -= 1
+    if fallback_estimates == 0:
+        score += 1
+    elif fallback_estimates >= max(1, total // 3):
+        score -= 1
+
+    if score >= 4:
+        return "High"
+    if score >= 2:
+        return "Medium"
+    return "Low"
+
+
+def describe_estimate_confidence(
+    items: list[AnalysisItem],
+    *,
+    benchmarked_files: int = 0,
+) -> str:
+    if not items:
+        return "No estimate inputs were available."
+
+    total = len(items)
+    known_durations = sum(1 for item in items if item.duration_seconds > 0)
+    codec_count = len({item.codec or "unknown" for item in items})
+    fallback_estimates = sum(
+        1 for item in items if item.recommendation != "skip" and item.estimated_output_bytes <= 0
+    )
+    benchmark_note = (
+        f"{benchmarked_files} benchmark sample{'s' if benchmarked_files != 1 else ''}"
+        if benchmarked_files > 0
+        else "no encode benchmark sample"
+    )
+    detail = (
+        f"{benchmark_note}, {known_durations}/{total} file durations known, "
+        f"{codec_count} codec group{'s' if codec_count != 1 else ''}"
+    )
+    if fallback_estimates:
+        detail += (
+            f", {fallback_estimates} estimate fallback{'s' if fallback_estimates != 1 else ''}"
+        )
+    return detail
 
 
 def save_manifest(manifest: AnalysisManifest, path: Path) -> None:
@@ -221,6 +294,8 @@ def display_analysis_summary(
     items: list[AnalysisItem],
     estimated_total_encode_seconds: float | None,
     console: Console,
+    estimate_confidence: str | None = None,
+    estimate_confidence_detail: str | None = None,
 ) -> None:
     recommended = [item for item in items if item.recommendation == "recommended"]
     maybe = [item for item in items if item.recommendation == "maybe"]
@@ -294,6 +369,11 @@ def display_analysis_summary(
         console.print(
             f"Rough encode time: [cyan]~{_fmt_duration(estimated_total_encode_seconds)}[/cyan]"
         )
+    confidence = estimate_confidence or estimate_analysis_confidence(items)
+    console.print(
+        f"Estimate confidence: [cyan]{confidence}[/cyan]"
+        + (f" [dim]({estimate_confidence_detail})[/dim]" if estimate_confidence_detail else "")
+    )
     console.print("[dim]Analysis estimates are approximate.[/dim]")
     console.print(
         "[dim]Hardware encoders are faster, but source duration, bitrate, and resolution still dominate total runtime.[/dim]"

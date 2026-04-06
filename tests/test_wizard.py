@@ -118,7 +118,7 @@ def test_build_profiles_renames_slower_hardware_and_recommends_software() -> Non
     recommended = next(profile for profile in profiles if profile.is_recommended)
 
     assert gpu_profile.name == "Fastest GPU encode"
-    assert recommended.name == "Faster Encode"
+    assert recommended.name == "Fast"
 
 
 def test_build_profiles_does_not_recommend_dominated_profile() -> None:
@@ -154,7 +154,7 @@ def test_build_profiles_estimates_decrease_with_higher_crf() -> None:
         total_input_bytes=10 * 1024**3,
     )
     balanced = next(profile for profile in profiles if profile.name == "Balanced")
-    smallest = next(profile for profile in profiles if profile.name == "Smallest File")
+    smallest = next(profile for profile in profiles if profile.name == "Smallest")
     assert smallest.estimated_output_bytes < balanced.estimated_output_bytes
 
 
@@ -170,10 +170,13 @@ def test_display_profiles_table_uses_device_label() -> None:
     display_profiles_table(profiles, 10 * 1024**3, 3, {"qsv": "Intel Arc Test"}, console)
 
     output = console.export_text()
-    assert "Intel Quick Sync" in output
+    assert "Intel Quick" in output
+    assert "Sync" in output
     assert "Intel" in output
-    assert "Arc Test" in output
+    assert "Arc" in output
+    assert "Test" in output
     assert "approximate estimates" in output
+    assert "Estimate confidence:" not in output
 
 
 def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
@@ -189,8 +192,9 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
 
     output = console.export_text()
     assert "Why choose this" in output
-    assert "Lowest estimated wait: Faster Encode" in output
-    assert "Default pick: Faster Encode" in output
+    assert "Intent" in output
+    assert "Lowest estimated wait: Fast" in output
+    assert "Default pick: Fast" in output
 
 
 def test_run_custom_wizard_returns_hardware_choice() -> None:
@@ -251,7 +255,9 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
     recommended = _analysis_item(source, "recommended")
     maybe = _analysis_item(tmp_path / "ep02.mkv", "maybe")
     fake_job = _job_for(source)
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[source]),
@@ -289,7 +295,9 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
     recommended = _analysis_item(source, "recommended")
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
     manifest_path = tmp_path / "analysis.json"
 
     with (
@@ -321,7 +329,9 @@ def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> 
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
     maybe = _analysis_item(source, "maybe")
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[source]),
@@ -349,7 +359,9 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
     recommended = _analysis_item(recommended_path, "recommended")
     maybe = _analysis_item(maybe_path, "maybe")
     fake_job = _job_for(recommended_path)
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[recommended_path, maybe_path]),
@@ -397,7 +409,9 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
         reason_text="reason text",
     )
     fake_job = _job_for(larger)
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
     preview_result = _fake_preview_result(larger)
     preview_result.job.output.write_bytes(b"preview")
 
@@ -434,7 +448,7 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
 # Built-in profiles in wizard
 # ---------------------------------------------------------------------------
 
-_BUILTIN_NAMES = {"TV Batch", "Archival", "Fast GPU Transcode", "Smallest Acceptable"}
+_BUILTIN_NAMES = {"Fast Batch", "Archival", "GPU Offload", "Smallest Acceptable"}
 
 
 def test_build_profiles_includes_builtins() -> None:
@@ -455,7 +469,7 @@ def test_builtin_profiles_have_is_builtin_flag() -> None:
         total_media_seconds=3600.0,
         total_input_bytes=10 * 1024**3,
     )
-    builtin_profiles = [p for p in profiles if p.name in _BUILTIN_NAMES]
+    builtin_profiles = [p for p in profiles if p.is_builtin]
     assert len(builtin_profiles) == 4
     assert all(p.is_builtin for p in builtin_profiles)
 
@@ -467,7 +481,7 @@ def test_builtin_fast_gpu_substitutes_sw_when_no_hw() -> None:
         total_media_seconds=3600.0,
         total_input_bytes=10 * 1024**3,
     )
-    gpu_profile = next(p for p in profiles if p.name == "Fast GPU Transcode")
+    gpu_profile = next(p for p in profiles if p.name == "GPU Offload")
     # No HW available — should fall back to software preset
     assert gpu_profile.encoder_key not in {"qsv", "nvenc", "amf"}
     assert gpu_profile.sw_preset is not None
@@ -480,7 +494,7 @@ def test_builtin_fast_gpu_uses_best_hw_when_available() -> None:
         total_media_seconds=3600.0,
         total_input_bytes=10 * 1024**3,
     )
-    gpu_profile = next(p for p in profiles if p.name == "Fast GPU Transcode")
+    gpu_profile = next(p for p in profiles if p.name == "GPU Offload")
     # Best HW is nvenc (speed 8.0)
     assert gpu_profile.encoder_key == "nvenc"
 
@@ -582,7 +596,9 @@ def test_run_wizard_auto_selects_recommended_profile(tmp_path: Path) -> None:
     fake_job = _job_for(source)
 
     # Balanced is recommended when no HW available
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[source]),
@@ -617,7 +633,9 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
     source.write_bytes(b"x" * 1000)
     recommended = _analysis_item(source, "recommended")
     fake_job = _job_for(source)
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[source]),
@@ -651,7 +669,9 @@ def test_run_wizard_switches_to_fallback_when_preflight_encode_fails(tmp_path: P
     source.write_bytes(b"x" * 1000)
     recommended = _analysis_item(source, "recommended")
     fake_job = _job_for(source)
-    selected_profile = EncoderProfile(1, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[source]),
@@ -696,8 +716,12 @@ def test_run_wizard_returns_to_profile_selection_when_fallback_declined(tmp_path
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
     recommended = _analysis_item(source, "recommended")
-    first_profile = EncoderProfile(1, "Fastest", "qsv", 20, None, 0, 0.0, "Good", True)
-    second_profile = EncoderProfile(2, "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", False)
+    first_profile = EncoderProfile(
+        1, "GPU offload", "Fastest", "qsv", 20, None, 0, 0.0, "Good", True
+    )
+    second_profile = EncoderProfile(
+        2, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", False
+    )
     fake_job = _job_for(source)
 
     with (

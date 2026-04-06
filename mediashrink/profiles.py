@@ -69,10 +69,20 @@ def load_profiles(path: Path | None = None) -> list[SavedProfile]:
 def get_builtin_profiles() -> list[SavedProfile]:
     """Return the fixed built-in intent presets. These are never persisted."""
     return [
-        SavedProfile(name="TV Batch",            preset="faster", crf=22, label="TV shows / fast batch",    builtin=True),
-        SavedProfile(name="Archival",             preset="slow",   crf=16, label="Maximum quality",          builtin=True),
-        SavedProfile(name="Fast GPU Transcode",   preset="nvenc",  crf=22, label="Hardware speed (GPU)",     builtin=True),
-        SavedProfile(name="Smallest Acceptable",  preset="slow",   crf=28, label="Maximum compression",      builtin=True),
+        SavedProfile(
+            name="Fast Batch", preset="faster", crf=22, label="TV shows / fast batch", builtin=True
+        ),
+        SavedProfile(name="Archival", preset="slow", crf=16, label="Maximum quality", builtin=True),
+        SavedProfile(
+            name="GPU Offload", preset="nvenc", crf=22, label="Hardware speed (GPU)", builtin=True
+        ),
+        SavedProfile(
+            name="Smallest Acceptable",
+            preset="slow",
+            crf=28,
+            label="Maximum compression",
+            builtin=True,
+        ),
     ]
 
 
