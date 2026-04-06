@@ -1623,6 +1623,33 @@ def test_encode_stop_policy_aborts_on_incompatible_file_before_batch(tmp_path: P
     assert "Compatibility check failed" in result.stdout
 
 
+def test_encode_skip_policy_reports_specific_subtitle_incompatibility(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch(
+            "mediashrink.cli.preflight_encode_job",
+            return_value=_make_result(
+                job,
+                success=False,
+                output_size_bytes=0,
+                error_message="Subtitle codec 94213 is not supported in mov_text",
+            ),
+        ),
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--yes", "--on-file-failure", "skip"])
+
+    assert result.exit_code == 0
+    assert "subtitle codec is not supported by the chosen output container" in result.stdout
+
+
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)

@@ -7,7 +7,11 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from mediashrink.calibration import load_calibration_store, lookup_estimate
+from mediashrink.calibration import (
+    describe_calibration_estimate,
+    load_calibration_store,
+    lookup_estimate,
+)
 from mediashrink.encoder import estimate_output_size, get_duration_seconds, get_video_bitrate_kbps
 from mediashrink.models import AnalysisItem, AnalysisManifest
 from mediashrink.scanner import is_already_compressed, probe_video_codec, scan_directory
@@ -248,6 +252,42 @@ def estimate_analysis_encode_seconds(
         item.duration_seconds for item in recommended if item.duration_seconds > 0
     )
     return total_media_seconds / speed if total_media_seconds > 0 else None
+
+
+def describe_estimate_calibration(
+    items: list[AnalysisItem],
+    *,
+    preset: str,
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> str | None:
+    if not use_calibration:
+        return "calibration disabled"
+    candidates = [item for item in items if item.recommendation == "recommended"] or list(items)
+    if not candidates:
+        return None
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    notes: list[str] = []
+    seen: set[tuple[str | None, str]] = set()
+    for item in candidates[:3]:
+        key = (item.codec, item.source.suffix.lower() or ".mkv")
+        if key in seen:
+            continue
+        seen.add(key)
+        estimate = lookup_estimate(
+            active_store,
+            codec=item.codec,
+            resolution="unknown",
+            bitrate="unknown",
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        note = describe_calibration_estimate(estimate)
+        if note:
+            notes.append(note)
+    if not notes:
+        return "using heuristic estimates only"
+    return notes[0]
 
 
 def build_manifest(

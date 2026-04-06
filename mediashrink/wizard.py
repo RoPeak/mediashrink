@@ -15,6 +15,7 @@ from rich.text import Text
 from mediashrink.analysis import (
     analyze_files,
     build_manifest,
+    describe_estimate_calibration,
     describe_estimate_confidence,
     display_analysis_summary,
     estimate_analysis_confidence,
@@ -1234,6 +1235,13 @@ def run_wizard(
         use_calibration=use_calibration,
     )
     profile_estimate_confidence = estimate_analysis_confidence(candidate_items, benchmarked_files=1)
+    profile_calibration_detail = describe_estimate_calibration(
+        candidate_items,
+        preset=next(
+            (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
+        ),
+        use_calibration=use_calibration,
+    )
     display_profiles_table(
         profiles,
         candidate_input_bytes,
@@ -1241,8 +1249,13 @@ def run_wizard(
         device_labels,
         console,
         estimate_confidence=profile_estimate_confidence,
-        estimate_confidence_detail=describe_estimate_confidence(
-            candidate_items, benchmarked_files=1
+        estimate_confidence_detail=(
+            describe_estimate_confidence(candidate_items, benchmarked_files=1)
+            + (
+                f"; local history: {profile_calibration_detail}"
+                if profile_calibration_detail
+                else ""
+            )
         ),
     )
 

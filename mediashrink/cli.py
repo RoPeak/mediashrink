@@ -16,6 +16,7 @@ from typer.core import TyperGroup
 from mediashrink.analysis import (
     analyze_files,
     build_manifest,
+    describe_estimate_calibration,
     describe_estimate_confidence,
     display_analysis_summary,
     estimate_analysis_confidence,
@@ -319,14 +320,22 @@ def _collect_preflight_warnings(jobs: list[EncodeJob], ffprobe: Path) -> list[st
 
 def _classify_incompatible_reason(message: str | None, job: EncodeJob) -> str:
     lowered = (message or "").lower()
+    if "attachment" in lowered:
+        return "attachment streams are not supported by the chosen output container"
+    if "mov_text" in lowered or "subtitle" in lowered or "subrip" in lowered or "ass" in lowered:
+        return "subtitle codec is not supported by the chosen output container"
+    if "data" in lowered or "bin_data" in lowered:
+        return "auxiliary data streams are not supported by the chosen output container"
+    if "audio" in lowered and "not currently supported in container" in lowered:
+        return "audio codec is not supported by the chosen output container"
     if "could not write header" in lowered and "invalid argument" in lowered:
         return "unsupported container/stream combination"
-    if "attachment" in lowered or "data" in lowered:
-        return "incompatible stream layout"
+    if "invalid argument" in lowered and is_hardware_preset(job.preset):
+        return "encoder/container combination appears unreliable on this device"
     if job.output.suffix.lower() in {".mp4", ".m4v"}:
-        return "unsupported container/stream combination"
+        return "output container cannot safely carry one or more copied streams"
     if is_hardware_preset(job.preset) and "invalid argument" in lowered:
-        return "encoder/container combination historically unreliable"
+        return "encoder/container combination appears unreliable on this device"
     return "incompatible stream layout"
 
 
@@ -1574,6 +1583,8 @@ def encode_cmd(
             console.print(
                 f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
             )
+            for note in incompatible[:5]:
+                console.print(f"[yellow]  - {note}[/yellow]")
         if incompatible and on_file_failure == "stop":
             for note in incompatible:
                 console.print(f"[red]Compatibility check failed:[/red] {note}")
@@ -1778,6 +1789,13 @@ def analyze(
     )
     estimate_confidence = estimate_analysis_confidence(items)
     estimate_confidence_detail = describe_estimate_confidence(items)
+    calibration_detail = describe_estimate_calibration(
+        items,
+        preset=effective_preset,
+        use_calibration=use_calibration,
+    )
+    if calibration_detail:
+        estimate_confidence_detail += f"; local history: {calibration_detail}"
 
     if json_output:
         manifest = build_manifest(
@@ -1929,6 +1947,8 @@ def apply(
         console.print(
             f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
         )
+        for note in incompatible[:5]:
+            console.print(f"[yellow]  - {note}[/yellow]")
     if incompatible and on_file_failure == "stop":
         for note in incompatible:
             console.print(f"[red]Compatibility check failed:[/red] {note}")
@@ -2260,6 +2280,8 @@ def resume(
         console.print(
             f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
         )
+        for note in incompatible[:5]:
+            console.print(f"[yellow]  - {note}[/yellow]")
     if incompatible and on_file_failure == "stop":
         for note in incompatible:
             console.print(f"[red]Compatibility check failed:[/red] {note}")
@@ -2446,6 +2468,8 @@ def overnight(
         console.print(
             f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because overnight mode continues past file-level issues.[/yellow]"
         )
+        for note in incompatible[:5]:
+            console.print(f"[yellow]  - {note}[/yellow]")
 
     prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
     resumed_from_session = False

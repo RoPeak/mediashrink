@@ -9,6 +9,7 @@ from mediashrink.analysis import (
     analyze_files,
     build_analysis_item,
     build_manifest,
+    describe_estimate_calibration,
     describe_estimate_confidence,
     display_analysis_summary,
     estimate_analysis_confidence,
@@ -246,6 +247,41 @@ def test_select_representative_items_prefers_legacy_h264_and_maybe(tmp_path: Pat
     selected = select_representative_items([extras, maybe, h264, legacy], limit=3)
 
     assert [item.source.name for item in selected] == ["legacy.mkv", "h264.mkv", "maybe.mkv"]
+
+
+def test_describe_estimate_calibration_mentions_local_history(tmp_path: Path) -> None:
+    item = build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "1080p",
+                "bitrate_bucket": "high",
+                "preset": "fast",
+                "preset_family": "software",
+                "crf": 20,
+                "input_bytes": 1000,
+                "output_bytes": 500,
+                "duration_seconds": 100.0,
+                "wall_seconds": 50.0,
+                "effective_speed": 2.0,
+                "fallback_used": False,
+                "retry_used": False,
+            }
+        ],
+        "failures": [],
+    }
+
+    detail = describe_estimate_calibration(
+        [item],
+        preset="fast",
+        calibration_store=calibration_store,
+    )
+
+    assert detail is not None
+    assert "close local match" in detail
 
 
 def build_analysis_item_dict_item(

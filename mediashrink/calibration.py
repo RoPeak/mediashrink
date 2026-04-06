@@ -45,6 +45,8 @@ class CalibrationEstimate:
     confidence: str
     exact_matches: int
     loose_matches: int
+    weighted_samples: float
+    source: str
 
 
 def get_calibration_path() -> Path:
@@ -233,36 +235,61 @@ def lookup_estimate(
         elif loose:
             loose_matches.append(raw)
 
-    selected = exact_matches or loose_matches
-    if not selected:
+    if not exact_matches and not loose_matches:
         return None
 
-    output_ratios = [
-        float(item["output_bytes"]) / max(int(item["input_bytes"]), 1)
-        for item in selected
-        if int(item.get("input_bytes", 0)) > 0 and int(item.get("output_bytes", 0)) > 0
-    ]
-    speeds = [
-        float(item["effective_speed"])
-        for item in selected
-        if float(item.get("effective_speed", 0.0)) > 0
-    ]
+    weighted_output_total = 0.0
+    weighted_output_samples = 0.0
+    weighted_speed_total = 0.0
+    weighted_speed_samples = 0.0
+    weighted_samples = 0.0
+
+    for raw in exact_matches:
+        weight = 1.0
+        if int(raw.get("input_bytes", 0)) > 0 and int(raw.get("output_bytes", 0)) > 0:
+            weighted_output_total += (
+                float(raw["output_bytes"]) / max(int(raw["input_bytes"]), 1)
+            ) * weight
+            weighted_output_samples += weight
+        if float(raw.get("effective_speed", 0.0)) > 0:
+            weighted_speed_total += float(raw["effective_speed"]) * weight
+            weighted_speed_samples += weight
+        weighted_samples += weight
+
+    for raw in loose_matches:
+        weight = 0.35
+        if int(raw.get("input_bytes", 0)) > 0 and int(raw.get("output_bytes", 0)) > 0:
+            weighted_output_total += (
+                float(raw["output_bytes"]) / max(int(raw["input_bytes"]), 1)
+            ) * weight
+            weighted_output_samples += weight
+        if float(raw.get("effective_speed", 0.0)) > 0:
+            weighted_speed_total += float(raw["effective_speed"]) * weight
+            weighted_speed_samples += weight
+        weighted_samples += weight
+
     failure_rate = estimate_failure_rate(store, preset=preset, container=container)
     exact_count = len(exact_matches)
     loose_count = len(loose_matches)
     confidence = "Low"
-    if exact_count >= 3:
+    if exact_count >= 2 and weighted_samples >= 3.0:
         confidence = "High"
-    elif exact_count >= 1 or loose_count >= 3:
+    elif exact_count >= 1 or weighted_samples >= 1.5:
         confidence = "Medium"
 
     return CalibrationEstimate(
-        output_ratio=(sum(output_ratios) / len(output_ratios)) if output_ratios else None,
-        speed=(sum(speeds) / len(speeds)) if speeds else None,
+        output_ratio=(
+            weighted_output_total / weighted_output_samples if weighted_output_samples > 0 else None
+        ),
+        speed=(
+            weighted_speed_total / weighted_speed_samples if weighted_speed_samples > 0 else None
+        ),
         failure_rate=failure_rate,
         confidence=confidence,
         exact_matches=exact_count,
         loose_matches=loose_count,
+        weighted_samples=weighted_samples,
+        source="exact" if exact_count > 0 else "related",
     )
 
 
@@ -298,3 +325,23 @@ def estimate_failure_rate(
     if total <= 0:
         return 0.0
     return failures / total
+
+
+def describe_calibration_estimate(estimate: CalibrationEstimate | None) -> str | None:
+    if estimate is None:
+        return None
+    sample_parts: list[str] = []
+    if estimate.exact_matches:
+        sample_parts.append(
+            f"{estimate.exact_matches} close local match{'es' if estimate.exact_matches != 1 else ''}"
+        )
+    if estimate.loose_matches:
+        sample_parts.append(
+            f"{estimate.loose_matches} related match{'es' if estimate.loose_matches != 1 else ''}"
+        )
+    if not sample_parts:
+        sample_parts.append("no local matches")
+    note = ", ".join(sample_parts)
+    if estimate.failure_rate > 0:
+        note += f", {estimate.failure_rate * 100:.0f}% failure history"
+    return note
