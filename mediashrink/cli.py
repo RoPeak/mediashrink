@@ -1,4 +1,5 @@
 import json
+import shutil
 import sys
 import threading
 import time
@@ -21,8 +22,15 @@ from mediashrink.analysis import (
     save_manifest,
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
-from mediashrink.encoder import encode_file, encode_preview
-from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult, SessionManifest
+from mediashrink.encoder import encode_file, encode_preview, is_hardware_preset
+from mediashrink.models import (
+    AnalysisItem,
+    EncodeAttempt,
+    EncodeJob,
+    EncodeResult,
+    SessionFileEntry,
+    SessionManifest,
+)
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
 from mediashrink.profiles import delete_profile, get_profile, list_all_profiles
 from mediashrink.progress import EncodingDisplay
@@ -31,6 +39,7 @@ from mediashrink.session import (
     build_session,
     find_resumable_session,
     get_session_path,
+    load_session,
     save_session,
     update_session_entry,
 )
@@ -40,12 +49,26 @@ EXIT_NO_FILES = 1
 EXIT_ENCODE_FAILURES = 2
 EXIT_USER_CANCELLED = 3
 EXIT_FFMPEG_NOT_FOUND = 4
+REPORT_VERSION = 1
 STALL_WARNING_SECONDS = 90.0
 STALL_POLL_SECONDS = 5.0
+_FALLBACK_PRESET = "faster"
+_FALLBACK_CRF = 22
+_FALLBACK_PROGRESS_THRESHOLD = 5.0
+_FALLBACK_DURATION_THRESHOLD = 60.0
+_DISK_ESTIMATE_FALLBACK_RATIO = 0.70
+_GB = 1024**3
+_MB = 1024**2
 
 
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _fmt_size(size_bytes: int) -> str:
+    if size_bytes >= _GB:
+        return f"{size_bytes / _GB:.2f} GB"
+    return f"{size_bytes / _MB:.1f} MB"
 
 
 def _format_resume_counts(session: SessionManifest) -> str:
@@ -57,6 +80,260 @@ def _format_resume_counts(session: SessionManifest) -> str:
         f"{counts['pending']} pending, "
         f"{counts['failed']} failed, "
         f"{counts['skipped']} skipped"
+    )
+
+
+def _print_safe_interrupt_guidance() -> None:
+    console.print(
+        "[dim]Safe to stop with Ctrl+C: completed files stay done, the current temp output is discarded, and you can resume the unfinished files later.[/dim]"
+    )
+
+
+def _normalize_failure_message(message: str | None) -> str | None:
+    if not message:
+        return message
+    lowered = message.lower()
+    if "no space left on device" in lowered:
+        return "Disk full: no space left on device."
+    if "permission denied" in lowered:
+        return "Permission denied while reading input or writing output."
+    if "could not write header" in lowered and "invalid argument" in lowered:
+        return "Container or stream compatibility issue: FFmpeg could not write the output header."
+    if "invalid argument" in lowered:
+        return "FFmpeg rejected the current encoder or container settings."
+    if "device type" in lowered or "unsupported" in lowered and "encoder" in lowered:
+        return "Hardware encoder is not supported or is unavailable for this file."
+    if "error opening output" in lowered:
+        return "Output path is not writable or could not be created."
+    return message
+
+
+def _apply_failure_diagnostics(result: EncodeResult) -> EncodeResult:
+    if result.success or result.skipped:
+        return result
+    normalized = _normalize_failure_message(result.error_message)
+    if normalized == result.error_message:
+        return result
+    result.raw_error_message = result.error_message
+    result.error_message = normalized
+    if result.attempts:
+        last_attempt = result.attempts[-1]
+        result.attempts[-1] = EncodeAttempt(
+            preset=last_attempt.preset,
+            crf=last_attempt.crf,
+            success=last_attempt.success,
+            duration_seconds=last_attempt.duration_seconds,
+            progress_pct=last_attempt.progress_pct,
+            error_message=normalized,
+        )
+    return result
+
+
+def _estimate_required_free_space(jobs: list[EncodeJob], overwrite: bool) -> int:
+    to_encode = [job for job in jobs if not job.skip and not job.dry_run]
+    if not to_encode:
+        return 0
+    estimated_outputs = 0
+    largest_buffer = 0
+    for job in to_encode:
+        source_size = job.source.stat().st_size
+        estimated_output = (
+            job.estimated_output_bytes
+            if job.estimated_output_bytes > 0
+            else int(source_size * _DISK_ESTIMATE_FALLBACK_RATIO)
+        )
+        estimated_outputs += estimated_output
+        largest_buffer = max(largest_buffer, max(source_size, estimated_output))
+    if overwrite:
+        estimated_outputs = 0
+    return estimated_outputs + largest_buffer
+
+
+def _maybe_warn_low_disk_space(
+    jobs: list[EncodeJob],
+    output_root: Path,
+    overwrite: bool,
+    assume_yes: bool,
+) -> None:
+    required_bytes = _estimate_required_free_space(jobs, overwrite)
+    if required_bytes <= 0:
+        return
+    free_bytes = shutil.disk_usage(output_root).free
+    if free_bytes >= required_bytes:
+        return
+    console.print(
+        f"[yellow]Low disk space warning:[/yellow] estimated free space {_fmt_size(free_bytes)} vs roughly {_fmt_size(required_bytes)} required for this batch."
+    )
+    console.print(
+        "[dim]This is a warning only. Side-by-side encodes and temporary outputs may need more space than is currently free.[/dim]"
+    )
+    if not assume_yes and not typer.confirm("Continue anyway?", default=False):
+        console.print("[dim]Aborted.[/dim]")
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
+
+
+def _reconcile_session_with_jobs(session: SessionManifest, jobs: list[EncodeJob]) -> None:
+    known_sources = {entry.source for entry in session.entries}
+    for job in jobs:
+        if str(job.source) in known_sources:
+            continue
+        session.entries.append(
+            SessionFileEntry(
+                source=str(job.source),
+                status="skipped" if job.skip else "pending",
+                output=str(job.output) if not job.skip else None,
+            )
+        )
+
+
+def _report_output_dir(base_dir: Path, output_dir: Path | None, log_path: Path | None) -> Path:
+    if log_path is not None:
+        return log_path.parent
+    return output_dir or base_dir
+
+
+def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
+    succeeded = [result for result in results if result.success and not result.skipped]
+    failed = [result for result in results if not result.success and not result.skipped]
+    skipped = [result for result in results if result.skipped]
+    input_total = sum(result.input_size_bytes for result in succeeded)
+    output_total = sum(result.output_size_bytes for result in succeeded)
+    return {
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "skipped": len(skipped),
+        "input_bytes": input_total,
+        "output_bytes": output_total,
+        "saved_bytes": input_total - output_total,
+    }
+
+
+def _write_batch_reports(
+    *,
+    mode: str,
+    base_dir: Path,
+    output_dir: Path | None,
+    manifest_path: Path | None,
+    preset: str,
+    crf: int,
+    overwrite: bool,
+    cleanup_requested: bool,
+    resumed_from_session: bool,
+    session_path: Path | None,
+    started_at: str,
+    finished_at: str,
+    results: list[EncodeResult],
+    cleaned_paths: list[Path],
+    log_path: Path | None,
+) -> tuple[Path, Path]:
+    report_dir = _report_output_dir(base_dir, output_dir, log_path)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path = report_dir / f"mediashrink_report_{timestamp}.json"
+    text_path = report_dir / f"mediashrink_report_{timestamp}.txt"
+    totals = _results_totals(results)
+    files = []
+    for result in results:
+        status = "skipped" if result.skipped else "success" if result.success else "failed"
+        files.append(
+            {
+                "source": str(result.job.source),
+                "output": str(result.job.output),
+                "status": status,
+                "skipped_reason": result.skip_reason,
+                "error_message": result.error_message,
+                "raw_error_message": result.raw_error_message,
+                "duration_seconds": result.duration_seconds,
+                "input_bytes": result.input_size_bytes,
+                "output_bytes": result.output_size_bytes,
+                "reduction_pct": round(result.size_reduction_pct, 1) if result.success else 0.0,
+                "fallback_used": result.fallback_used,
+                "attempts": [attempt.to_dict() for attempt in result.attempts],
+            }
+        )
+    payload = {
+        "report_version": REPORT_VERSION,
+        "mode": mode,
+        "directory": str(base_dir),
+        "manifest_path": str(manifest_path) if manifest_path is not None else None,
+        "preset": preset,
+        "crf": crf,
+        "output_dir": str(output_dir) if output_dir is not None else None,
+        "overwrite": overwrite,
+        "cleanup_requested": cleanup_requested,
+        "cleanup_completed": len(cleaned_paths),
+        "cleaned_paths": [str(path) for path in cleaned_paths],
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "resumed_from_session": resumed_from_session,
+        "session_path": str(session_path) if session_path is not None else None,
+        "totals": totals,
+        "files": files,
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    lines = [
+        "mediashrink batch report",
+        f"Mode: {mode}",
+        f"Directory: {base_dir}",
+        f"Manifest: {manifest_path}" if manifest_path is not None else "Manifest: -",
+        f"Preset / CRF: {preset} / {crf}",
+        f"Output dir: {output_dir}" if output_dir is not None else "Output dir: alongside sources",
+        f"Overwrite: {'yes' if overwrite else 'no'}",
+        f"Cleanup requested: {'yes' if cleanup_requested else 'no'}",
+        f"Cleanup completed: {len(cleaned_paths)}",
+        f"Resumed from session: {'yes' if resumed_from_session else 'no'}",
+        f"Session path: {session_path}" if session_path is not None else "Session path: -",
+        f"Started: {started_at}",
+        f"Finished: {finished_at}",
+        "",
+        "Totals",
+        f"  Succeeded: {totals['succeeded']}",
+        f"  Failed: {totals['failed']}",
+        f"  Skipped: {totals['skipped']}",
+        f"  Input: {_fmt_size(int(totals['input_bytes']))}",
+        f"  Output: {_fmt_size(int(totals['output_bytes']))}",
+        f"  Saved: {_fmt_size(int(totals['saved_bytes']))}",
+        "",
+        "Files",
+    ]
+    for result in results:
+        status = "SKIPPED" if result.skipped else "OK" if result.success else "FAILED"
+        lines.append(f"- {result.job.source.name}: {status}")
+        if result.skip_reason:
+            lines.append(f"  Reason: {result.skip_reason}")
+        if result.error_message:
+            lines.append(f"  Error: {result.error_message}")
+        if result.fallback_used:
+            lines.append("  Fallback: hardware retry switched to libx265 faster / CRF 22")
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, text_path
+
+
+def _clone_job_with_settings(job: EncodeJob, *, preset: str, crf: int) -> EncodeJob:
+    return EncodeJob(
+        source=job.source,
+        output=job.output,
+        tmp_output=job.tmp_output,
+        crf=crf,
+        preset=preset,
+        dry_run=job.dry_run,
+        skip=job.skip,
+        skip_reason=job.skip_reason,
+        source_codec=job.source_codec,
+        estimated_output_bytes=job.estimated_output_bytes,
+    )
+
+
+def _should_retry_hardware_failure(result: EncodeResult) -> bool:
+    if result.success or result.skipped or not is_hardware_preset(result.job.preset):
+        return False
+    if result.job.preset == _FALLBACK_PRESET:
+        return False
+    progress_pct = max((attempt.progress_pct for attempt in result.attempts), default=0.0)
+    return (
+        progress_pct <= _FALLBACK_PROGRESS_THRESHOLD
+        or result.duration_seconds <= _FALLBACK_DURATION_THRESHOLD
     )
 
 
@@ -115,7 +392,11 @@ def _run_encode_loop(
     session: SessionManifest | None = None,
     session_path: Path | None = None,
     log_path: Path | None = None,
+    stall_warning_seconds: float | None = None,
+    allow_hardware_fallback: bool = True,
 ) -> list[EncodeResult]:
+    if stall_warning_seconds is None:
+        stall_warning_seconds = STALL_WARNING_SECONDS
     to_encode = [job for job in jobs if not job.skip]
     total_bytes = sum(job.source.stat().st_size for job in to_encode)
     results = []
@@ -164,7 +445,7 @@ def _run_encode_loop(
                     if stall_state["warned"]:
                         continue
                     idle_for = time.monotonic() - stall_state["last_update"]
-                    if idle_for >= STALL_WARNING_SECONDS:
+                    if idle_for >= stall_warning_seconds:
                         console.print(
                             f"\n[yellow]No progress update from FFmpeg for about {int(idle_for)}s while encoding {filename}.[/yellow]"
                         )
@@ -203,6 +484,63 @@ def _run_encode_loop(
                     progress_callback=make_callback() if not job.skip else None,
                     log_path=log_path,
                 )
+                result = _apply_failure_diagnostics(result)
+                if allow_hardware_fallback and _should_retry_hardware_failure(result):
+                    console.print(
+                        f"[yellow]Retrying {filename} with software fallback[/yellow] [dim](libx265 faster, CRF {_FALLBACK_CRF})[/dim]"
+                    )
+                    fallback_job = _clone_job_with_settings(
+                        job, preset=_FALLBACK_PRESET, crf=_FALLBACK_CRF
+                    )
+                    fallback_result = encode_file(
+                        fallback_job,
+                        ffmpeg=ffmpeg,
+                        ffprobe=ffprobe,
+                        progress_callback=make_callback(),
+                        log_path=log_path,
+                    )
+                    fallback_result = _apply_failure_diagnostics(fallback_result)
+                    attempts = list(result.attempts) + list(fallback_result.attempts)
+                    if fallback_result.success:
+                        result = EncodeResult(
+                            job=fallback_result.job,
+                            skipped=False,
+                            skip_reason=None,
+                            success=True,
+                            input_size_bytes=fallback_result.input_size_bytes,
+                            output_size_bytes=fallback_result.output_size_bytes,
+                            duration_seconds=fallback_result.duration_seconds,
+                            error_message=None,
+                            raw_error_message=result.raw_error_message,
+                            media_duration_seconds=fallback_result.media_duration_seconds,
+                            fallback_used=True,
+                            attempts=attempts,
+                        )
+                    else:
+                        combined_error = (
+                            f"Hardware attempt failed: {result.error_message} | "
+                            f"Fallback failed: {fallback_result.error_message}"
+                        )
+                        result = EncodeResult(
+                            job=fallback_result.job,
+                            skipped=False,
+                            skip_reason=None,
+                            success=False,
+                            input_size_bytes=fallback_result.input_size_bytes,
+                            output_size_bytes=fallback_result.output_size_bytes,
+                            duration_seconds=fallback_result.duration_seconds,
+                            error_message=combined_error,
+                            raw_error_message="\n".join(
+                                filter(
+                                    None,
+                                    [result.raw_error_message, fallback_result.raw_error_message],
+                                )
+                            )
+                            or None,
+                            media_duration_seconds=fallback_result.media_duration_seconds,
+                            fallback_used=True,
+                            attempts=attempts,
+                        )
             except KeyboardInterrupt:
                 stall_stop.set()
                 if stall_thread is not None:
@@ -216,6 +554,7 @@ def _run_encode_loop(
                         last_progress_pct=stall_state["last_percent"],
                         last_progress_at=_now_iso(),
                         error="Interrupted by user",
+                        fallback_used=False,
                     )
                     save_session(session, session_path)
                 if results:
@@ -250,6 +589,8 @@ def _run_encode_loop(
                     last_progress_pct=100.0 if result.success else stall_state["last_percent"],
                     last_progress_at=_now_iso() if not job.skip else None,
                     finished_at=_now_iso() if not job.skip else None,
+                    fallback_used=result.fallback_used,
+                    attempt_history=result.attempts,
                 )
                 save_session(session, session_path)
 
@@ -321,23 +662,24 @@ def _analyze_with_optional_progress(
         return items
 
 
-def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> None:
+def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> list[Path]:
     candidates = eligible_cleanup_results(results)
     if not candidates:
-        return
+        return []
 
     if not assume_yes:
         if not typer.confirm(
             "Delete the original source files for successful encodes and rename the compressed outputs back to the original filenames?",
             default=False,
         ):
-            return
+            return []
 
     cleaned = cleanup_successful_results(results)
     if cleaned:
         console.print(
             f"[green]Cleanup complete:[/green] restored original names for {len(cleaned)} file(s)."
         )
+    return cleaned
 
 
 def _resolve_encode_settings(
@@ -364,6 +706,33 @@ def _resolve_encode_settings(
         effective_preset = preset
 
     return effective_crf, effective_preset, profile_name
+
+
+def _build_resume_jobs(
+    session: SessionManifest,
+    *,
+    ffprobe: Path,
+) -> list[EncodeJob]:
+    files: list[Path] = []
+    for entry in session.entries:
+        source = Path(entry.source)
+        if entry.status not in {"pending", "failed", "in_progress"}:
+            continue
+        if source.exists():
+            files.append(source)
+    if not files:
+        return []
+    output_dir = Path(session.output_dir) if session.output_dir is not None else None
+    return build_jobs(
+        files=files,
+        output_dir=output_dir,
+        overwrite=session.overwrite,
+        crf=session.crf,
+        preset=session.preset,
+        dry_run=False,
+        ffprobe=ffprobe,
+        no_skip=False,
+    )
 
 
 @app.command("encode", hidden=True)
@@ -454,10 +823,17 @@ def encode_cmd(
         "-v",
         help="Write FFmpeg stderr to a log file alongside the output.",
     ),
+    stall_warning_seconds: int = typer.Option(
+        int(STALL_WARNING_SECONDS),
+        "--stall-warning-seconds",
+        min=1,
+        help="Warn if FFmpeg produces no progress update for this many seconds.",
+    ),
 ) -> None:
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
+    started_at = _now_iso()
 
     effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
 
@@ -479,6 +855,8 @@ def encode_cmd(
         no_skip=no_skip,
     )
 
+    prior: SessionManifest | None = None
+    resumed_from_session = False
     # Resume detection — skip files already completed in a previous session
     if not dry_run and not no_resume:
         prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
@@ -492,10 +870,12 @@ def encode_cmd(
             if done:
                 console.print("Resume from the last completed file? [Y/n] ", end="")
                 if typer.confirm("", default=True):
+                    resumed_from_session = True
                     for job in jobs:
                         if str(job.source) in done:
                             job.skip = True
                             job.skip_reason = "resumed (already done)"
+                    _reconcile_session_with_jobs(prior, jobs)
 
     display.show_scan_table(jobs)
 
@@ -505,16 +885,26 @@ def encode_cmd(
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
     if not dry_run and not yes:
+        if not json_output:
+            _print_safe_interrupt_guidance()
+        _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=json_output)
         if not display.confirm_proceed(len(to_encode)):
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(code=EXIT_USER_CANCELLED)
+    elif not dry_run:
+        if not json_output:
+            _print_safe_interrupt_guidance()
+        _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=True)
 
     session_path = get_session_path(directory, output_dir) if not dry_run else None
     active_session = None
     if session_path is not None:
-        active_session = build_session(
-            directory, effective_preset, effective_crf, overwrite, output_dir, jobs
-        )
+        if resumed_from_session and prior is not None:
+            active_session = prior
+        else:
+            active_session = build_session(
+                directory, effective_preset, effective_crf, overwrite, output_dir, jobs
+            )
         save_session(active_session, session_path)
 
     log_path: Path | None = None
@@ -532,11 +922,34 @@ def encode_cmd(
         session=active_session,
         session_path=session_path,
         log_path=log_path,
+        stall_warning_seconds=float(stall_warning_seconds),
     )
+    cleaned_paths: list[Path] = []
     if cleanup:
-        _maybe_prompt_for_cleanup(results, assume_yes=True)
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not dry_run and not overwrite and output_dir is None and not yes:
-        _maybe_prompt_for_cleanup(results, assume_yes=False)
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+    if not dry_run:
+        json_report, text_report = _write_batch_reports(
+            mode="encode",
+            base_dir=directory,
+            output_dir=output_dir,
+            manifest_path=None,
+            preset=effective_preset,
+            crf=effective_crf,
+            overwrite=overwrite,
+            cleanup_requested=cleanup,
+            resumed_from_session=resumed_from_session,
+            session_path=session_path,
+            started_at=started_at,
+            finished_at=_now_iso(),
+            results=results,
+            cleaned_paths=cleaned_paths,
+            log_path=log_path,
+        )
+        if not json_output:
+            console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
     has_failures = any(not r.success and not r.skipped for r in results)
     exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
@@ -698,9 +1111,16 @@ def apply(
         "--cleanup",
         help="After successful side-by-side encodes, delete originals and rename outputs back to the original filenames.",
     ),
+    stall_warning_seconds: int = typer.Option(
+        int(STALL_WARNING_SECONDS),
+        "--stall-warning-seconds",
+        min=1,
+        help="Warn if FFmpeg produces no progress update for this many seconds.",
+    ),
 ) -> None:
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
+    started_at = _now_iso()
     loaded_manifest = load_manifest(manifest)
 
     effective_crf = loaded_manifest.crf
@@ -734,15 +1154,48 @@ def apply(
         console.print("[dim]Nothing to encode.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
+    _print_safe_interrupt_guidance()
+    _maybe_warn_low_disk_space(
+        jobs,
+        output_dir or loaded_manifest.analyzed_directory,
+        overwrite,
+        assume_yes=yes,
+    )
     if not yes and not display.confirm_proceed(len(to_encode)):
         console.print("[dim]Aborted.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
-    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    results = _run_encode_loop(
+        jobs,
+        ffmpeg,
+        ffprobe,
+        display,
+        stall_warning_seconds=float(stall_warning_seconds),
+    )
+    cleaned_paths: list[Path] = []
     if cleanup:
-        _maybe_prompt_for_cleanup(results, assume_yes=True)
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not overwrite and output_dir is None and not yes:
-        _maybe_prompt_for_cleanup(results, assume_yes=False)
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+    json_report, text_report = _write_batch_reports(
+        mode="apply",
+        base_dir=loaded_manifest.analyzed_directory,
+        output_dir=output_dir,
+        manifest_path=manifest,
+        preset=effective_preset,
+        crf=effective_crf,
+        overwrite=overwrite,
+        cleanup_requested=cleanup,
+        resumed_from_session=False,
+        session_path=None,
+        started_at=started_at,
+        finished_at=_now_iso(),
+        results=results,
+        cleaned_paths=cleaned_paths,
+        log_path=None,
+    )
+    console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
     if any(not r.success and not r.skipped for r in results):
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
@@ -793,6 +1246,12 @@ def wizard(
         "--auto",
         help="Non-interactive mode: auto-select the recommended profile, skip all prompts.",
     ),
+    stall_warning_seconds: int = typer.Option(
+        int(STALL_WARNING_SECONDS),
+        "--stall-warning-seconds",
+        min=1,
+        help="Warn if FFmpeg produces no progress update for this many seconds.",
+    ),
 ) -> None:
     """Interactively detect hardware, choose settings, and optionally save a profile."""
     from mediashrink.wizard import run_wizard
@@ -800,6 +1259,7 @@ def wizard(
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
+    started_at = _now_iso()
 
     jobs, action, wizard_cleanup = run_wizard(
         directory=directory,
@@ -820,11 +1280,192 @@ def wizard(
     if action == "export":
         raise typer.Exit(code=EXIT_SUCCESS)
 
-    results = _run_encode_loop(jobs, ffmpeg, ffprobe, display)
+    if not json_output:
+        _print_safe_interrupt_guidance()
+    _maybe_warn_low_disk_space(
+        jobs,
+        output_dir or directory,
+        overwrite,
+        assume_yes=auto,
+    )
+
+    results = _run_encode_loop(
+        jobs,
+        ffmpeg,
+        ffprobe,
+        display,
+        stall_warning_seconds=float(stall_warning_seconds),
+    )
+    cleaned_paths: list[Path] = []
     if wizard_cleanup:
-        _maybe_prompt_for_cleanup(results, assume_yes=True)
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not json_output and not overwrite and output_dir is None:
         pass  # cleanup was already asked upfront; no second prompt
+
+    json_report, text_report = _write_batch_reports(
+        mode="wizard",
+        base_dir=directory,
+        output_dir=output_dir,
+        manifest_path=None,
+        preset=jobs[0].preset if jobs else "fast",
+        crf=jobs[0].crf if jobs else 20,
+        overwrite=overwrite,
+        cleanup_requested=wizard_cleanup,
+        resumed_from_session=False,
+        session_path=None,
+        started_at=started_at,
+        finished_at=_now_iso(),
+        results=results,
+        cleaned_paths=cleaned_paths,
+        log_path=None,
+    )
+    if not json_output:
+        console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
+
+    has_failures = any(not r.success and not r.skipped for r in results)
+    exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
+    if json_output:
+        print(_results_to_json(results, exit_code))
+    if has_failures:
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+
+
+@app.command()
+def resume(
+    directory: Path = typer.Argument(
+        ...,
+        help=f"Directory containing the resumable session for supported video files ({supported_formats_label()}).",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Locate the session/output files here instead of alongside originals.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt.",
+    ),
+    cleanup: bool = typer.Option(
+        False,
+        "--cleanup",
+        help="After successful side-by-side encodes, delete originals and rename outputs back to the original filenames.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit encode results as a JSON blob instead of Rich terminal output.",
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Write FFmpeg stderr to a log file alongside the output.",
+    ),
+    stall_warning_seconds: int = typer.Option(
+        int(STALL_WARNING_SECONDS),
+        "--stall-warning-seconds",
+        min=1,
+        help="Warn if FFmpeg produces no progress update for this many seconds.",
+    ),
+) -> None:
+    quiet_console = Console(quiet=True) if json_output else console
+    display = EncodingDisplay(quiet_console)
+    ffmpeg, ffprobe = _prepare_tools(output_dir)
+    started_at = _now_iso()
+
+    session_path = get_session_path(directory, output_dir)
+    session = load_session(session_path)
+    if session is None:
+        console.print(f"[red bold]Error:[/red bold] no resumable session found at {session_path}")
+        raise typer.Exit(code=EXIT_NO_FILES)
+    if session.directory != str(directory):
+        console.print(
+            "[red bold]Error:[/red bold] session directory does not match the requested directory."
+        )
+        raise typer.Exit(code=EXIT_NO_FILES)
+    if output_dir is not None and session.output_dir != str(output_dir):
+        console.print(
+            "[red bold]Error:[/red bold] session output directory does not match --output-dir."
+        )
+        raise typer.Exit(code=EXIT_NO_FILES)
+    jobs = _build_resume_jobs(session, ffprobe=ffprobe)
+    if not jobs:
+        console.print("[yellow]No resumable files remain in the saved session.[/yellow]")
+        raise typer.Exit(code=EXIT_NO_FILES)
+
+    _reconcile_session_with_jobs(session, jobs)
+    console.print(
+        f"[cyan]Resuming session:[/cyan] {_format_resume_counts(session)}",
+        highlight=False,
+    )
+    console.print(f"[dim]Session path:[/dim] {session_path}")
+    display.show_scan_table(jobs)
+    if not json_output:
+        _print_safe_interrupt_guidance()
+    _maybe_warn_low_disk_space(
+        jobs,
+        output_dir or directory,
+        session.overwrite,
+        assume_yes=yes,
+    )
+
+    to_encode = [job for job in jobs if not job.skip]
+    if not to_encode:
+        console.print("[dim]Nothing to encode.[/dim]")
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
+    if not yes and not display.confirm_proceed(len(to_encode)):
+        console.print("[dim]Aborted.[/dim]")
+        raise typer.Exit(code=EXIT_USER_CANCELLED)
+
+    log_path: Path | None = None
+    if verbose:
+        log_dir = output_dir if output_dir is not None else directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"mediashrink_{timestamp}.log"
+        console.print(f"[dim]Verbose log:[/dim] {log_path}")
+
+    results = _run_encode_loop(
+        jobs,
+        ffmpeg,
+        ffprobe,
+        display,
+        session=session,
+        session_path=session_path,
+        log_path=log_path,
+        stall_warning_seconds=float(stall_warning_seconds),
+    )
+    cleaned_paths: list[Path] = []
+    if cleanup:
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
+    elif not session.overwrite and output_dir is None and not yes:
+        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+
+    json_report, text_report = _write_batch_reports(
+        mode="resume",
+        base_dir=directory,
+        output_dir=output_dir,
+        manifest_path=None,
+        preset=session.preset,
+        crf=session.crf,
+        overwrite=session.overwrite,
+        cleanup_requested=cleanup,
+        resumed_from_session=True,
+        session_path=session_path,
+        started_at=started_at,
+        finished_at=_now_iso(),
+        results=results,
+        cleaned_paths=cleaned_paths,
+        log_path=log_path,
+    )
+    if not json_output:
+        console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
     has_failures = any(not r.success and not r.skipped for r in results)
     exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS

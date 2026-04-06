@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from mediashrink.constants import CRF_BASELINE, CRF_COMPRESSION_FACTOR
-from mediashrink.models import EncodeJob, EncodeResult
+from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 
 
 def get_duration_seconds(path: Path, ffprobe: Path) -> float:
@@ -434,6 +434,7 @@ def encode_file(
     """
     input_size = job.source.stat().st_size
     start_time = time.monotonic()
+    last_progress_pct = 0.0
 
     if job.skip:
         return EncodeResult(
@@ -444,6 +445,7 @@ def encode_file(
             input_size_bytes=input_size,
             output_size_bytes=0,
             duration_seconds=0.0,
+            attempts=[],
         )
 
     if job.dry_run:
@@ -455,6 +457,7 @@ def encode_file(
             input_size_bytes=input_size,
             output_size_bytes=0,
             duration_seconds=0.0,
+            attempts=[],
         )
 
     total_duration = get_duration_seconds(job.source, ffprobe)
@@ -506,6 +509,7 @@ def encode_file(
                     out_us = float(parsed["out_time_ms"])
                     if total_duration > 0:
                         pct = min((out_us / 1_000_000) / media_duration * 100, 100.0)
+                        last_progress_pct = pct
                         progress_callback(pct)
                 except ValueError:
                     pass
@@ -536,6 +540,17 @@ def encode_file(
             output_size_bytes=0,
             duration_seconds=duration,
             error_message=_summarize_stderr_lines(list(stderr_tail), process.returncode),
+            raw_error_message=_summarize_stderr_lines(list(stderr_tail), process.returncode),
+            attempts=[
+                EncodeAttempt(
+                    preset=job.preset,
+                    crf=job.crf,
+                    success=False,
+                    duration_seconds=duration,
+                    progress_pct=last_progress_pct,
+                    error_message=_summarize_stderr_lines(list(stderr_tail), process.returncode),
+                )
+            ],
         )
 
     # Success: rename tmp → final output
@@ -553,6 +568,15 @@ def encode_file(
         output_size_bytes=output_size,
         duration_seconds=duration,
         media_duration_seconds=media_duration,
+        attempts=[
+            EncodeAttempt(
+                preset=job.preset,
+                crf=job.crf,
+                success=True,
+                duration_seconds=duration,
+                progress_pct=max(last_progress_pct, 100.0 if media_duration > 0 else 0.0),
+            )
+        ],
     )
 
 

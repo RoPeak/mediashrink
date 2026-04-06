@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mediashrink.models import EncodeJob, SessionFileEntry, SessionManifest
+from mediashrink.models import EncodeAttempt, EncodeJob, SessionFileEntry, SessionManifest
 from mediashrink.session import (
     SESSION_VERSION,
     build_session,
@@ -87,6 +87,40 @@ def test_update_session_entry_records_progress_telemetry(tmp_path: Path) -> None
     assert entry.last_progress_pct == 47.5
     assert entry.last_progress_at == "2026-04-06T10:00:00+00:00"
     assert entry.started_at == "2026-04-06T09:00:00+00:00"
+
+
+def test_update_session_entry_records_attempt_history(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    manifest = build_session(tmp_path, "fast", 20, False, None, [job])
+
+    update_session_entry(
+        manifest,
+        job.source,
+        "failed",
+        fallback_used=True,
+        attempt_history=[
+            EncodeAttempt(
+                preset="amf",
+                crf=20,
+                success=False,
+                duration_seconds=5.0,
+                progress_pct=0.0,
+                error_message="Invalid argument",
+            ),
+            EncodeAttempt(
+                preset="faster",
+                crf=22,
+                success=True,
+                duration_seconds=10.0,
+                progress_pct=100.0,
+            ),
+        ],
+    )
+
+    entry = manifest.entries[0]
+    assert entry.fallback_used is True
+    assert len(entry.attempt_history) == 2
+    assert entry.attempt_history[0].preset == "amf"
 
 
 def test_find_resumable_session_returns_none_when_settings_differ(tmp_path: Path) -> None:

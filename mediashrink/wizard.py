@@ -1218,6 +1218,9 @@ def run_wizard(
     if not to_encode[0].output.parent.exists():
         console.print(f"  Output:   {to_encode[0].output.parent}")
     console.print("  [dim]Estimates are approximate.[/dim]")
+    console.print(
+        "  [dim]Safe to stop with Ctrl+C: completed files stay done, the current temp output is discarded, and you can resume unfinished files later.[/dim]"
+    )
 
     cleanup_after = False
     if not overwrite and output_dir is None and not auto:

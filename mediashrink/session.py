@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mediashrink.models import EncodeJob, SessionFileEntry, SessionManifest
+from mediashrink.models import EncodeAttempt, EncodeJob, SessionFileEntry, SessionManifest
 
 SESSION_VERSION = 1
 _SESSION_FILENAME = ".mediashrink-session.json"
@@ -73,6 +73,8 @@ def update_session_entry(
     last_progress_at: str | None = None,
     started_at: str | None = None,
     finished_at: str | None = None,
+    fallback_used: bool | None = None,
+    attempt_history: list[EncodeAttempt] | None = None,
 ) -> None:
     """Mutate the entry matching `source` in place."""
     source_str = str(source)
@@ -92,6 +94,10 @@ def update_session_entry(
                 entry.started_at = started_at
             if finished_at is not None:
                 entry.finished_at = finished_at
+            if fallback_used is not None:
+                entry.fallback_used = fallback_used
+            if attempt_history is not None:
+                entry.attempt_history = list(attempt_history)
             return
 
 

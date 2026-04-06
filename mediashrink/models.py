@@ -6,6 +6,42 @@ from typing import Any
 
 
 @dataclass
+class EncodeAttempt:
+    preset: str
+    crf: int
+    success: bool
+    duration_seconds: float
+    progress_pct: float
+    error_message: str | None = None
+
+    def to_dict(self) -> dict[str, str | int | float | bool | None]:
+        return {
+            "preset": self.preset,
+            "crf": self.crf,
+            "success": self.success,
+            "duration_seconds": self.duration_seconds,
+            "progress_pct": self.progress_pct,
+            "error_message": self.error_message,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "EncodeAttempt":
+        preset = raw.get("preset")
+        if not isinstance(preset, str):
+            raise ValueError("encode attempt preset must be a string")
+        return cls(
+            preset=preset,
+            crf=int(raw.get("crf", 0)),
+            success=bool(raw.get("success", False)),
+            duration_seconds=float(raw.get("duration_seconds", 0.0)),
+            progress_pct=float(raw.get("progress_pct", 0.0)),
+            error_message=(
+                raw.get("error_message") if isinstance(raw.get("error_message"), str) else None
+            ),
+        )
+
+
+@dataclass
 class EncodeJob:
     source: Path
     output: Path
@@ -29,7 +65,10 @@ class EncodeResult:
     output_size_bytes: int
     duration_seconds: float
     error_message: str | None = field(default=None)
+    raw_error_message: str | None = field(default=None)
     media_duration_seconds: float = 0.0  # source file's playback duration
+    fallback_used: bool = False
+    attempts: list[EncodeAttempt] = field(default_factory=list)
 
     @property
     def size_reduction_bytes(self) -> int:
@@ -115,8 +154,12 @@ class SessionFileEntry:
     last_progress_at: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    fallback_used: bool = False
+    attempt_history: list[EncodeAttempt] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, str | float | None]:
+    def to_dict(
+        self,
+    ) -> dict[str, str | float | bool | list[dict[str, str | int | float | bool | None]] | None]:
         return {
             "source": self.source,
             "status": self.status,
@@ -127,6 +170,8 @@ class SessionFileEntry:
             "last_progress_at": self.last_progress_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "fallback_used": self.fallback_used,
+            "attempt_history": [attempt.to_dict() for attempt in self.attempt_history],
         }
 
     @classmethod
@@ -144,6 +189,10 @@ class SessionFileEntry:
         last_progress_at = raw.get("last_progress_at")
         started_at = raw.get("started_at")
         finished_at = raw.get("finished_at")
+        fallback_used = raw.get("fallback_used", False)
+        raw_attempt_history = raw.get("attempt_history", [])
+        if not isinstance(raw_attempt_history, list):
+            raw_attempt_history = []
         return cls(
             source=source,
             status=status,
@@ -156,6 +205,12 @@ class SessionFileEntry:
             last_progress_at=last_progress_at if isinstance(last_progress_at, str) else None,
             started_at=started_at if isinstance(started_at, str) else None,
             finished_at=finished_at if isinstance(finished_at, str) else None,
+            fallback_used=bool(fallback_used),
+            attempt_history=[
+                EncodeAttempt.from_dict(item)
+                for item in raw_attempt_history
+                if isinstance(item, dict)
+            ],
         )
 
 
