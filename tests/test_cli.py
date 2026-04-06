@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import pytest
+import typer
 from typer.testing import CliRunner
 
 from mediashrink.analysis import build_manifest, save_manifest
 from mediashrink.cli import app
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.profiles import SavedProfile, upsert_profile
+from mediashrink.session import build_session, get_session_path, save_session
 
 runner = CliRunner()
 
@@ -926,3 +930,133 @@ def test_run_encode_loop_removes_file_task_and_updates_overall_only_on_completio
     assert overall_updates == [5_000_000]
     mock_progress.remove_task.assert_called_once_with(1)
     mock_display.show_summary.assert_called_once_with([ok_result])
+
+
+def test_run_encode_loop_interrupt_preserves_session_and_prints_resume_guidance(
+    tmp_path: Path,
+) -> None:
+    from mediashrink.cli import _run_encode_loop
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 5_000_000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    session = build_session(tmp_path, "fast", 20, False, None, [job])
+    session_path = get_session_path(tmp_path, None)
+    save_session(session, session_path)
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    def fake_encode_file(*args: object, **kwargs: object) -> EncodeResult:
+        progress_callback = kwargs["progress_callback"]
+        progress_callback(47.0)
+        raise KeyboardInterrupt
+
+    with patch("mediashrink.cli.encode_file", side_effect=fake_encode_file):
+        with pytest.raises(typer.Exit) as exc:
+            _run_encode_loop(
+                [job],
+                FFMPEG,
+                FFPROBE,
+                mock_display,
+                session=session,
+                session_path=session_path,
+            )
+
+    assert exc.value.exit_code == 3
+    saved = json.loads(session_path.read_text(encoding="utf-8"))
+    entry = saved["entries"][0]
+    assert entry["status"] == "pending"
+    assert entry["error"] == "Interrupted by user"
+    assert entry["last_progress_pct"] == 47.0
+
+
+def test_encode_command_shows_resume_counts_and_path(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    source2 = tmp_path / "ep02.mkv"
+    source2.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    pending_job = _make_job(source2)
+    fake_result = _make_result(pending_job)
+    session = build_session(tmp_path, "slow", 20, False, None, [fake_job, pending_job])
+    session.entries[0].status = "success"
+    save_session(session, get_session_path(tmp_path, None))
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source, source2]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job, pending_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--preset", "slow"], input="y\ny\n")
+
+    assert result.exit_code == 0
+    assert "Session found: 1 done, 1 pending, 0 failed, 0 skipped" in result.stdout
+    assert "Session path:" in result.stdout
+
+
+def test_run_encode_loop_warns_when_progress_stalls(tmp_path: Path) -> None:
+    from mediashrink.cli import _run_encode_loop
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 5_000_000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=5_000_000,
+        output_size_bytes=2_500_000,
+        duration_seconds=2.0,
+        media_duration_seconds=120.0,
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    def fake_encode_file(*args: object, **kwargs: object) -> EncodeResult:
+        time.sleep(0.03)
+        return ok_result
+
+    with (
+        patch("mediashrink.cli.encode_file", side_effect=fake_encode_file),
+        patch("mediashrink.cli.STALL_WARNING_SECONDS", 0.01),
+        patch("mediashrink.cli.STALL_POLL_SECONDS", 0.005),
+        patch("mediashrink.cli.console.print") as mock_print,
+    ):
+        _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
+
+    printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+    assert "No progress update from FFmpeg" in printed

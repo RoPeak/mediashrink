@@ -4,12 +4,12 @@ import typer
 from rich.console import Console
 from rich.progress import (
     BarColumn,
+    ProgressColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 from rich.table import Table
 from rich.text import Text
@@ -34,6 +34,23 @@ def _fmt_duration(seconds: float) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+class _CompletedSizeColumn(ProgressColumn):
+    def render(self, task) -> Text:
+        total = int(task.total or 0)
+        completed = min(int(task.completed or 0), total) if total > 0 else int(task.completed or 0)
+        if total > 0:
+            return Text(f"{_fmt_size(completed)}/{_fmt_size(total)}", style="progress.download")
+        return Text(_fmt_size(completed), style="progress.download")
+
+
+class _EtaColumn(ProgressColumn):
+    def render(self, task) -> Text:
+        remaining = task.time_remaining
+        if remaining is None:
+            return Text("ETA unavailable", style="progress.remaining")
+        return Text(_fmt_duration(remaining), style="progress.remaining")
 
 
 def _is_preview_result(result: EncodeResult) -> bool:
@@ -137,19 +154,20 @@ class EncodingDisplay:
         return typer.confirm(f"Encode {count} file(s)?", default=True)
 
     def make_progress_bar(self) -> Progress:
-        from rich.progress import DownloadColumn
-
+        width = self.console.width
+        bar_width = max(20, min(40, width // 4))
         return Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}", table_column=None),
-            BarColumn(bar_width=None),
+            BarColumn(bar_width=bar_width),
             TaskProgressColumn(),
-            DownloadColumn(),
+            _CompletedSizeColumn(),
             TimeElapsedColumn(),
-            TimeRemainingColumn(),
+            _EtaColumn(),
             console=self.console,
             transient=False,
             expand=True,
+            disable=not self.console.is_terminal,
         )
 
     def show_summary(self, results: list[EncodeResult]) -> None:

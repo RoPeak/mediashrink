@@ -89,3 +89,14 @@ def test_show_summary_prints_counts_and_failure_details(tmp_path: Path) -> None:
     assert "1 succeeded, 1 failed, 1 skipped" in output
     assert "Failure details" in output
     assert "failed.mkv: Could not write header" in output
+
+
+def test_make_progress_bar_uses_stable_columns() -> None:
+    console = Console(record=True, width=100)
+
+    progress = EncodingDisplay(console).make_progress_bar()
+    column_names = [type(column).__name__ for column in progress.columns]
+
+    assert "DownloadColumn" not in column_names
+    assert "_CompletedSizeColumn" in column_names
+    assert "_EtaColumn" in column_names

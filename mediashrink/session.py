@@ -68,6 +68,11 @@ def update_session_entry(
     status: str,
     output: Path | None = None,
     error: str | None = None,
+    encoder: str | None = None,
+    last_progress_pct: float | None = None,
+    last_progress_at: str | None = None,
+    started_at: str | None = None,
+    finished_at: str | None = None,
 ) -> None:
     """Mutate the entry matching `source` in place."""
     source_str = str(source)
@@ -76,8 +81,17 @@ def update_session_entry(
             entry.status = status
             if output is not None:
                 entry.output = str(output)
-            if error is not None:
-                entry.error = error
+            entry.error = error
+            if encoder is not None:
+                entry.encoder = encoder
+            if last_progress_pct is not None:
+                entry.last_progress_pct = last_progress_pct
+            if last_progress_at is not None:
+                entry.last_progress_at = last_progress_at
+            if started_at is not None:
+                entry.started_at = started_at
+            if finished_at is not None:
+                entry.finished_at = finished_at
             return
 
 
@@ -97,7 +111,7 @@ def find_resumable_session(
     if manifest.directory != str(directory):
         return None
     # Only resumable if there are pending or failed entries
-    actionable = [e for e in manifest.entries if e.status in {"pending", "failed"}]
+    actionable = [e for e in manifest.entries if e.status in {"pending", "failed", "in_progress"}]
     if not actionable:
         return None
     return manifest

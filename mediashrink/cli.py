@@ -1,6 +1,9 @@
 import json
 import sys
+import threading
+import time
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +40,24 @@ EXIT_NO_FILES = 1
 EXIT_ENCODE_FAILURES = 2
 EXIT_USER_CANCELLED = 3
 EXIT_FFMPEG_NOT_FOUND = 4
+STALL_WARNING_SECONDS = 90.0
+STALL_POLL_SECONDS = 5.0
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _format_resume_counts(session: SessionManifest) -> str:
+    counts = {"success": 0, "pending": 0, "failed": 0, "skipped": 0}
+    for entry in session.entries:
+        counts[entry.status] = counts.get(entry.status, 0) + 1
+    return (
+        f"{counts['success']} done, "
+        f"{counts['pending']} pending, "
+        f"{counts['failed']} failed, "
+        f"{counts['skipped']} skipped"
+    )
 
 
 def _results_to_json(results: list[EncodeResult], exit_code: int) -> str:
@@ -118,10 +139,59 @@ def _run_encode_loop(
                 completed=0,
                 total=task_total,
             )
+            started_at = _now_iso()
+            stall_state = {
+                "last_update": time.monotonic(),
+                "last_percent": 0.0,
+                "warned": False,
+            }
+            stall_stop = threading.Event()
+
+            if session is not None and session_path is not None:
+                update_session_entry(
+                    session,
+                    source=job.source,
+                    status="in_progress" if not job.skip else "skipped",
+                    encoder=job.preset,
+                    started_at=started_at,
+                    last_progress_pct=0.0 if not job.skip else None,
+                    last_progress_at=started_at if not job.skip else None,
+                )
+                save_session(session, session_path)
+
+            def watch_for_stall() -> None:
+                while not stall_stop.wait(STALL_POLL_SECONDS):
+                    if stall_state["warned"]:
+                        continue
+                    idle_for = time.monotonic() - stall_state["last_update"]
+                    if idle_for >= STALL_WARNING_SECONDS:
+                        console.print(
+                            f"\n[yellow]No progress update from FFmpeg for about {int(idle_for)}s while encoding {filename}.[/yellow]"
+                        )
+                        console.print(
+                            "[dim]The encoder may still be working. If you stop now, completed files stay done and the next run can resume from the session file.[/dim]"
+                        )
+                        stall_state["warned"] = True
+
+            stall_thread = None
+            if not job.skip:
+                stall_thread = threading.Thread(target=watch_for_stall, daemon=True)
+                stall_thread.start()
 
             def make_callback(ft=file_task, fb=file_size):
                 def callback(pct: float) -> None:
+                    stall_state["last_update"] = time.monotonic()
+                    stall_state["last_percent"] = pct
                     progress.update(ft, completed=fb * pct / 100)
+                    if session is not None and session_path is not None:
+                        update_session_entry(
+                            session,
+                            source=job.source,
+                            status="in_progress",
+                            last_progress_pct=pct,
+                            last_progress_at=_now_iso(),
+                        )
+                        save_session(session, session_path)
 
                 return callback
 
@@ -134,10 +204,33 @@ def _run_encode_loop(
                     log_path=log_path,
                 )
             except KeyboardInterrupt:
+                stall_stop.set()
+                if stall_thread is not None:
+                    stall_thread.join(timeout=1)
+                if session is not None and session_path is not None and not job.skip:
+                    update_session_entry(
+                        session,
+                        source=job.source,
+                        status="pending",
+                        encoder=job.preset,
+                        last_progress_pct=stall_state["last_percent"],
+                        last_progress_at=_now_iso(),
+                        error="Interrupted by user",
+                    )
+                    save_session(session, session_path)
+                if results:
+                    display.show_summary(results)
                 console.print("\n[yellow]Interrupted.[/yellow]")
-                sys.exit(1)
+                if session_path is not None:
+                    console.print(
+                        f"[dim]Completed files are preserved. Resume later with the same command; session state is stored in[/dim] {session_path}"
+                    )
+                raise typer.Exit(code=EXIT_USER_CANCELLED)
 
             results.append(result)
+            stall_stop.set()
+            if stall_thread is not None:
+                stall_thread.join(timeout=1)
 
             # Update session after each file so partial progress is persisted
             if session is not None and session_path is not None:
@@ -153,6 +246,10 @@ def _run_encode_loop(
                     status=status,
                     output=job.output if result.success else None,
                     error=result.error_message,
+                    encoder=job.preset,
+                    last_progress_pct=100.0 if result.success else stall_state["last_percent"],
+                    last_progress_at=_now_iso() if not job.skip else None,
+                    finished_at=_now_iso() if not job.skip else None,
                 )
                 save_session(session, session_path)
 
@@ -206,7 +303,9 @@ def _analyze_with_optional_progress(
         transient=False,
         expand=True,
     ) as progress:
-        task = progress.add_task("[dim]Analyzing files (ffprobe + size estimates)...[/dim]", total=len(files))
+        task = progress.add_task(
+            "[dim]Analyzing files (ffprobe + size estimates)...[/dim]", total=len(files)
+        )
 
         def callback(completed: int, total: int, path: Path) -> None:
             name = path.name if len(path.name) <= 56 else path.name[:53] + "..."
@@ -385,12 +484,13 @@ def encode_cmd(
         prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
         if prior is not None:
             done = {e.source for e in prior.entries if e.status == "success"}
+            console.print(
+                f"[cyan]Session found:[/cyan] {_format_resume_counts(prior)}",
+                highlight=False,
+            )
+            console.print(f"[dim]Session path:[/dim] {get_session_path(directory, output_dir)}")
             if done:
-                console.print(
-                    f"[cyan]Session found:[/cyan] {len(done)} file(s) already completed. "
-                    "Resume? [Y/n] ",
-                    end="",
-                )
+                console.print("Resume from the last completed file? [Y/n] ", end="")
                 if typer.confirm("", default=True):
                     for job in jobs:
                         if str(job.source) in done:

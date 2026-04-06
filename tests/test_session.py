@@ -67,6 +67,28 @@ def test_update_session_entry_records_error(tmp_path: Path) -> None:
     assert manifest.entries[0].error == "FFmpeg exited with code 1"
 
 
+def test_update_session_entry_records_progress_telemetry(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    manifest = build_session(tmp_path, "fast", 20, False, None, [job])
+
+    update_session_entry(
+        manifest,
+        job.source,
+        "in_progress",
+        encoder="fast",
+        last_progress_pct=47.5,
+        last_progress_at="2026-04-06T10:00:00+00:00",
+        started_at="2026-04-06T09:00:00+00:00",
+    )
+
+    entry = manifest.entries[0]
+    assert entry.status == "in_progress"
+    assert entry.encoder == "fast"
+    assert entry.last_progress_pct == 47.5
+    assert entry.last_progress_at == "2026-04-06T10:00:00+00:00"
+    assert entry.started_at == "2026-04-06T09:00:00+00:00"
+
+
 def test_find_resumable_session_returns_none_when_settings_differ(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
     manifest = build_session(tmp_path, "fast", 20, False, None, [job])
@@ -94,6 +116,17 @@ def test_find_resumable_session_matches_preset_and_crf(tmp_path: Path) -> None:
     assert result.crf == 20
 
 
+def test_find_resumable_session_accepts_in_progress_entries(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    manifest = build_session(tmp_path, "fast", 20, False, None, [job])
+    update_session_entry(manifest, job.source, "in_progress")
+    session_path = get_session_path(tmp_path, None)
+    save_session(manifest, session_path)
+
+    result = find_resumable_session(tmp_path, None, "fast", 20)
+    assert result is not None
+
+
 def test_find_resumable_session_returns_none_when_all_done(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
     manifest = build_session(tmp_path, "fast", 20, False, None, [job])
@@ -112,7 +145,10 @@ def test_load_session_returns_none_for_missing_file(tmp_path: Path) -> None:
 
 def test_load_session_returns_none_for_wrong_version(tmp_path: Path) -> None:
     path = tmp_path / ".mediashrink-session.json"
-    path.write_text('{"version": 99, "directory": "/x", "timestamp": "t", "preset": "fast", "crf": 20, "overwrite": false, "output_dir": null, "entries": []}', encoding="utf-8")
+    path.write_text(
+        '{"version": 99, "directory": "/x", "timestamp": "t", "preset": "fast", "crf": 20, "overwrite": false, "output_dir": null, "entries": []}',
+        encoding="utf-8",
+    )
     assert load_session(path) is None
 
 

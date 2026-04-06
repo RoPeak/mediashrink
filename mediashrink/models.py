@@ -110,13 +110,23 @@ class SessionFileEntry:
     status: str  # "pending" | "success" | "failed" | "skipped"
     output: str | None = None
     error: str | None = None
+    encoder: str | None = None
+    last_progress_pct: float | None = None
+    last_progress_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, str | float | None]:
         return {
             "source": self.source,
             "status": self.status,
             "output": self.output,
             "error": self.error,
+            "encoder": self.encoder,
+            "last_progress_pct": self.last_progress_pct,
+            "last_progress_at": self.last_progress_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
 
     @classmethod
@@ -129,11 +139,23 @@ class SessionFileEntry:
             raise ValueError("session entry status must be a string")
         output = raw.get("output")
         error = raw.get("error")
+        encoder = raw.get("encoder")
+        last_progress_pct = raw.get("last_progress_pct")
+        last_progress_at = raw.get("last_progress_at")
+        started_at = raw.get("started_at")
+        finished_at = raw.get("finished_at")
         return cls(
             source=source,
             status=status,
             output=output if isinstance(output, str) else None,
             error=error if isinstance(error, str) else None,
+            encoder=encoder if isinstance(encoder, str) else None,
+            last_progress_pct=(
+                float(last_progress_pct) if isinstance(last_progress_pct, (int, float)) else None
+            ),
+            last_progress_at=last_progress_at if isinstance(last_progress_at, str) else None,
+            started_at=started_at if isinstance(started_at, str) else None,
+            finished_at=finished_at if isinstance(finished_at, str) else None,
         )
 
 

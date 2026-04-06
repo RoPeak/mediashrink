@@ -106,6 +106,33 @@ def test_build_profiles_recommends_fastest_hardware() -> None:
     assert recommended[0].encoder_key == "nvenc"
 
 
+def test_build_profiles_renames_slower_hardware_and_recommends_software() -> None:
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 2.0, "fast": 0.8, "faster": 3.0},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+
+    gpu_profile = next(profile for profile in profiles if profile.encoder_key == "amf")
+    recommended = next(profile for profile in profiles if profile.is_recommended)
+
+    assert gpu_profile.name == "Fastest GPU encode"
+    assert recommended.name == "Faster Encode"
+
+
+def test_build_profiles_does_not_recommend_dominated_profile() -> None:
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 2.0, "fast": 0.8, "faster": 3.0},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+
+    gpu_profile = next(profile for profile in profiles if profile.encoder_key == "amf")
+    assert gpu_profile.is_recommended is False
+
+
 def test_build_profiles_recommends_balanced_without_hw() -> None:
     profiles = build_profiles(
         available_hw=[],
@@ -147,6 +174,23 @@ def test_display_profiles_table_uses_device_label() -> None:
     assert "Intel" in output
     assert "Arc Test" in output
     assert "approximate estimates" in output
+
+
+def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
+    console = Console(record=True, width=160)
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 2.0, "fast": 0.8, "faster": 3.0},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+
+    display_profiles_table(profiles, 10 * 1024**3, 3, {"amf": "AMD Test"}, console)
+
+    output = console.export_text()
+    assert "Why choose this" in output
+    assert "Lowest estimated wait: Faster Encode" in output
+    assert "Default pick: Faster Encode" in output
 
 
 def test_run_custom_wizard_returns_hardware_choice() -> None:
@@ -211,7 +255,9 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
 
     with (
         patch("mediashrink.wizard.scan_directory", return_value=[source]),
-        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended, maybe]) as mock_analyze,
+        patch(
+            "mediashrink.wizard._run_analysis_with_progress", return_value=[recommended, maybe]
+        ) as mock_analyze,
         patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
         patch("mediashrink.wizard.detect_device_labels", return_value={}),
         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
@@ -661,7 +707,10 @@ def test_run_wizard_returns_to_profile_selection_when_fallback_declined(tmp_path
         patch("mediashrink.wizard.detect_device_labels", return_value={}),
         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
         patch("mediashrink.wizard.display_profiles_table"),
-        patch("mediashrink.wizard.prompt_profile_selection", side_effect=[first_profile, second_profile]),
+        patch(
+            "mediashrink.wizard.prompt_profile_selection",
+            side_effect=[first_profile, second_profile],
+        ),
         patch("mediashrink.wizard.maybe_save_profile"),
         patch("mediashrink.wizard._maybe_run_preview", return_value=True),
         patch("mediashrink.wizard.display_analysis_summary"),

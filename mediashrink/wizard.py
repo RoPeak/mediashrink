@@ -78,8 +78,67 @@ class EncoderProfile:
     estimated_encode_seconds: float
     quality_label: str
     is_recommended: bool
+    why_choose: str = ""
     is_custom: bool = False
     is_builtin: bool = False
+
+
+_QUALITY_RANK = {
+    "Acceptable": 0,
+    "Good": 1,
+    "Very good": 2,
+    "Excellent": 3,
+    "Visually lossless": 4,
+}
+
+
+def _quality_rank(label: str) -> int:
+    return _QUALITY_RANK.get(label, -1)
+
+
+def _is_profile_dominated(profile: EncoderProfile, peers: list[EncoderProfile]) -> bool:
+    if profile.is_custom or profile.estimated_encode_seconds <= 0:
+        return False
+
+    profile_saved = profile.estimated_output_bytes
+    profile_quality = _quality_rank(profile.quality_label)
+    for peer in peers:
+        if peer is profile or peer.is_custom or peer.estimated_encode_seconds <= 0:
+            continue
+        peer_saved = peer.estimated_output_bytes
+        peer_quality = _quality_rank(peer.quality_label)
+        if (
+            peer.estimated_encode_seconds <= profile.estimated_encode_seconds
+            and peer_saved <= profile_saved
+            and peer_quality >= profile_quality
+            and (
+                peer.estimated_encode_seconds < profile.estimated_encode_seconds
+                or peer_saved < profile_saved
+                or peer_quality > profile_quality
+            )
+        ):
+            return True
+    return False
+
+
+def _select_recommended_profile(profiles: list[EncoderProfile]) -> EncoderProfile | None:
+    candidates = [
+        profile
+        for profile in profiles
+        if not profile.is_custom
+        and profile.estimated_encode_seconds > 0
+        and not _is_profile_dominated(profile, profiles)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda profile: (
+            profile.estimated_encode_seconds,
+            _quality_rank(profile.quality_label) * -1,
+            profile.estimated_output_bytes,
+        ),
+    )
 
 
 def detect_available_encoders(
@@ -252,6 +311,22 @@ def _encoder_display_name(
     return f"libx265 ({encoder_key})"
 
 
+def _profile_why_choose(profile: EncoderProfile, recommended: EncoderProfile | None) -> str:
+    if profile.is_custom:
+        return "Manual override for exact settings."
+    if recommended is profile:
+        return "Best default from the current time, size, and quality estimates."
+    if profile.encoder_key in _HW_ENCODERS:
+        return "Uses GPU hardware to reduce CPU load and keep the encode on the hardware path."
+    if profile.name == "Balanced":
+        return "Higher quality at a moderate speed cost."
+    if profile.name in {"Best Quality", "Archival"}:
+        return "Prioritizes retention over runtime."
+    if profile.name in {"Smallest File", "Smallest Acceptable"}:
+        return "Pushes harder for smaller output sizes."
+    return "Alternative trade-off if you prefer this balance."
+
+
 def build_profiles(
     available_hw: list[str],
     benchmark_speeds: dict[str, float | None],
@@ -270,7 +345,7 @@ def build_profiles(
         profiles.append(
             EncoderProfile(
                 index=idx,
-                name="Fastest on this device",
+                name="Fastest GPU encode",
                 encoder_key=key,
                 crf=20,
                 sw_preset=None,
@@ -278,6 +353,7 @@ def build_profiles(
                 estimated_encode_seconds=_estimate_time(total_media_seconds, speed),
                 quality_label="Good",
                 is_recommended=False,
+                why_choose="",
             )
         )
         idx += 1
@@ -295,6 +371,7 @@ def build_profiles(
             estimated_encode_seconds=_estimate_time(total_media_seconds, faster_speed),
             quality_label="Very good",
             is_recommended=False,
+            why_choose="",
         )
     )
     idx += 1
@@ -310,6 +387,7 @@ def build_profiles(
             estimated_encode_seconds=_estimate_time(total_media_seconds, fast_speed),
             quality_label="Excellent",
             is_recommended=False,
+            why_choose="",
         )
     )
     idx += 1
@@ -326,6 +404,7 @@ def build_profiles(
             estimated_encode_seconds=_estimate_time(total_media_seconds, slow_speed),
             quality_label="Visually lossless",
             is_recommended=False,
+            why_choose="",
         )
     )
     idx += 1
@@ -341,6 +420,7 @@ def build_profiles(
             estimated_encode_seconds=_estimate_time(total_media_seconds, slow_speed),
             quality_label="Good",
             is_recommended=False,
+            why_choose="",
         )
     )
     idx += 1
@@ -381,6 +461,7 @@ def build_profiles(
                 estimated_encode_seconds=_estimate_time(total_media_seconds, speed),
                 quality_label=_BUILTIN_QUALITY_LABELS.get(bp.name, "Good"),
                 is_recommended=False,
+                why_choose="",
                 is_builtin=True,
             )
         )
@@ -397,51 +478,49 @@ def build_profiles(
             estimated_encode_seconds=0,
             quality_label="",
             is_recommended=False,
+            why_choose="",
             is_custom=True,
         )
     )
 
     if hardware_profiles:
-        # Compare the best hardware estimate against the best software estimate.
-        # Hardware is not always fastest — if software beats it, prefer software and
-        # rename the hardware profile so "Fastest on this device" is only shown when true.
-        hw_keys = {k for k, _ in hardware_profiles}
-        hw_timed = [
-            p
-            for p in profiles
-            if p.encoder_key in hw_keys
-            and not p.is_custom
-            and not p.is_builtin
-            and p.estimated_encode_seconds
+        timed_profiles = [
+            profile
+            for profile in profiles
+            if not profile.is_custom and profile.estimated_encode_seconds > 0
         ]
-        sw_timed = [
-            p
-            for p in profiles
-            if p.sw_preset is not None
-            and not p.is_custom
-            and not p.is_builtin
-            and p.estimated_encode_seconds
-        ]
-        all_timed = hw_timed + sw_timed
-        if all_timed:
-            fastest = min(all_timed, key=lambda p: p.estimated_encode_seconds or float("inf"))
-            fastest.is_recommended = True
-            # Rename any hardware profiles that aren't the recommended one
-            for profile in hw_timed:
-                if not profile.is_recommended:
-                    profile.name = "Fastest GPU encode"
-        else:
-            # No time estimates: default to fastest hardware
-            recommended_key = hardware_profiles[0][0]
-            for profile in profiles:
-                if profile.encoder_key == recommended_key:
-                    profile.is_recommended = True
-                    break
+        fastest_overall = (
+            min(timed_profiles, key=lambda profile: profile.estimated_encode_seconds)
+            if timed_profiles
+            else None
+        )
+        hw_primary = next(
+            (
+                profile
+                for profile in profiles
+                if profile.encoder_key == best_hw and not profile.is_builtin
+            ),
+            None,
+        )
+        if hw_primary is not None and hw_primary is fastest_overall:
+            hw_primary.name = "Fastest on this device"
+        recommended = _select_recommended_profile(profiles)
+        if recommended is not None:
+            recommended.is_recommended = True
+        elif hw_primary is not None:
+            hw_primary.is_recommended = True
     else:
-        for profile in profiles:
-            if profile.name == "Balanced":
-                profile.is_recommended = True
-                break
+        balanced = next((profile for profile in profiles if profile.name == "Balanced"), None)
+        if balanced is not None and not _is_profile_dominated(balanced, profiles):
+            balanced.is_recommended = True
+        else:
+            recommended = _select_recommended_profile(profiles)
+            if recommended is not None:
+                recommended.is_recommended = True
+
+    recommended = next((profile for profile in profiles if profile.is_recommended), None)
+    for profile in profiles:
+        profile.why_choose = _profile_why_choose(profile, recommended)
 
     return profiles
 
@@ -466,12 +545,21 @@ def display_profiles_table(
     table.add_column("Est. Saving", justify="right", style="bold green", no_wrap=True)
     table.add_column("Est. Time", justify="right", no_wrap=True)
     table.add_column("Quality", no_wrap=True)
+    table.add_column("Why choose this")
     if not compact:
         table.add_column("CRF", justify="center", no_wrap=True)
 
     for profile in profiles:
         if profile.is_custom:
-            row: list[str | Text] = [str(profile.index), "Custom", "-", "-", "-", "-"]
+            row: list[str | Text] = [
+                str(profile.index),
+                "Custom",
+                "-",
+                "-",
+                "-",
+                "-",
+                "Manual override.",
+            ]
             if not compact:
                 row.append("-")
             table.add_row(*row)
@@ -505,10 +593,22 @@ def display_profiles_table(
             est_saving,
             est_time,
             Text(profile.quality_label, style=quality_style),
+            profile.why_choose,
         ]
         if not compact:
             row.append(str(profile.crf))
         table.add_row(*row)
+
+    recommended = next((profile for profile in profiles if profile.is_recommended), None)
+    fastest = min(
+        (
+            profile
+            for profile in profiles
+            if not profile.is_custom and profile.estimated_encode_seconds > 0
+        ),
+        key=lambda profile: profile.estimated_encode_seconds,
+        default=None,
+    )
 
     console.print()
     console.print(table)
@@ -521,9 +621,14 @@ def display_profiles_table(
     console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
-    console.print(
-        "  [dim]For lower wait time, choose the [recommended] profile or Faster Encode.[/dim]"
-    )
+    if fastest is not None:
+        console.print(
+            f"  [dim]Lowest estimated wait: {fastest.name} (~{_fmt_duration(fastest.estimated_encode_seconds)}).[/dim]"
+        )
+    if recommended is not None:
+        console.print(
+            f"  [dim]Default pick: {recommended.name} because it offers the best non-dominated trade-off for this batch.[/dim]"
+        )
     if compact:
         console.print("  [dim]Compact view hides lower-priority columns on narrow terminals.[/dim]")
     console.print()
@@ -734,6 +839,8 @@ def _select_profile_interactively(
         f"([dim]encoder:[/dim] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'}, "
         f"[dim]CRF:[/dim] {crf})"
     )
+    if not selected.is_custom and selected.why_choose:
+        console.print(f"  [dim]Why choose this:[/dim] {selected.why_choose}")
     return preset, crf, sw_preset, display_label
 
 
