@@ -57,11 +57,14 @@ def get_video_bitrate_kbps(path: Path, ffprobe: Path) -> float:
 
 # Per-codec compression factor at CRF_BASELINE (20).
 # Represents the expected output-to-input size ratio after H.265 encoding.
-# Calibrated against real-world encodes (vc1/mpeg2 values from observed runs).
+# Calibrated against real-world batch encodes:
+#   mpeg2video: 42-file batch achieved 73.3% savings → ~0.27 output ratio (updated from 0.48)
+#   vc1: similar compressibility to mpeg2video (updated from 0.48)
+#   h264: typical H.264→H.265 yields 40-50% savings → 0.50-0.60 output ratio
 _CODEC_BASE_FACTOR: dict[str, float] = {
     "h264": 0.50,
-    "vc1": 0.48,
-    "mpeg2video": 0.48,
+    "vc1": 0.30,
+    "mpeg2video": 0.28,
     "hevc": 1.00,  # already H.265 — no meaningful savings expected
 }
 _DEFAULT_CODEC_FACTOR = 0.45  # used for unknown/unlisted codecs
@@ -296,6 +299,24 @@ def _duration_flags(duration_limit_seconds: float | None) -> list[str]:
     return []
 
 
+# MP4/M4V containers do not support most subtitle formats (ASS, SSA, PGS, DVB, etc.).
+# Attempting to copy incompatible subtitle streams causes FFmpeg to fail at header-write
+# time with "Invalid argument" before a single frame is encoded.
+_MP4_CONTAINERS = {".mp4", ".m4v"}
+
+
+def _subtitle_args(output_path: Path) -> list[str]:
+    """Return subtitle stream arguments appropriate for the output container.
+
+    MP4/M4V containers only support mov_text; arbitrary subtitle copy fails.
+    Drop all subtitle streams for MP4 outputs to avoid header-write errors.
+    MKV accepts any subtitle codec — copy unchanged.
+    """
+    if output_path.suffix.lower() in _MP4_CONTAINERS:
+        return ["-sn"]
+    return ["-c:s", "copy"]
+
+
 def _build_sw_command(
     job: EncodeJob,
     ffmpeg: Path,
@@ -317,8 +338,9 @@ def _build_sw_command(
             job.preset,
             "-c:a",
             "copy",
-            "-c:s",
-            "copy",
+        ]
+        + _subtitle_args(job.tmp_output)
+        + [
             "-tag:v",
             "hvc1",
             "-movflags",
@@ -358,8 +380,9 @@ def _build_hw_command(
     cmd += [
         "-c:a",
         "copy",
-        "-c:s",
-        "copy",
+    ]
+    cmd += _subtitle_args(job.tmp_output)
+    cmd += [
         "-tag:v",
         "hev1",  # hvc1 requires inline params (software only); hev1 = container header (hardware)
         "-movflags",

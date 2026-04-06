@@ -234,9 +234,11 @@ def display_analysis_summary(
     table.add_column("Recommendation", justify="center", no_wrap=True)
     table.add_column("Reason")
 
-    for item in sorted(
+    _TABLE_LIMIT = 12
+    sorted_items = sorted(
         items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True
-    )[:12]:
+    )
+    for item in sorted_items[:_TABLE_LIMIT]:
         savings_text = (
             "-"
             if item.estimated_savings_bytes <= 0
@@ -260,6 +262,13 @@ def display_analysis_summary(
 
     console.print()
     console.print(table)
+    if len(sorted_items) > _TABLE_LIMIT:
+        hidden = len(sorted_items) - _TABLE_LIMIT
+        console.print(
+            f"[dim]Showing top {_TABLE_LIMIT} of {len(sorted_items)} files by estimated saving. "
+            f"{hidden} more not shown — use --manifest-out to export the full list.[/dim]",
+            highlight=False,
+        )
     console.print(
         f"[bold]{len(items)}[/bold] file(s) scanned - "
         f"[green bold]{len(recommended)}[/green bold] recommended, "

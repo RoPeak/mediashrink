@@ -402,11 +402,41 @@ def build_profiles(
     )
 
     if hardware_profiles:
-        recommended_key = hardware_profiles[0][0]
-        for profile in profiles:
-            if profile.encoder_key == recommended_key:
-                profile.is_recommended = True
-                break
+        # Compare the best hardware estimate against the best software estimate.
+        # Hardware is not always fastest — if software beats it, prefer software and
+        # rename the hardware profile so "Fastest on this device" is only shown when true.
+        hw_keys = {k for k, _ in hardware_profiles}
+        hw_timed = [
+            p
+            for p in profiles
+            if p.encoder_key in hw_keys
+            and not p.is_custom
+            and not p.is_builtin
+            and p.estimated_encode_seconds
+        ]
+        sw_timed = [
+            p
+            for p in profiles
+            if p.sw_preset is not None
+            and not p.is_custom
+            and not p.is_builtin
+            and p.estimated_encode_seconds
+        ]
+        all_timed = hw_timed + sw_timed
+        if all_timed:
+            fastest = min(all_timed, key=lambda p: p.estimated_encode_seconds or float("inf"))
+            fastest.is_recommended = True
+            # Rename any hardware profiles that aren't the recommended one
+            for profile in hw_timed:
+                if not profile.is_recommended:
+                    profile.name = "Fastest GPU encode"
+        else:
+            # No time estimates: default to fastest hardware
+            recommended_key = hardware_profiles[0][0]
+            for profile in profiles:
+                if profile.encoder_key == recommended_key:
+                    profile.is_recommended = True
+                    break
     else:
         for profile in profiles:
             if profile.name == "Balanced":
@@ -492,7 +522,7 @@ def display_profiles_table(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
     console.print(
-        "  [dim]For lower wait time, choose Fastest on this device or Faster Encode.[/dim]"
+        "  [dim]For lower wait time, choose the [recommended] profile or Faster Encode.[/dim]"
     )
     if compact:
         console.print("  [dim]Compact view hides lower-priority columns on narrow terminals.[/dim]")
@@ -724,7 +754,9 @@ def _run_analysis_with_progress(
         transient=False,
         expand=True,
     ) as progress:
-        task = progress.add_task("[dim]Analyzing files (ffprobe + size estimates)...[/dim]", total=len(files))
+        task = progress.add_task(
+            "[dim]Analyzing files (ffprobe + size estimates)...[/dim]", total=len(files)
+        )
 
         def callback(completed: int, total: int, path: Path) -> None:
             name = path.name if len(path.name) <= 56 else path.name[:53] + "..."
@@ -749,7 +781,9 @@ def _maybe_run_preview(
     auto: bool,
     console: Console,
 ) -> bool:
-    if auto or not typer.confirm("Test a 2-minute preview clip before the full batch?", default=False):
+    if auto or not typer.confirm(
+        "Test a 2-minute preview clip before the full batch?", default=False
+    ):
         return True
 
     console.print(f"[dim]Preview encoding[/dim] {sample_file.name}...")
@@ -766,8 +800,12 @@ def _maybe_run_preview(
     EncodingDisplay(console).show_summary([preview_result])
     if preview_result.success and preview_result.job.output.exists():
         console.print(f"  [dim]Preview saved:[/dim] {preview_result.job.output}")
-        console.print("  [dim]Inspect video quality and verify audio/subtitle playback before continuing.[/dim]")
-        console.print("  [dim]Use the preview clip as a quality check, not as a file-size estimate.[/dim]")
+        console.print(
+            "  [dim]Inspect video quality and verify audio/subtitle playback before continuing.[/dim]"
+        )
+        console.print(
+            "  [dim]Use the preview clip as a quality check, not as a file-size estimate.[/dim]"
+        )
         return True
 
     if preview_result.error_message:
@@ -863,7 +901,9 @@ def run_wizard(
         total_media_seconds=candidate_media_seconds,
         total_input_bytes=candidate_input_bytes,
     )
-    display_profiles_table(profiles, candidate_input_bytes, len(candidate_items), device_labels, console)
+    display_profiles_table(
+        profiles, candidate_input_bytes, len(candidate_items), device_labels, console
+    )
 
     for hw_key in available_hw:
         if hw_key in _HW_ENCODER_CAVEATS:
@@ -913,13 +953,19 @@ def run_wizard(
                     items=analysis_items,
                 )
                 default_manifest_path = directory / "mediashrink-analysis.json"
-                manifest_path = Path(typer.prompt("Manifest path", default=str(default_manifest_path)))
+                manifest_path = Path(
+                    typer.prompt("Manifest path", default=str(default_manifest_path))
+                )
                 save_manifest(manifest, manifest_path)
                 console.print(f"[green]Wrote manifest[/green] {manifest_path}")
                 return [], "export", False
 
             selected_items = list(recommended_items)
-            if action == "review_maybe" and maybe_items and review_maybe_items(maybe_items, console):
+            if (
+                action == "review_maybe"
+                and maybe_items
+                and review_maybe_items(maybe_items, console)
+            ):
                 selected_items.extend(maybe_items)
             action_taken = True
 
@@ -959,7 +1005,9 @@ def run_wizard(
             break
 
         console.print()
-        console.print("[red]Selected settings failed a short compatibility check before batch encoding.[/red]")
+        console.print(
+            "[red]Selected settings failed a short compatibility check before batch encoding.[/red]"
+        )
         console.print(
             f"[red]Profile:[/red] {display_label} "
             f"([red]encoder:[/red] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'})"
@@ -967,7 +1015,9 @@ def run_wizard(
         if preflight_result.error_message:
             console.print(f"[red]FFmpeg reported:[/red] {preflight_result.error_message}")
 
-        fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = _DEFAULT_FALLBACK_PROFILE
+        fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = (
+            _DEFAULT_FALLBACK_PROFILE
+        )
         if preset != fallback_preset and typer.confirm(
             f"Switch to {fallback_label} (libx265, CRF {fallback_crf}) and retry?",
             default=True,

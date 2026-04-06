@@ -294,6 +294,26 @@ class EncodingDisplay:
                 + (f"  [dim]{_fmt_duration(total_time)} elapsed[/dim]" if total_time > 0 else ""),
                 highlight=False,
             )
+
+        # Show estimate vs actual when we have both and it's a real (non-dry-run) batch encode.
+        if not is_dry_run and not is_preview and successful_results:
+            est_output_total = sum(
+                r.job.estimated_output_bytes
+                for r in successful_results
+                if r.job.estimated_output_bytes > 0
+            )
+            est_input_total = sum(
+                r.input_size_bytes for r in successful_results if r.job.estimated_output_bytes > 0
+            )
+            if est_output_total > 0 and est_input_total > 0 and total_input > 0:
+                est_saved = est_input_total - est_output_total
+                est_pct = est_saved / est_input_total * 100
+                self.console.print(
+                    f"[dim]Estimated saving: ~{_fmt_size(est_saved)} ({est_pct:.0f}%)  "
+                    f"→  Actual saving: {_fmt_size(total_saved)} ({overall_pct:.1f}%)[/dim]",
+                    highlight=False,
+                )
+
         if is_preview:
             clip_label = preview_duration or "this sample"
             self.console.print(

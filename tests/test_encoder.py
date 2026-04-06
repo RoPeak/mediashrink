@@ -147,6 +147,76 @@ def test_build_hw_command_amf_includes_tuning(tmp_path: Path) -> None:
     assert cmd[tag_idx + 1] == "hev1"
 
 
+def test_build_ffmpeg_command_mkv_copies_subtitles(tmp_path: Path) -> None:
+    """MKV output should use -c:s copy (subtitles safe in MKV container)."""
+    job = _make_job(tmp_path)  # default is .mkv output
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-c:s" in cmd
+    cs_idx = cmd.index("-c:s")
+    assert cmd[cs_idx + 1] == "copy"
+    assert "-sn" not in cmd
+
+
+def test_build_ffmpeg_command_mp4_drops_subtitles(tmp_path: Path) -> None:
+    """MP4 output must use -sn to avoid header-write failures from incompatible subtitle codecs."""
+    source = tmp_path / "movie.mp4"
+    source.write_bytes(b"fake mp4 data")
+    output = tmp_path / "movie_compressed.mp4"
+    tmp_output = tmp_path / ".tmp_movie_compressed.mp4"
+    job = EncodeJob(
+        source=source,
+        output=output,
+        tmp_output=tmp_output,
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-sn" in cmd
+    assert "-c:s" not in cmd
+
+
+def test_build_ffmpeg_command_m4v_drops_subtitles(tmp_path: Path) -> None:
+    """M4V output (same container family as MP4) must also drop subtitle streams."""
+    source = tmp_path / "movie.m4v"
+    source.write_bytes(b"fake m4v data")
+    output = tmp_path / "movie_compressed.m4v"
+    tmp_output = tmp_path / ".tmp_movie_compressed.m4v"
+    job = EncodeJob(
+        source=source,
+        output=output,
+        tmp_output=tmp_output,
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-sn" in cmd
+    assert "-c:s" not in cmd
+
+
+def test_build_hw_command_mp4_drops_subtitles(tmp_path: Path) -> None:
+    """Hardware encoder with MP4 output must also drop subtitle streams."""
+    source = tmp_path / "movie.mp4"
+    source.write_bytes(b"fake mp4 data")
+    output = tmp_path / "movie_compressed.mp4"
+    tmp_output = tmp_path / ".tmp_movie_compressed.mp4"
+    job = EncodeJob(
+        source=source,
+        output=output,
+        tmp_output=tmp_output,
+        crf=20,
+        preset="amf",
+        dry_run=False,
+        skip=False,
+    )
+    cmd = build_ffmpeg_command(job, FFMPEG)
+    assert "-sn" in cmd
+    assert "-c:s" not in cmd
+
+
 def test_is_hardware_preset() -> None:
     assert is_hardware_preset("qsv") is True
     assert is_hardware_preset("nvenc") is True
@@ -393,7 +463,7 @@ def test_estimate_output_size_vc1_lower_than_h264(tmp_path: Path) -> None:
         mock_stat.return_value.st_size = source_size
         h264_result = estimate_output_size(source, FFPROBE, codec="h264", crf=20)
 
-    # vc1 factor (0.48) < h264 factor (0.50) → vc1 estimate should be smaller
+    # vc1 factor (0.30) < h264 factor (0.50) → vc1 estimate should be smaller
     assert vc1_result < h264_result
 
 
