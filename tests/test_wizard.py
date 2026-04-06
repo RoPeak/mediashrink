@@ -757,6 +757,60 @@ def test_run_wizard_returns_to_profile_selection_when_fallback_declined(tmp_path
     assert presets == ["qsv", "fast"]
 
 
+def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
+    mp4_source = tmp_path / "movie.mp4"
+    mkv_source = tmp_path / "movie.mkv"
+    mp4_source.write_bytes(b"x" * 1000)
+    mkv_source.write_bytes(b"x" * 1000)
+    recommended_mp4 = _analysis_item(mp4_source, "recommended")
+    recommended_mkv = _analysis_item(mkv_source, "recommended")
+    mp4_job = EncodeJob(
+        source=mp4_source,
+        output=tmp_path / "movie_compressed.mp4",
+        tmp_output=tmp_path / ".tmp_movie_compressed.mp4",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    mkv_job = _job_for(mkv_source)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[mp4_source, mkv_source]),
+        patch(
+            "mediashrink.wizard._run_analysis_with_progress",
+            return_value=[recommended_mp4, recommended_mkv],
+        ),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[mp4_job, mkv_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            side_effect=[
+                _fake_encode_result(mp4_source, success=False, error_message="Invalid argument"),
+            ],
+        ),
+        patch("mediashrink.wizard.typer.confirm", side_effect=[True, True, True]),
+    ):
+        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+
+    output = console.export_text()
+    assert action == "encode"
+    assert jobs == [mkv_job]
+    assert "Skipping 1 incompatible file(s) for this run." in output
+
+
 # ---------------------------------------------------------------------------
 # Stage 10 — UX polish regression tests
 # ---------------------------------------------------------------------------

@@ -861,6 +861,47 @@ def _subtitle_drop_warning(jobs: list[EncodeJob], ffprobe: Path) -> str | None:
     )
 
 
+def _preflight_candidates(jobs: list[EncodeJob]) -> list[EncodeJob]:
+    non_mkv = [job for job in jobs if job.output.suffix.lower() != ".mkv"]
+    if non_mkv:
+        return non_mkv
+    if not jobs:
+        return []
+    return [max(jobs, key=lambda job: job.source.stat().st_size)]
+
+
+def _run_preflight_checks(
+    jobs: list[EncodeJob],
+    ffmpeg: Path,
+    ffprobe: Path,
+    *,
+    crf: int,
+    preset: str,
+    console: Console,
+) -> tuple[list[EncodeJob], list[tuple[EncodeJob, EncodeResult]]]:
+    candidates = _preflight_candidates(jobs)
+    compatible: list[EncodeJob] = []
+    failed: list[tuple[EncodeJob, EncodeResult]] = []
+    with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
+        for job in candidates:
+            result = preflight_encode_job(
+                job.source,
+                ffmpeg,
+                ffprobe,
+                crf=crf,
+                preset=preset,
+            )
+            if result.success:
+                compatible.append(job)
+            else:
+                failed.append((job, result))
+    if len(candidates) == 1 and compatible:
+        return jobs, failed
+    compatible_sources = {job.source for job in compatible}
+    passthrough = [job for job in jobs if job not in candidates]
+    return passthrough + compatible, failed
+
+
 def _select_profile_interactively(
     profiles: list[EncoderProfile],
     available_hw: list[str],
@@ -1181,16 +1222,15 @@ def run_wizard(
             known_speed=benchmark_speeds.get(preset),
         )
 
-        preflight_job = max(to_encode, key=lambda job: job.source.stat().st_size)
-        with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
-            preflight_result = preflight_encode_job(
-                preflight_job.source,
-                ffmpeg,
-                ffprobe,
-                crf=crf,
-                preset=preset,
-            )
-        if preflight_result.success:
+        compatible_jobs, preflight_failures = _run_preflight_checks(
+            to_encode,
+            ffmpeg,
+            ffprobe,
+            crf=crf,
+            preset=preset,
+            console=console,
+        )
+        if not preflight_failures:
             break
 
         console.print()
@@ -1201,8 +1241,44 @@ def run_wizard(
             f"[red]Profile:[/red] {display_label} "
             f"([red]encoder:[/red] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'})"
         )
-        if preflight_result.error_message:
-            console.print(f"[red]FFmpeg reported:[/red] {preflight_result.error_message}")
+        for failed_job, preflight_result in preflight_failures[:5]:
+            if preflight_result.error_message:
+                console.print(
+                    f"[red]{failed_job.source.name}:[/red] {preflight_result.error_message}"
+                )
+        if len(preflight_failures) > 5:
+            console.print(
+                f"[dim]...and {len(preflight_failures) - 5} more compatibility failure(s).[/dim]"
+            )
+        if any(job.output.suffix.lower() != ".mkv" for job, _ in preflight_failures):
+            console.print(
+                "[dim]These failures are often caused by non-video/data streams that .mp4/.m4v outputs cannot safely carry.[/dim]"
+            )
+
+        if compatible_jobs and len(compatible_jobs) < len(to_encode):
+            compatible_sources = {job.source for job in compatible_jobs}
+            skip_default = True
+            skip_prompt = (
+                f"Skip {len(preflight_failures)} incompatible file(s) and continue with "
+                f"{len(compatible_jobs)} compatible file(s)?"
+            )
+            if auto or typer.confirm(skip_prompt, default=skip_default):
+                selected_items = [
+                    item for item in selected_items if item.source in compatible_sources
+                ]
+                jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
+                to_encode = compatible_jobs
+                estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+                    items=selected_items,
+                    preset=preset,
+                    crf=crf,
+                    ffmpeg=ffmpeg,
+                    known_speed=benchmark_speeds.get(preset),
+                )
+                console.print(
+                    f"[yellow]Skipping {len(preflight_failures)} incompatible file(s) for this run.[/yellow]"
+                )
+                break
 
         fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = (
             _DEFAULT_FALLBACK_PROFILE
@@ -1222,19 +1298,18 @@ def run_wizard(
                 no_skip=no_skip,
             )
             fallback_to_encode = [job for job in fallback_jobs if not job.skip]
-            fallback_job = max(fallback_to_encode, key=lambda job: job.source.stat().st_size)
             console.print(f"[dim]Retrying with[/dim] {fallback_label}...")
-            with console.status("[dim]Running final compatibility check...[/dim]", spinner="dots"):
-                fallback_result = preflight_encode_job(
-                    fallback_job.source,
-                    ffmpeg,
-                    ffprobe,
-                    crf=fallback_crf,
-                    preset=fallback_preset,
-                )
-            if fallback_result.success:
+            fallback_compatible, fallback_failures = _run_preflight_checks(
+                fallback_to_encode,
+                ffmpeg,
+                ffprobe,
+                crf=fallback_crf,
+                preset=fallback_preset,
+                console=console,
+            )
+            if not fallback_failures:
                 jobs = fallback_jobs
-                to_encode = fallback_to_encode
+                to_encode = fallback_compatible
                 preset = fallback_preset
                 crf = fallback_crf
                 sw_preset = fallback_sw_preset
@@ -1247,10 +1322,41 @@ def run_wizard(
                     known_speed=benchmark_speeds.get(preset),
                 )
                 break
+            if fallback_compatible and len(fallback_compatible) < len(fallback_to_encode):
+                fallback_sources = {job.source for job in fallback_compatible}
+                if auto or typer.confirm(
+                    f"Skip {len(fallback_failures)} incompatible file(s) and continue with {len(fallback_compatible)} compatible file(s) using {fallback_label}?",
+                    default=True,
+                ):
+                    selected_items = [
+                        item for item in selected_items if item.source in fallback_sources
+                    ]
+                    jobs = [
+                        job for job in fallback_jobs if job.skip or job.source in fallback_sources
+                    ]
+                    to_encode = fallback_compatible
+                    preset = fallback_preset
+                    crf = fallback_crf
+                    sw_preset = fallback_sw_preset
+                    display_label = fallback_label
+                    estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+                        items=selected_items,
+                        preset=preset,
+                        crf=crf,
+                        ffmpeg=ffmpeg,
+                        known_speed=benchmark_speeds.get(preset),
+                    )
+                    console.print(
+                        f"[yellow]Skipping {len(fallback_failures)} incompatible file(s) for this run.[/yellow]"
+                    )
+                    break
             console.print()
             console.print("[red]Fallback profile also failed compatibility checks.[/red]")
-            if fallback_result.error_message:
-                console.print(f"[red]FFmpeg reported:[/red] {fallback_result.error_message}")
+            for failed_job, fallback_result in fallback_failures[:5]:
+                if fallback_result.error_message:
+                    console.print(
+                        f"[red]{failed_job.source.name}:[/red] {fallback_result.error_message}"
+                    )
 
         console.print(
             "[dim]Choose another profile. Software profiles are the safest fallback when hardware encoding is not compatible with the selected files.[/dim]"

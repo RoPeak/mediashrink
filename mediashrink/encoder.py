@@ -317,6 +317,17 @@ def _subtitle_args(output_path: Path) -> list[str]:
     return ["-c:s", "copy"]
 
 
+def _stream_map_args(output_path: Path) -> list[str]:
+    """Return stream-selection args for the output container.
+
+    MP4/M4V outputs are more fragile when copying arbitrary auxiliary/data streams.
+    Restrict them to video/audio only and drop data streams explicitly.
+    """
+    if output_path.suffix.lower() in _MP4_CONTAINERS:
+        return ["-map", "0:v", "-map", "0:a?", "-dn"]
+    return ["-map", "0"]
+
+
 def output_drops_subtitles(output_path: Path) -> bool:
     return output_path.suffix.lower() in _MP4_CONTAINERS
 
@@ -352,8 +363,9 @@ def _build_sw_command(
             str(ffmpeg),
             "-i",
             str(job.source),
-            "-map",
-            "0",
+        ]
+        + _stream_map_args(job.tmp_output)
+        + [
             "-c:v",
             "libx265",
             "-crf",
@@ -394,8 +406,9 @@ def _build_hw_command(
         str(ffmpeg),
         "-i",
         str(job.source),
-        "-map",
-        "0",
+    ]
+    cmd += _stream_map_args(job.tmp_output)
+    cmd += [
         "-c:v",
         encoder,
     ]

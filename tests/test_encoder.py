@@ -175,6 +175,8 @@ def test_build_ffmpeg_command_mp4_drops_subtitles(tmp_path: Path) -> None:
     cmd = build_ffmpeg_command(job, FFMPEG)
     assert "-sn" in cmd
     assert "-c:s" not in cmd
+    assert ["-map", "0:v", "-map", "0:a?", "-dn"] == cmd[cmd.index("-map") : cmd.index("-c:v")]
+    assert "0" not in cmd[cmd.index("-map") + 1 : cmd.index("-c:v")]
 
 
 def test_build_ffmpeg_command_m4v_drops_subtitles(tmp_path: Path) -> None:
@@ -195,6 +197,7 @@ def test_build_ffmpeg_command_m4v_drops_subtitles(tmp_path: Path) -> None:
     cmd = build_ffmpeg_command(job, FFMPEG)
     assert "-sn" in cmd
     assert "-c:s" not in cmd
+    assert ["-map", "0:v", "-map", "0:a?", "-dn"] == cmd[cmd.index("-map") : cmd.index("-c:v")]
 
 
 def test_build_hw_command_mp4_drops_subtitles(tmp_path: Path) -> None:
@@ -215,6 +218,7 @@ def test_build_hw_command_mp4_drops_subtitles(tmp_path: Path) -> None:
     cmd = build_ffmpeg_command(job, FFMPEG)
     assert "-sn" in cmd
     assert "-c:s" not in cmd
+    assert ["-map", "0:v", "-map", "0:a?", "-dn"] == cmd[cmd.index("-map") : cmd.index("-c:v")]
 
 
 def test_is_hardware_preset() -> None:
