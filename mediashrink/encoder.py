@@ -7,6 +7,12 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
+from mediashrink.calibration import (
+    bitrate_bucket,
+    load_calibration_store,
+    lookup_estimate,
+    resolution_bucket,
+)
 from mediashrink.constants import CRF_BASELINE, CRF_COMPRESSION_FACTOR
 from mediashrink.models import EncodeAttempt, EncodeJob, EncodeResult
 
@@ -111,7 +117,16 @@ def _resolution_factor(width: int, height: int) -> float:
     return 1.10  # SD — less redundancy, harder to compress
 
 
-def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, crf: int = 20) -> int:
+def estimate_output_size(
+    path: Path,
+    ffprobe: Path,
+    codec: str | None = None,
+    crf: int = 20,
+    *,
+    preset: str = "fast",
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> int:
     """
     Estimate the output file size after H.265 encoding.
 
@@ -141,19 +156,41 @@ def estimate_output_size(path: Path, ffprobe: Path, codec: str | None = None, cr
         combined_factor = codec_factor * crf_scale * res_factor
 
         video_kbps = get_video_bitrate_kbps(path, ffprobe)
+        heuristic_estimate = 0
         if video_kbps <= 0:
-            # Fallback: apply factor to whole file
-            return int(input_size * combined_factor)
+            heuristic_estimate = int(input_size * combined_factor)
+        else:
+            video_bytes = (video_kbps * 1000 / 8) * duration
+            non_video_bytes = max(input_size - video_bytes, 0)
 
-        video_bytes = (video_kbps * 1000 / 8) * duration
-        non_video_bytes = max(input_size - video_bytes, 0)
+            # Extra bonus for very high-bitrate sources (more headroom to compress)
+            if video_kbps > 8000:
+                combined_factor *= 0.90
 
-        # Extra bonus for very high-bitrate sources (more headroom to compress)
-        if video_kbps > 8000:
-            combined_factor *= 0.90
+            estimated_video_bytes = video_bytes * combined_factor
+            heuristic_estimate = int(estimated_video_bytes + non_video_bytes)
 
-        estimated_video_bytes = video_bytes * combined_factor
-        return int(estimated_video_bytes + non_video_bytes)
+        if use_calibration:
+            active_store = (
+                calibration_store if calibration_store is not None else load_calibration_store()
+            )
+            lookup = lookup_estimate(
+                active_store,
+                codec=codec,
+                resolution=resolution_bucket(width, height),
+                bitrate=bitrate_bucket(video_kbps),
+                preset=preset,
+                container=path.suffix.lower() or ".mkv",
+            )
+            if lookup is not None and lookup.output_ratio is not None and lookup.output_ratio > 0:
+                calibrated_estimate = int(input_size * lookup.output_ratio)
+                if lookup.confidence == "High":
+                    return calibrated_estimate
+                if lookup.confidence == "Medium":
+                    return int((calibrated_estimate * 0.65) + (heuristic_estimate * 0.35))
+                return int((calibrated_estimate * 0.40) + (heuristic_estimate * 0.60))
+
+        return heuristic_estimate
     except (OSError, ValueError):
         return 0
 

@@ -133,6 +133,60 @@ def test_build_profiles_does_not_recommend_dominated_profile() -> None:
     assert gpu_profile.is_recommended is False
 
 
+def test_build_profiles_highest_confidence_downranks_unreliable_hardware(tmp_path: Path) -> None:
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "1080p",
+                "bitrate_bucket": "high",
+                "preset": "fast",
+                "preset_family": "software",
+                "crf": 20,
+                "input_bytes": 1000,
+                "output_bytes": 500,
+                "duration_seconds": 100.0,
+                "wall_seconds": 100.0,
+                "effective_speed": 1.0,
+                "fallback_used": False,
+                "retry_used": False,
+            }
+        ],
+        "failures": [
+            {
+                "encoder": "amf",
+                "container": ".mkv",
+                "stage": "encode",
+                "reason": "invalid argument",
+            },
+            {
+                "encoder": "amf",
+                "container": ".mkv",
+                "stage": "encode",
+                "reason": "invalid argument",
+            },
+        ],
+    }
+    candidate = _analysis_item(tmp_path / "candidate.mkv", "recommended")
+
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 10.0, "fast": 1.0, "faster": 1.1},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+        candidate_items=[candidate],
+        ffprobe=FFPROBE,
+        policy="highest-confidence",
+        calibration_store=calibration_store,
+    )
+
+    recommended = next(profile for profile in profiles if profile.is_recommended)
+    assert recommended.encoder_key in {"fast", "faster"}
+    assert recommended.encoder_key != "amf"
+
+
 def test_build_profiles_recommends_balanced_without_hw() -> None:
     profiles = build_profiles(
         available_hw=[],

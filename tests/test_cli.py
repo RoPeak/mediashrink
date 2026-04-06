@@ -1468,3 +1468,72 @@ def test_run_encode_loop_warns_when_progress_stalls(tmp_path: Path) -> None:
 
     printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
     assert "No progress update from FFmpeg" in printed
+
+
+def test_run_encode_loop_skip_policy_marks_failed_file_skipped(tmp_path: Path) -> None:
+    from mediashrink.cli import _run_encode_loop
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    failed = _make_result(job, success=False, output_size_bytes=0, error_message="disk full")
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    with patch("mediashrink.cli.encode_file", return_value=failed):
+        results = _run_encode_loop(
+            [job], FFMPEG, FFPROBE, mock_display, on_file_failure="skip", use_calibration=False
+        )
+
+    assert results[0].skipped is True
+    assert "skipped_by_policy" in (results[0].skip_reason or "")
+
+
+def test_encode_overnight_flag_forces_skip_policy_and_verbose(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    ok_result = _make_result(job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]) as mock_loop,
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--overnight"])
+
+    assert result.exit_code == 0
+    assert mock_loop.call_args.kwargs["on_file_failure"] == "skip"
+    assert mock_loop.call_args.kwargs["use_calibration"] is True
+
+
+def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    ok_result = _make_result(job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch(
+            "mediashrink.cli._prepare_overnight_jobs",
+            return_value=([job], "fast", 20),
+        ) as mock_prepare,
+        patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]) as mock_loop,
+    ):
+        result = runner.invoke(app, ["overnight", str(tmp_path)])
+
+    assert result.exit_code == 0
+    mock_prepare.assert_called_once()
+    assert mock_loop.call_args.kwargs["on_file_failure"] == "skip"

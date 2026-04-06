@@ -24,10 +24,23 @@ from mediashrink.analysis import (
     save_manifest,
     select_representative_items,
 )
+from mediashrink.calibration import (
+    CalibrationRecord,
+    FailureRecord,
+    append_failure_record,
+    append_success_record,
+    bitrate_bucket,
+    estimate_failure_rate,
+    load_calibration_store,
+    resolution_bucket,
+)
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import (
     encode_file,
     encode_preview,
+    get_duration_seconds,
+    get_video_bitrate_kbps,
+    get_video_resolution,
     is_hardware_preset,
     output_drops_subtitles,
     source_has_subtitle_streams,
@@ -89,6 +102,13 @@ _TRANSIENT_RETRY_PATTERNS: dict[str, tuple[str, ...]] = {
 _DISK_ESTIMATE_FALLBACK_RATIO = 0.70
 _GB = 1024**3
 _MB = 1024**2
+_POLICY_CHOICES = {
+    "fastest-wall-clock",
+    "lowest-cpu",
+    "best-compression",
+    "highest-confidence",
+}
+_FAILURE_POLICY_CHOICES = {"skip", "retry", "stop"}
 
 
 def _now_iso() -> str:
@@ -136,6 +156,68 @@ def _normalize_failure_message(message: str | None) -> str | None:
     if "error opening output" in lowered:
         return "Output path is not writable or could not be created."
     return message
+
+
+def _validate_policy(value: str) -> str:
+    if value not in _POLICY_CHOICES:
+        raise typer.BadParameter(f"invalid policy '{value}'")
+    return value
+
+
+def _validate_failure_policy(value: str) -> str:
+    if value not in _FAILURE_POLICY_CHOICES:
+        raise typer.BadParameter(f"invalid failure policy '{value}'")
+    return value
+
+
+def _resolve_runtime_settings(
+    *,
+    overnight: bool,
+    policy: str,
+    on_file_failure: str,
+    verbose: bool,
+    cleanup: bool,
+    yes: bool,
+    use_calibration: bool,
+) -> dict[str, object]:
+    runtime_policy = _validate_policy(policy)
+    runtime_failure_policy = _validate_failure_policy(on_file_failure)
+    if overnight:
+        runtime_failure_policy = "skip"
+        return {
+            "policy": runtime_policy,
+            "on_file_failure": runtime_failure_policy,
+            "verbose": True,
+            "cleanup": False if not cleanup else cleanup,
+            "yes": True,
+            "use_calibration": use_calibration,
+        }
+    return {
+        "policy": runtime_policy,
+        "on_file_failure": runtime_failure_policy,
+        "verbose": verbose,
+        "cleanup": cleanup,
+        "yes": yes,
+        "use_calibration": use_calibration,
+    }
+
+
+def _classify_result_status(result: EncodeResult) -> str:
+    if result.success and not result.skipped:
+        return "success"
+    if result.skipped:
+        if result.skip_reason and result.skip_reason.startswith("incompatible:"):
+            return "skipped_incompatible"
+        return "skipped_by_policy"
+    return "failed_after_retries"
+
+
+def _normalize_loop_result(
+    loop_result: list[EncodeResult] | tuple[list[EncodeResult], bool],
+) -> tuple[list[EncodeResult], bool]:
+    if isinstance(loop_result, tuple):
+        return loop_result
+    return loop_result, bool(getattr(loop_result, "stopped_early", False))
 
 
 def _apply_failure_diagnostics(result: EncodeResult) -> EncodeResult:
@@ -259,6 +341,53 @@ def _report_output_dir(base_dir: Path, output_dir: Path | None, log_path: Path |
     return output_dir or base_dir
 
 
+def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
+    if not result.success or result.skipped or result.job.dry_run:
+        return
+    width, height = get_video_resolution(result.job.source, ffprobe)
+    bitrate_kbps = get_video_bitrate_kbps(result.job.source, ffprobe)
+    duration_seconds = (
+        result.media_duration_seconds
+        if result.media_duration_seconds > 0
+        else get_duration_seconds(result.job.source, ffprobe)
+    )
+    codec = result.job.source_codec or "unknown"
+    effective_speed = (
+        duration_seconds / result.duration_seconds if result.duration_seconds > 0 else 0.0
+    )
+    append_success_record(
+        CalibrationRecord(
+            codec=codec,
+            container=result.job.output.suffix.lower() or ".mkv",
+            resolution_bucket=resolution_bucket(width, height),
+            bitrate_bucket=bitrate_bucket(bitrate_kbps),
+            preset=result.job.preset,
+            preset_family="hardware" if is_hardware_preset(result.job.preset) else "software",
+            crf=result.job.crf,
+            input_bytes=result.input_size_bytes,
+            output_bytes=result.output_size_bytes,
+            duration_seconds=duration_seconds,
+            wall_seconds=result.duration_seconds,
+            effective_speed=effective_speed,
+            fallback_used=result.fallback_used,
+            retry_used=result.retry_count > 0,
+        )
+    )
+
+
+def _record_failure_calibration(result: EncodeResult) -> None:
+    if result.success or result.skipped or result.job.dry_run:
+        return
+    append_failure_record(
+        FailureRecord(
+            encoder="hardware" if is_hardware_preset(result.job.preset) else result.job.preset,
+            container=result.job.output.suffix.lower() or ".mkv",
+            stage="encode",
+            reason=result.error_message or "unknown",
+        )
+    )
+
+
 def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
     succeeded = [result for result in results if result.success and not result.skipped]
     failed = [result for result in results if not result.success and not result.skipped]
@@ -293,6 +422,8 @@ def _write_batch_reports(
     cleaned_paths: list[Path],
     log_path: Path | None,
     warnings: list[str] | None = None,
+    policy: str | None = None,
+    on_file_failure: str | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -302,7 +433,7 @@ def _write_batch_reports(
     totals = _results_totals(results)
     files = []
     for result in results:
-        status = "skipped" if result.skipped else "success" if result.success else "failed"
+        status = _classify_result_status(result)
         files.append(
             {
                 "source": str(result.job.source),
@@ -350,6 +481,8 @@ def _write_batch_reports(
         "session_path": str(session_path) if session_path is not None else None,
         "totals": totals,
         "warnings": warnings or [],
+        "policy": policy,
+        "on_file_failure": on_file_failure,
         "files": files,
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -366,6 +499,10 @@ def _write_batch_reports(
         f"Cleanup completed: {len(cleaned_paths)}",
         f"Resumed from session: {'yes' if resumed_from_session else 'no'}",
         f"Session path: {session_path}" if session_path is not None else "Session path: -",
+        f"Policy: {policy}" if policy is not None else "Policy: -",
+        f"On file failure: {on_file_failure}"
+        if on_file_failure is not None
+        else "On file failure: -",
         f"Started: {started_at}",
         f"Finished: {finished_at}",
         "",
@@ -390,7 +527,7 @@ def _write_batch_reports(
         ]
     )
     for result in results:
-        status = "SKIPPED" if result.skipped else "OK" if result.success else "FAILED"
+        status = _classify_result_status(result).upper()
         lines.append(f"- {result.job.source.name}: {status}")
         if result.skip_reason:
             lines.append(f"  Reason: {result.skip_reason}")
@@ -586,6 +723,12 @@ app.add_typer(profiles_app, name="profiles")
 console = Console()
 
 
+class EncodeLoopResults(list):
+    def __init__(self, results: list[EncodeResult], *, stopped_early: bool = False) -> None:
+        super().__init__(results)
+        self.stopped_early = stopped_early
+
+
 def _run_encode_loop(
     jobs: list[EncodeJob],
     ffmpeg: Path,
@@ -599,6 +742,8 @@ def _run_encode_loop(
     resumed_from_session: bool = False,
     previously_completed: int = 0,
     previously_skipped: int = 0,
+    on_file_failure: str = "retry",
+    use_calibration: bool = True,
 ) -> list[EncodeResult]:
     if stall_warning_seconds is None:
         stall_warning_seconds = STALL_WARNING_SECONDS
@@ -606,6 +751,7 @@ def _run_encode_loop(
     total_bytes = sum(job.source.stat().st_size for job in to_encode)
     results = []
     bytes_done = 0
+    stopped_early = False
 
     with display.make_progress_bar() as progress:
         overall_task = progress.add_task(
@@ -834,6 +980,21 @@ def _run_encode_loop(
             if stall_thread is not None:
                 stall_thread.join(timeout=1)
 
+            if use_calibration:
+                if result.success and not result.skipped:
+                    _record_success_calibration(result, ffprobe)
+                elif not result.success and not result.skipped:
+                    _record_failure_calibration(result)
+
+            if not result.success and not result.skipped:
+                if on_file_failure == "skip":
+                    result.skipped = True
+                    result.skip_reason = (
+                        f"skipped_by_policy: {result.error_message or 'encode failed'}"
+                    )
+                elif on_file_failure == "stop":
+                    stopped_early = True
+
             # Update session after each file so partial progress is persisted
             if session is not None and session_path is not None:
                 if result.skipped:
@@ -864,6 +1025,8 @@ def _run_encode_loop(
                 bytes_done += file_size
                 progress.update(overall_task, completed=bytes_done)
                 progress.update(file_task, completed=task_total)
+            if stopped_early:
+                break
 
         progress.remove_task(file_task)
 
@@ -873,7 +1036,7 @@ def _run_encode_loop(
         previously_completed=previously_completed,
         previously_skipped=previously_skipped,
     )
-    return results
+    return EncodeLoopResults(results, stopped_early=stopped_early)
 
 
 def _prepare_tools(output_dir: Path | None) -> tuple[Path, Path]:
@@ -897,12 +1060,22 @@ def _analyze_with_optional_progress(
     ffprobe: Path,
     ui_console: Console,
     show_progress: bool,
+    *,
+    preset: str = "fast",
+    crf: int = 20,
+    use_calibration: bool = True,
 ) -> list[AnalysisItem]:
     files = scan_directory(directory, recursive=recursive)
     if not files:
         return []
     if not show_progress:
-        return analyze_files(files, ffprobe)
+        return analyze_files(
+            files,
+            ffprobe,
+            preset=preset,
+            crf=crf,
+            use_calibration=use_calibration,
+        )
 
     from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
@@ -928,7 +1101,14 @@ def _analyze_with_optional_progress(
                 description=f"[dim]Analyzing files (ffprobe + size estimates)...[/dim] [white]{name}[/white]",
             )
 
-        items = analyze_files(files, ffprobe, progress_callback=callback)
+        items = analyze_files(
+            files,
+            ffprobe,
+            progress_callback=callback,
+            preset=preset,
+            crf=crf,
+            use_calibration=use_calibration,
+        )
         progress.update(task, completed=len(files))
         return items
 
@@ -1004,6 +1184,107 @@ def _build_resume_jobs(
         ffprobe=ffprobe,
         no_skip=False,
     )
+
+
+def _prepare_overnight_jobs(
+    *,
+    directory: Path,
+    recursive: bool,
+    output_dir: Path | None,
+    overwrite: bool,
+    no_skip: bool,
+    ffmpeg: Path,
+    ffprobe: Path,
+    policy: str,
+    use_calibration: bool,
+) -> tuple[list[EncodeJob], str, int]:
+    from mediashrink.wizard import (
+        _run_preflight_checks,
+        _sum_item_durations,
+        benchmark_encoder,
+        build_profiles,
+        detect_available_encoders,
+    )
+
+    files = scan_directory(directory, recursive=recursive)
+    if not files:
+        return [], "fast", 20
+    items = analyze_files(files, ffprobe, use_calibration=use_calibration)
+    recommended_items = [item for item in items if item.recommendation == "recommended"]
+    maybe_items = [item for item in items if item.recommendation == "maybe"]
+    selected_items = recommended_items or maybe_items
+    if not selected_items:
+        selected_items = items
+    sample_item = max(selected_items, key=lambda item: item.size_bytes)
+    available_hw = detect_available_encoders(
+        ffmpeg, Console(quiet=True), sample_item.source, ffprobe
+    )
+    benchmark_speeds: dict[str, float | None] = {}
+    for key in list(available_hw) + ["fast", "faster"]:
+        benchmark_speeds[key] = benchmark_encoder(
+            encoder_key=key,
+            sample_file=sample_item.source,
+            sample_duration=sample_item.duration_seconds or 3600.0,
+            crf=20,
+            ffmpeg=ffmpeg,
+        )
+    profiles = build_profiles(
+        available_hw=available_hw,
+        benchmark_speeds=benchmark_speeds,
+        total_media_seconds=_sum_item_durations(selected_items),
+        total_input_bytes=sum(item.size_bytes for item in selected_items),
+        candidate_items=selected_items,
+        ffprobe=ffprobe,
+        policy=policy,
+        use_calibration=use_calibration,
+    )
+    selected_profile = next(
+        (profile for profile in profiles if profile.is_recommended), profiles[0]
+    )
+    jobs = build_jobs(
+        files=[item.source for item in selected_items],
+        output_dir=output_dir,
+        overwrite=overwrite,
+        crf=selected_profile.crf,
+        preset=selected_profile.encoder_key,
+        dry_run=False,
+        ffprobe=ffprobe,
+        no_skip=no_skip,
+    )
+    compatible_jobs, preflight_failures = _run_preflight_checks(
+        [job for job in jobs if not job.skip],
+        ffmpeg,
+        ffprobe,
+        crf=selected_profile.crf,
+        preset=selected_profile.encoder_key,
+        console=Console(quiet=True),
+    )
+    if preflight_failures:
+        incompatible_sources = {job.source for job, _ in preflight_failures}
+        for job in jobs:
+            if job.source in incompatible_sources:
+                job.skip = True
+                job.skip_reason = "incompatible: preflight compatibility check failed"
+        if not compatible_jobs and selected_profile.encoder_key != _FALLBACK_PRESET:
+            jobs = build_jobs(
+                files=[item.source for item in selected_items],
+                output_dir=output_dir,
+                overwrite=overwrite,
+                crf=_FALLBACK_CRF,
+                preset=_FALLBACK_PRESET,
+                dry_run=False,
+                ffprobe=ffprobe,
+                no_skip=no_skip,
+            )
+            selected_profile = next(
+                (
+                    profile
+                    for profile in profiles
+                    if profile.encoder_key == _FALLBACK_PRESET and profile.crf == _FALLBACK_CRF
+                ),
+                selected_profile,
+            )
+    return jobs, selected_profile.encoder_key, selected_profile.crf
 
 
 @app.command("encode", hidden=True)
@@ -1094,6 +1375,26 @@ def encode_cmd(
         "-v",
         help="Write FFmpeg stderr to a log file alongside the output.",
     ),
+    policy: str = typer.Option(
+        "fastest-wall-clock",
+        "--policy",
+        help="Encoder selection policy: fastest-wall-clock, lowest-cpu, best-compression, or highest-confidence.",
+    ),
+    on_file_failure: str = typer.Option(
+        "retry",
+        "--on-file-failure",
+        help="What to do after an unrecovered file failure: skip, retry, or stop.",
+    ),
+    use_calibration: bool = typer.Option(
+        True,
+        "--use-calibration/--no-calibration",
+        help="Use local historical encode results to improve estimates and policy ranking.",
+    ),
+    overnight: bool = typer.Option(
+        False,
+        "--overnight",
+        help="Run unattended with safe overnight defaults: auto-resume, verbose logging, skip failed files, and keep cleanup off.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -1101,6 +1402,21 @@ def encode_cmd(
         help="Warn if FFmpeg produces no progress update for this many seconds.",
     ),
 ) -> None:
+    runtime = _resolve_runtime_settings(
+        overnight=overnight,
+        policy=policy,
+        on_file_failure=on_file_failure,
+        verbose=verbose,
+        cleanup=cleanup,
+        yes=yes,
+        use_calibration=use_calibration,
+    )
+    verbose = bool(runtime["verbose"])
+    cleanup = bool(runtime["cleanup"])
+    yes = bool(runtime["yes"])
+    use_calibration = bool(runtime["use_calibration"])
+    on_file_failure = str(runtime["on_file_failure"])
+    policy = str(runtime["policy"])
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
@@ -1139,8 +1455,11 @@ def encode_cmd(
             )
             console.print(f"[dim]Session path:[/dim] {get_session_path(directory, output_dir)}")
             if done:
-                console.print("Resume from the last completed file? [Y/n] ", end="")
-                if typer.confirm("", default=True):
+                should_resume = overnight or typer.confirm(
+                    "Resume from the last completed file?",
+                    default=True,
+                )
+                if should_resume:
                     resumed_from_session = True
                     for job in jobs:
                         if str(job.source) in done:
@@ -1177,7 +1496,15 @@ def encode_cmd(
             active_session = prior
         else:
             active_session = build_session(
-                directory, effective_preset, effective_crf, overwrite, output_dir, jobs
+                directory,
+                effective_preset,
+                effective_crf,
+                overwrite,
+                output_dir,
+                jobs,
+                policy=policy,
+                on_file_failure=on_file_failure,
+                use_calibration=use_calibration,
             )
         save_session(active_session, session_path)
 
@@ -1192,18 +1519,22 @@ def encode_cmd(
         prior if resumed_from_session else None
     )
 
-    results = _run_encode_loop(
-        jobs,
-        ffmpeg,
-        ffprobe,
-        display,
-        session=active_session,
-        session_path=session_path,
-        log_path=log_path,
-        stall_warning_seconds=float(stall_warning_seconds),
-        resumed_from_session=resumed_from_session,
-        previously_completed=resume_completed,
-        previously_skipped=resume_skipped,
+    results, stopped_early = _normalize_loop_result(
+        _run_encode_loop(
+            jobs,
+            ffmpeg,
+            ffprobe,
+            display,
+            session=active_session,
+            session_path=session_path,
+            log_path=log_path,
+            stall_warning_seconds=float(stall_warning_seconds),
+            resumed_from_session=resumed_from_session,
+            previously_completed=resume_completed,
+            previously_skipped=resume_skipped,
+            on_file_failure=on_file_failure,
+            use_calibration=use_calibration,
+        )
     )
     cleaned_paths: list[Path] = []
     if cleanup:
@@ -1230,11 +1561,13 @@ def encode_cmd(
             cleaned_paths=cleaned_paths,
             log_path=log_path,
             warnings=preflight_warnings,
+            policy=policy,
+            on_file_failure=on_file_failure,
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
-    has_failures = any(not r.success and not r.skipped for r in results)
+    has_failures = any(not r.success and not r.skipped for r in results) or stopped_early
     exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
     if json_output:
         print(_results_to_json(results, exit_code))
@@ -1288,6 +1621,11 @@ def analyze(
         "--json",
         help="Emit analysis results as a JSON blob instead of Rich terminal output.",
     ),
+    use_calibration: bool = typer.Option(
+        True,
+        "--use-calibration/--no-calibration",
+        help="Use local historical encode results to improve estimates.",
+    ),
 ) -> None:
     quiet_console = Console(quiet=True) if json_output else console
     ffmpeg, ffprobe = _prepare_tools(None)
@@ -1299,6 +1637,9 @@ def analyze(
         ffprobe=ffprobe,
         ui_console=quiet_console,
         show_progress=not json_output,
+        preset=effective_preset,
+        crf=effective_crf,
+        use_calibration=use_calibration,
     )
     if not items:
         if json_output:
@@ -1314,6 +1655,7 @@ def analyze(
         preset=effective_preset,
         crf=effective_crf,
         ffmpeg=ffmpeg,
+        use_calibration=use_calibration,
     )
     estimate_confidence = estimate_analysis_confidence(items)
     estimate_confidence_detail = describe_estimate_confidence(items)
@@ -1404,6 +1746,21 @@ def apply(
         "--cleanup",
         help="After successful side-by-side encodes, delete originals and rename outputs back to the original filenames.",
     ),
+    policy: str = typer.Option(
+        "fastest-wall-clock",
+        "--policy",
+        help="Encoder policy metadata recorded with the run.",
+    ),
+    on_file_failure: str = typer.Option(
+        "retry",
+        "--on-file-failure",
+        help="What to do after an unrecovered file failure: skip, retry, or stop.",
+    ),
+    use_calibration: bool = typer.Option(
+        True,
+        "--use-calibration/--no-calibration",
+        help="Use local historical encode results to improve estimates and policy ranking.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -1460,12 +1817,16 @@ def apply(
         console.print("[dim]Aborted.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
-    results = _run_encode_loop(
-        jobs,
-        ffmpeg,
-        ffprobe,
-        display,
-        stall_warning_seconds=float(stall_warning_seconds),
+    results, stopped_early = _normalize_loop_result(
+        _run_encode_loop(
+            jobs,
+            ffmpeg,
+            ffprobe,
+            display,
+            stall_warning_seconds=float(stall_warning_seconds),
+            on_file_failure=_validate_failure_policy(on_file_failure),
+            use_calibration=use_calibration,
+        )
     )
     cleaned_paths: list[Path] = []
     if cleanup:
@@ -1490,10 +1851,12 @@ def apply(
         cleaned_paths=cleaned_paths,
         log_path=None,
         warnings=preflight_warnings,
+        policy=_validate_policy(policy),
+        on_file_failure=on_file_failure,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
-    if any(not r.success and not r.skipped for r in results):
+    if stopped_early or any(not r.success and not r.skipped for r in results):
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 
@@ -1542,6 +1905,21 @@ def wizard(
         "--auto",
         help="Non-interactive mode: auto-select the recommended profile, skip all prompts.",
     ),
+    policy: str = typer.Option(
+        "fastest-wall-clock",
+        "--policy",
+        help="Encoder recommendation policy: fastest-wall-clock, lowest-cpu, best-compression, or highest-confidence.",
+    ),
+    on_file_failure: str = typer.Option(
+        "retry",
+        "--on-file-failure",
+        help="What to do after an unrecovered file failure: skip, retry, or stop.",
+    ),
+    use_calibration: bool = typer.Option(
+        True,
+        "--use-calibration/--no-calibration",
+        help="Use local historical encode results to improve estimates and recommendations.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -1567,6 +1945,9 @@ def wizard(
         no_skip=no_skip,
         console=quiet_console,
         auto=auto,
+        policy=_validate_policy(policy),
+        on_file_failure=_validate_failure_policy(on_file_failure),
+        use_calibration=use_calibration,
     )
 
     if action == "cancel":
@@ -1588,12 +1969,16 @@ def wizard(
         assume_yes=auto,
     )
 
-    results = _run_encode_loop(
-        jobs,
-        ffmpeg,
-        ffprobe,
-        display,
-        stall_warning_seconds=float(stall_warning_seconds),
+    results, stopped_early = _normalize_loop_result(
+        _run_encode_loop(
+            jobs,
+            ffmpeg,
+            ffprobe,
+            display,
+            stall_warning_seconds=float(stall_warning_seconds),
+            on_file_failure=on_file_failure,
+            use_calibration=use_calibration,
+        )
     )
     cleaned_paths: list[Path] = []
     if wizard_cleanup:
@@ -1618,11 +2003,13 @@ def wizard(
         cleaned_paths=cleaned_paths,
         log_path=None,
         warnings=preflight_warnings,
+        policy=policy,
+        on_file_failure=on_file_failure,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
-    has_failures = any(not r.success and not r.skipped for r in results)
+    has_failures = any(not r.success and not r.skipped for r in results) or stopped_early
     exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
     if json_output:
         print(_results_to_json(results, exit_code))
@@ -1667,6 +2054,21 @@ def resume(
         "--verbose",
         "-v",
         help="Write FFmpeg stderr to a log file alongside the output.",
+    ),
+    policy: str = typer.Option(
+        "fastest-wall-clock",
+        "--policy",
+        help="Encoder policy metadata recorded with the resumed run.",
+    ),
+    on_file_failure: str = typer.Option(
+        "retry",
+        "--on-file-failure",
+        help="What to do after an unrecovered file failure: skip, retry, or stop.",
+    ),
+    use_calibration: bool = typer.Option(
+        True,
+        "--use-calibration/--no-calibration",
+        help="Use local historical encode results during resumed runs.",
     ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
@@ -1735,18 +2137,22 @@ def resume(
 
     resume_completed, resume_skipped = _resume_summary_counts(session)
 
-    results = _run_encode_loop(
-        jobs,
-        ffmpeg,
-        ffprobe,
-        display,
-        session=session,
-        session_path=session_path,
-        log_path=log_path,
-        stall_warning_seconds=float(stall_warning_seconds),
-        resumed_from_session=True,
-        previously_completed=resume_completed,
-        previously_skipped=resume_skipped,
+    results, stopped_early = _normalize_loop_result(
+        _run_encode_loop(
+            jobs,
+            ffmpeg,
+            ffprobe,
+            display,
+            session=session,
+            session_path=session_path,
+            log_path=log_path,
+            stall_warning_seconds=float(stall_warning_seconds),
+            resumed_from_session=True,
+            previously_completed=resume_completed,
+            previously_skipped=resume_skipped,
+            on_file_failure=_validate_failure_policy(on_file_failure),
+            use_calibration=use_calibration,
+        )
     )
     cleaned_paths: list[Path] = []
     if cleanup:
@@ -1772,15 +2178,172 @@ def resume(
         cleaned_paths=cleaned_paths,
         log_path=log_path,
         warnings=preflight_warnings,
+        policy=_validate_policy(policy),
+        on_file_failure=on_file_failure,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
-    has_failures = any(not r.success and not r.skipped for r in results)
+    has_failures = any(not r.success and not r.skipped for r in results) or stopped_early
     exit_code = EXIT_ENCODE_FAILURES if has_failures else EXIT_SUCCESS
     if json_output:
         print(_results_to_json(results, exit_code))
     if has_failures:
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+
+
+@app.command()
+def overnight(
+    directory: Path = typer.Argument(
+        ...,
+        help=f"Directory containing supported video files ({supported_formats_label()}) to compress overnight.",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Write output files here instead of alongside originals.",
+    ),
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Replace original files after successful encoding.",
+    ),
+    recursive: bool = typer.Option(
+        True,
+        "--recursive/--no-recursive",
+        "-r/-R",
+        help="Scan subdirectories for supported files.",
+    ),
+    no_skip: bool = typer.Option(
+        False,
+        "--no-skip",
+        help="Encode files even if they appear to already be H.265.",
+    ),
+    policy: str = typer.Option(
+        "highest-confidence",
+        "--policy",
+        help="Encoder selection policy: fastest-wall-clock, lowest-cpu, best-compression, or highest-confidence.",
+    ),
+    use_calibration: bool = typer.Option(
+        True,
+        "--use-calibration/--no-calibration",
+        help="Use local historical encode results to improve estimates and profile ranking.",
+    ),
+    stall_warning_seconds: int = typer.Option(
+        int(STALL_WARNING_SECONDS),
+        "--stall-warning-seconds",
+        min=1,
+        help="Warn if FFmpeg produces no progress update for this many seconds.",
+    ),
+) -> None:
+    ffmpeg, ffprobe = _prepare_tools(output_dir)
+    started_at = _now_iso()
+    display = EncodingDisplay(console)
+    policy = _validate_policy(policy)
+    jobs, effective_preset, effective_crf = _prepare_overnight_jobs(
+        directory=directory,
+        recursive=recursive,
+        output_dir=output_dir,
+        overwrite=overwrite,
+        no_skip=no_skip,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        policy=policy,
+        use_calibration=use_calibration,
+    )
+    if not jobs:
+        console.print(
+            f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
+        )
+        raise typer.Exit(code=EXIT_NO_FILES)
+
+    prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
+    resumed_from_session = False
+    if prior is not None:
+        done = {e.source for e in prior.entries if e.status == "success"}
+        for job in jobs:
+            if str(job.source) in done:
+                job.skip = True
+                job.skip_reason = "resumed (already done)"
+        _reconcile_session_with_jobs(prior, jobs)
+        resumed_from_session = True
+
+    session_path = get_session_path(directory, output_dir)
+    session = (
+        prior
+        if resumed_from_session and prior is not None
+        else build_session(
+            directory,
+            effective_preset,
+            effective_crf,
+            overwrite,
+            output_dir,
+            jobs,
+            policy=policy,
+            on_file_failure="skip",
+            use_calibration=use_calibration,
+        )
+    )
+    save_session(session, session_path)
+    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    _print_safe_interrupt_guidance()
+    _print_preflight_warnings(preflight_warnings)
+    _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = output_dir if output_dir is not None else directory
+    log_path = log_dir / f"mediashrink_{timestamp}.log"
+    console.print(f"[dim]Overnight mode:[/dim] policy={policy}, on-file-failure=skip")
+    console.print(f"[dim]Verbose log:[/dim] {log_path}")
+
+    resume_completed, resume_skipped = _resume_summary_counts(
+        session if resumed_from_session else None
+    )
+    results, stopped_early = _normalize_loop_result(
+        _run_encode_loop(
+            jobs,
+            ffmpeg,
+            ffprobe,
+            display,
+            session=session,
+            session_path=session_path,
+            log_path=log_path,
+            stall_warning_seconds=float(stall_warning_seconds),
+            resumed_from_session=resumed_from_session,
+            previously_completed=resume_completed,
+            previously_skipped=resume_skipped,
+            on_file_failure="skip",
+            use_calibration=use_calibration,
+        )
+    )
+    _record_cleanup_results(session, session_path, results, [])
+    json_report, text_report = _write_batch_reports(
+        mode="overnight",
+        base_dir=directory,
+        output_dir=output_dir,
+        manifest_path=None,
+        preset=effective_preset,
+        crf=effective_crf,
+        overwrite=overwrite,
+        cleanup_requested=False,
+        resumed_from_session=resumed_from_session,
+        session_path=session_path,
+        started_at=started_at,
+        finished_at=_now_iso(),
+        results=results,
+        cleaned_paths=[],
+        log_path=log_path,
+        warnings=preflight_warnings,
+        policy=policy,
+        on_file_failure="skip",
+    )
+    console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
+    if stopped_early or any(not r.success and not r.skipped for r in results):
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
 

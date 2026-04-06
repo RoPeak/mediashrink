@@ -22,10 +22,12 @@ from mediashrink.analysis import (
     save_manifest,
     select_representative_items,
 )
+from mediashrink.calibration import estimate_failure_rate, load_calibration_store
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import (
     _HW_ENCODERS,
     encode_preview,
+    estimate_output_size,
     get_duration_seconds,
     preflight_encode_job,
     probe_encoder_available,
@@ -127,7 +129,50 @@ def _is_profile_dominated(profile: EncoderProfile, peers: list[EncoderProfile]) 
     return False
 
 
-def _select_recommended_profile(profiles: list[EncoderProfile]) -> EncoderProfile | None:
+def _policy_sort_key(
+    profile: EncoderProfile,
+    *,
+    policy: str,
+    failure_rate: float,
+) -> tuple[float, ...]:
+    hardware_bias = 0.0 if profile.encoder_key in _HW_ENCODERS else 1.0
+    quality_bias = float(_quality_rank(profile.quality_label) * -1)
+    if policy == "best-compression":
+        return (
+            float(profile.estimated_output_bytes),
+            quality_bias,
+            float(profile.estimated_encode_seconds),
+            failure_rate,
+        )
+    if policy == "lowest-cpu":
+        return (
+            hardware_bias,
+            failure_rate,
+            float(profile.estimated_encode_seconds),
+            float(profile.estimated_output_bytes),
+        )
+    if policy == "highest-confidence":
+        return (
+            failure_rate,
+            hardware_bias,
+            float(profile.estimated_encode_seconds),
+            quality_bias,
+            float(profile.estimated_output_bytes),
+        )
+    return (
+        float(profile.estimated_encode_seconds),
+        failure_rate,
+        quality_bias,
+        float(profile.estimated_output_bytes),
+    )
+
+
+def _select_recommended_profile(
+    profiles: list[EncoderProfile],
+    *,
+    policy: str = "fastest-wall-clock",
+    failure_rates: dict[str, float] | None = None,
+) -> EncoderProfile | None:
     candidates = [
         profile
         for profile in profiles
@@ -139,10 +184,10 @@ def _select_recommended_profile(profiles: list[EncoderProfile]) -> EncoderProfil
         return None
     return min(
         candidates,
-        key=lambda profile: (
-            profile.estimated_encode_seconds,
-            _quality_rank(profile.quality_label) * -1,
-            profile.estimated_output_bytes,
+        key=lambda profile: _policy_sort_key(
+            profile,
+            policy=policy,
+            failure_rate=(failure_rates or {}).get(profile.encoder_key, 0.0),
         ),
     )
 
@@ -340,9 +385,37 @@ def build_profiles(
     benchmark_speeds: dict[str, float | None],
     total_media_seconds: float,
     total_input_bytes: int,
+    *,
+    candidate_items: list[AnalysisItem] | None = None,
+    ffprobe: Path | None = None,
+    policy: str = "fastest-wall-clock",
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
 ) -> list[EncoderProfile]:
     profiles: list[EncoderProfile] = []
     idx = 1
+    active_calibration = (
+        load_calibration_store()
+        if use_calibration and calibration_store is None
+        else calibration_store
+    )
+
+    def estimated_output_bytes_for(crf: int, preset: str) -> int:
+        if not candidate_items or ffprobe is None:
+            return _estimate_output_bytes(total_input_bytes, crf)
+        total = 0
+        for item in candidate_items:
+            estimated = estimate_output_size(
+                item.source,
+                ffprobe,
+                codec=item.codec,
+                crf=crf,
+                preset=preset,
+                use_calibration=use_calibration,
+                calibration_store=active_calibration,
+            )
+            total += estimated if estimated > 0 else item.estimated_output_bytes
+        return total
 
     hardware_profiles: list[tuple[str, float | None]] = [
         (key, benchmark_speeds.get(key)) for key in ("qsv", "nvenc", "amf") if key in available_hw
@@ -358,7 +431,7 @@ def build_profiles(
                 encoder_key=key,
                 crf=20,
                 sw_preset=None,
-                estimated_output_bytes=_estimate_output_bytes(total_input_bytes, 20),
+                estimated_output_bytes=estimated_output_bytes_for(20, key),
                 estimated_encode_seconds=_estimate_time(total_media_seconds, speed),
                 quality_label="Good",
                 is_recommended=False,
@@ -377,7 +450,7 @@ def build_profiles(
             encoder_key="faster",
             crf=22,
             sw_preset="faster",
-            estimated_output_bytes=_estimate_output_bytes(total_input_bytes, 22),
+            estimated_output_bytes=estimated_output_bytes_for(22, "faster"),
             estimated_encode_seconds=_estimate_time(total_media_seconds, faster_speed),
             quality_label="Very good",
             is_recommended=False,
@@ -394,7 +467,7 @@ def build_profiles(
             encoder_key="fast",
             crf=20,
             sw_preset="fast",
-            estimated_output_bytes=_estimate_output_bytes(total_input_bytes, 20),
+            estimated_output_bytes=estimated_output_bytes_for(20, "fast"),
             estimated_encode_seconds=_estimate_time(total_media_seconds, fast_speed),
             quality_label="Excellent",
             is_recommended=False,
@@ -412,7 +485,7 @@ def build_profiles(
             encoder_key="slow",
             crf=18,
             sw_preset="slow",
-            estimated_output_bytes=_estimate_output_bytes(total_input_bytes, 18),
+            estimated_output_bytes=estimated_output_bytes_for(18, "slow"),
             estimated_encode_seconds=_estimate_time(total_media_seconds, slow_speed),
             quality_label="Visually lossless",
             is_recommended=False,
@@ -429,7 +502,7 @@ def build_profiles(
             encoder_key="slow",
             crf=28,
             sw_preset="slow",
-            estimated_output_bytes=_estimate_output_bytes(total_input_bytes, 28),
+            estimated_output_bytes=estimated_output_bytes_for(28, "slow"),
             estimated_encode_seconds=_estimate_time(total_media_seconds, slow_speed),
             quality_label="Good",
             is_recommended=False,
@@ -477,7 +550,7 @@ def build_profiles(
                 encoder_key=encoder_key,
                 crf=bp.crf,
                 sw_preset=sw_preset,
-                estimated_output_bytes=_estimate_output_bytes(total_input_bytes, bp.crf),
+                estimated_output_bytes=estimated_output_bytes_for(bp.crf, encoder_key),
                 estimated_encode_seconds=_estimate_time(total_media_seconds, speed),
                 quality_label=_BUILTIN_QUALITY_LABELS.get(bp.name, "Good"),
                 is_recommended=False,
@@ -504,6 +577,16 @@ def build_profiles(
         )
     )
 
+    failure_rates = {
+        profile.encoder_key: estimate_failure_rate(
+            active_calibration,
+            preset=profile.encoder_key,
+            container=(candidate_items[0].source.suffix.lower() if candidate_items else ".mkv"),
+        )
+        for profile in profiles
+        if not profile.is_custom
+    }
+
     if hardware_profiles:
         timed_profiles = [
             profile
@@ -525,7 +608,11 @@ def build_profiles(
         )
         if hw_primary is not None and hw_primary is fastest_overall:
             hw_primary.name = "Fastest on this device"
-        recommended = _select_recommended_profile(profiles)
+        recommended = _select_recommended_profile(
+            profiles,
+            policy=policy,
+            failure_rates=failure_rates,
+        )
         if recommended is not None:
             recommended.is_recommended = True
         elif hw_primary is not None:
@@ -535,7 +622,11 @@ def build_profiles(
         if balanced is not None and not _is_profile_dominated(balanced, profiles):
             balanced.is_recommended = True
         else:
-            recommended = _select_recommended_profile(profiles)
+            recommended = _select_recommended_profile(
+                profiles,
+                policy=policy,
+                failure_rates=failure_rates,
+            )
             if recommended is not None:
                 recommended.is_recommended = True
 
@@ -938,6 +1029,10 @@ def _run_analysis_with_progress(
     files: list[Path],
     ffprobe: Path,
     console: Console,
+    *,
+    preset: str = "fast",
+    crf: int = 20,
+    use_calibration: bool = True,
 ) -> list[AnalysisItem]:
     if not files:
         return []
@@ -964,7 +1059,14 @@ def _run_analysis_with_progress(
                 description=f"[dim]Analyzing files (ffprobe + size estimates)...[/dim] [white]{name}[/white]",
             )
 
-        items = analyze_files(files, ffprobe, progress_callback=callback)
+        items = analyze_files(
+            files,
+            ffprobe,
+            progress_callback=callback,
+            preset=preset,
+            crf=crf,
+            use_calibration=use_calibration,
+        )
         progress.update(task, completed=len(files))
         return items
 
@@ -1039,6 +1141,9 @@ def run_wizard(
     no_skip: bool,
     console: Console,
     auto: bool = False,
+    policy: str = "fastest-wall-clock",
+    on_file_failure: str = "retry",
+    use_calibration: bool = True,
 ) -> tuple[list[EncodeJob], str, bool]:
     """Run the interactive wizard and return (jobs, action)."""
     console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
@@ -1057,7 +1162,12 @@ def run_wizard(
         f"([yellow]{_fmt_size(total_input_bytes)}[/yellow] total)\n"
     )
 
-    analysis_items = _run_analysis_with_progress(files, ffprobe, console)
+    analysis_items = _run_analysis_with_progress(
+        files,
+        ffprobe,
+        console,
+        use_calibration=use_calibration,
+    )
     initial_confidence = estimate_analysis_confidence(analysis_items)
     display_analysis_summary(
         analysis_items,
@@ -1118,6 +1228,10 @@ def run_wizard(
         benchmark_speeds=benchmark_speeds,
         total_media_seconds=candidate_media_seconds,
         total_input_bytes=candidate_input_bytes,
+        candidate_items=candidate_items,
+        ffprobe=ffprobe,
+        policy=policy,
+        use_calibration=use_calibration,
     )
     profile_estimate_confidence = estimate_analysis_confidence(candidate_items, benchmarked_files=1)
     display_profiles_table(
@@ -1262,7 +1376,11 @@ def run_wizard(
                 f"Skip {len(preflight_failures)} incompatible file(s) and continue with "
                 f"{len(compatible_jobs)} compatible file(s)?"
             )
-            if auto or typer.confirm(skip_prompt, default=skip_default):
+            if (
+                on_file_failure == "skip"
+                or auto
+                or typer.confirm(skip_prompt, default=skip_default)
+            ):
                 selected_items = [
                     item for item in selected_items if item.source in compatible_sources
                 ]
@@ -1283,10 +1401,14 @@ def run_wizard(
         fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = (
             _DEFAULT_FALLBACK_PROFILE
         )
-        if preset != fallback_preset and typer.confirm(
-            f"Switch to {fallback_label} (libx265, CRF {fallback_crf}) and retry?",
-            default=True,
-        ):
+        should_try_fallback = on_file_failure != "stop" and (
+            auto
+            or typer.confirm(
+                f"Switch to {fallback_label} (libx265, CRF {fallback_crf}) and retry?",
+                default=True,
+            )
+        )
+        if preset != fallback_preset and should_try_fallback:
             fallback_jobs = build_jobs(
                 files=[item.source for item in selected_items],
                 output_dir=output_dir,
@@ -1324,9 +1446,13 @@ def run_wizard(
                 break
             if fallback_compatible and len(fallback_compatible) < len(fallback_to_encode):
                 fallback_sources = {job.source for job in fallback_compatible}
-                if auto or typer.confirm(
-                    f"Skip {len(fallback_failures)} incompatible file(s) and continue with {len(fallback_compatible)} compatible file(s) using {fallback_label}?",
-                    default=True,
+                if (
+                    on_file_failure == "skip"
+                    or auto
+                    or typer.confirm(
+                        f"Skip {len(fallback_failures)} incompatible file(s) and continue with {len(fallback_compatible)} compatible file(s) using {fallback_label}?",
+                        default=True,
+                    )
                 ):
                     selected_items = [
                         item for item in selected_items if item.source in fallback_sources
@@ -1357,6 +1483,9 @@ def run_wizard(
                     console.print(
                         f"[red]{failed_job.source.name}:[/red] {fallback_result.error_message}"
                     )
+
+        if on_file_failure == "stop":
+            return [], "cancel", False
 
         console.print(
             "[dim]Choose another profile. Software profiles are the safest fallback when hardware encoding is not compatible with the selected files.[/dim]"

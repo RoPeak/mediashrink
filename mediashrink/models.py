@@ -262,6 +262,9 @@ class SessionManifest:
     overwrite: bool
     output_dir: str | None
     entries: list[SessionFileEntry]
+    policy: str | None = None
+    on_file_failure: str | None = None
+    use_calibration: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -273,6 +276,9 @@ class SessionManifest:
             "overwrite": self.overwrite,
             "output_dir": self.output_dir,
             "entries": [e.to_dict() for e in self.entries],
+            "policy": self.policy,
+            "on_file_failure": self.on_file_failure,
+            "use_calibration": self.use_calibration,
         }
 
     @classmethod
@@ -299,6 +305,11 @@ class SessionManifest:
             overwrite=bool(raw.get("overwrite", False)),
             output_dir=output_dir if isinstance(output_dir, str) else None,
             entries=[SessionFileEntry.from_dict(e) for e in raw_entries],
+            policy=raw.get("policy") if isinstance(raw.get("policy"), str) else None,
+            on_file_failure=(
+                raw.get("on_file_failure") if isinstance(raw.get("on_file_failure"), str) else None
+            ),
+            use_calibration=bool(raw.get("use_calibration", True)),
         )
 
 

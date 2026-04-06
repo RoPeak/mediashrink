@@ -7,6 +7,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
+from mediashrink.calibration import load_calibration_store, lookup_estimate
 from mediashrink.encoder import estimate_output_size, get_duration_seconds, get_video_bitrate_kbps
 from mediashrink.models import AnalysisItem, AnalysisManifest
 from mediashrink.scanner import is_already_compressed, probe_video_codec, scan_directory
@@ -39,13 +40,33 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
-def build_analysis_item(path: Path, ffprobe: Path) -> AnalysisItem:
+def build_analysis_item(
+    path: Path,
+    ffprobe: Path,
+    *,
+    preset: str = "fast",
+    crf: int = 20,
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> AnalysisItem:
     codec = probe_video_codec(path, ffprobe)
     skip, skip_reason = is_already_compressed(path, ffprobe, codec=codec)
     size_bytes = path.stat().st_size
     duration_seconds = get_duration_seconds(path, ffprobe)
     bitrate_kbps = get_video_bitrate_kbps(path, ffprobe)
-    estimated_output_bytes = 0 if skip else estimate_output_size(path, ffprobe)
+    estimated_output_bytes = (
+        0
+        if skip
+        else estimate_output_size(
+            path,
+            ffprobe,
+            codec=codec,
+            crf=crf,
+            preset=preset,
+            use_calibration=use_calibration,
+            calibration_store=calibration_store,
+        )
+    )
     estimated_savings_bytes = (
         max(size_bytes - estimated_output_bytes, 0) if estimated_output_bytes > 0 else 0
     )
@@ -129,19 +150,44 @@ def analyze_files(
     files: list[Path],
     ffprobe: Path,
     progress_callback: Callable[[int, int, Path], None] | None = None,
+    *,
+    preset: str = "fast",
+    crf: int = 20,
+    use_calibration: bool = True,
 ) -> list[AnalysisItem]:
     items: list[AnalysisItem] = []
     total = len(files)
+    calibration_store = load_calibration_store() if use_calibration else None
     for index, path in enumerate(files, start=1):
-        items.append(build_analysis_item(path, ffprobe))
+        try:
+            item = build_analysis_item(
+                path,
+                ffprobe,
+                preset=preset,
+                crf=crf,
+                use_calibration=use_calibration,
+                calibration_store=calibration_store,
+            )
+        except TypeError:
+            # Some tests patch build_analysis_item with the older 2-arg signature.
+            item = build_analysis_item(path, ffprobe)
+        items.append(item)
         if progress_callback is not None:
             progress_callback(index, total, path)
     return items
 
 
-def analyze_directory(directory: Path, recursive: bool, ffprobe: Path) -> list[AnalysisItem]:
+def analyze_directory(
+    directory: Path,
+    recursive: bool,
+    ffprobe: Path,
+    *,
+    preset: str = "fast",
+    crf: int = 20,
+    use_calibration: bool = True,
+) -> list[AnalysisItem]:
     files = scan_directory(directory, recursive=recursive)
-    return analyze_files(files, ffprobe)
+    return analyze_files(files, ffprobe, preset=preset, crf=crf, use_calibration=use_calibration)
 
 
 def estimate_analysis_encode_seconds(
@@ -150,6 +196,9 @@ def estimate_analysis_encode_seconds(
     crf: int,
     ffmpeg: Path,
     known_speed: float | None = None,
+    *,
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
 ) -> float | None:
     recommended = [item for item in items if item.recommendation == "recommended"]
     if not recommended:
@@ -159,6 +208,26 @@ def estimate_analysis_encode_seconds(
     if known_speed is not None and known_speed > 0:
         speed = known_speed
     else:
+        if use_calibration and recommended:
+            active_store = (
+                calibration_store if calibration_store is not None else load_calibration_store()
+            )
+            sample = recommended[0]
+            lookup = lookup_estimate(
+                active_store,
+                codec=sample.codec,
+                resolution="unknown",
+                bitrate="unknown",
+                preset=preset,
+                container=sample.source.suffix.lower() or ".mkv",
+            )
+            if lookup is not None and lookup.speed is not None and lookup.speed > 0:
+                speed = lookup.speed
+            else:
+                speed = None
+        else:
+            speed = None
+    if speed is None:
         from mediashrink.wizard import benchmark_encoder
 
         sample = recommended[0]
