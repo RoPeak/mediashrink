@@ -43,6 +43,7 @@ from mediashrink.encoder import (
     get_video_resolution,
     is_hardware_preset,
     output_drops_subtitles,
+    preflight_encode_job,
     source_has_subtitle_streams,
 )
 from mediashrink.models import (
@@ -314,6 +315,64 @@ def _collect_preflight_warnings(jobs: list[EncodeJob], ffprobe: Path) -> list[st
             warning += f" Examples: {', '.join(subtitle_examples)}."
         warnings.append(warning)
     return warnings
+
+
+def _classify_incompatible_reason(message: str | None, job: EncodeJob) -> str:
+    lowered = (message or "").lower()
+    if "could not write header" in lowered and "invalid argument" in lowered:
+        return "unsupported container/stream combination"
+    if "attachment" in lowered or "data" in lowered:
+        return "incompatible stream layout"
+    if job.output.suffix.lower() in {".mp4", ".m4v"}:
+        return "unsupported container/stream combination"
+    if is_hardware_preset(job.preset) and "invalid argument" in lowered:
+        return "encoder/container combination historically unreliable"
+    return "incompatible stream layout"
+
+
+def _preflight_candidates(jobs: list[EncodeJob]) -> list[EncodeJob]:
+    return [
+        job
+        for job in jobs
+        if not job.skip and (job.output.suffix.lower() != ".mkv" or is_hardware_preset(job.preset))
+    ]
+
+
+def _apply_batch_preflight_policy(
+    jobs: list[EncodeJob],
+    *,
+    ffmpeg: Path,
+    ffprobe: Path,
+    on_file_failure: str,
+) -> tuple[list[EncodeJob], list[str], list[str]]:
+    candidates = _preflight_candidates(jobs)
+    if not candidates:
+        return jobs, [], []
+
+    warnings: list[str] = []
+    skipped: list[str] = []
+    stop_errors: list[str] = []
+    for job in candidates:
+        result = preflight_encode_job(
+            job.source,
+            ffmpeg,
+            ffprobe,
+            crf=job.crf,
+            preset=job.preset,
+        )
+        if result.success:
+            continue
+        reason = _classify_incompatible_reason(result.error_message, job)
+        detail = f"{job.source.name}: {reason}"
+        if on_file_failure == "skip":
+            job.skip = True
+            job.skip_reason = f"incompatible: {reason}"
+            skipped.append(detail)
+        elif on_file_failure == "stop":
+            stop_errors.append(detail)
+        else:
+            warnings.append(detail)
+    return jobs, warnings, skipped or stop_errors
 
 
 def _print_preflight_warnings(warnings: list[str]) -> None:
@@ -698,6 +757,30 @@ def _resume_summary_counts(session: SessionManifest | None) -> tuple[int, int]:
     completed = sum(1 for entry in session.entries if entry.status == "success")
     skipped = sum(1 for entry in session.entries if entry.status == "skipped")
     return completed, skipped
+
+
+def _build_skipped_results(jobs: list[EncodeJob]) -> list[EncodeResult]:
+    results: list[EncodeResult] = []
+    for job in jobs:
+        if not job.skip:
+            continue
+        input_size = job.source.stat().st_size if job.source.exists() else 0
+        results.append(
+            EncodeResult(
+                job=job,
+                skipped=True,
+                skip_reason=job.skip_reason,
+                success=False,
+                input_size_bytes=input_size,
+                output_size_bytes=0,
+                duration_seconds=0.0,
+            )
+        )
+    return results
+
+
+def _has_incompatible_skips(jobs: list[EncodeJob]) -> bool:
+    return any((job.skip_reason or "").startswith("incompatible:") for job in jobs if job.skip)
 
 
 class DefaultCommandGroup(TyperGroup):
@@ -1469,13 +1552,38 @@ def encode_cmd(
 
     display.show_scan_table(jobs)
 
+    if not dry_run:
+        jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
+            jobs,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            on_file_failure=on_file_failure,
+        )
+        if preflight_notes:
+            for note in preflight_notes:
+                console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+        if incompatible and on_file_failure == "skip":
+            console.print(
+                f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
+            )
+        if incompatible and on_file_failure == "stop":
+            for note in incompatible:
+                console.print(f"[red]Compatibility check failed:[/red] {note}")
+            raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
-        console.print("[dim]Nothing to encode.[/dim]")
-        raise typer.Exit(code=EXIT_USER_CANCELLED)
+        results = _build_skipped_results(jobs)
+        if not results or not _has_incompatible_skips(jobs):
+            console.print("[dim]Nothing to encode.[/dim]")
+            raise typer.Exit(code=EXIT_USER_CANCELLED)
+        console.print("[dim]All remaining files were skipped before encode start.[/dim]")
+        stopped_early = False
+    else:
+        stopped_early = False
     preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
 
-    if not dry_run and not yes:
+    if to_encode and not dry_run and not yes:
         if not json_output:
             _print_safe_interrupt_guidance()
             _print_preflight_warnings(preflight_warnings)
@@ -1483,11 +1591,13 @@ def encode_cmd(
         if not display.confirm_proceed(len(to_encode)):
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(code=EXIT_USER_CANCELLED)
-    elif not dry_run:
+    elif to_encode and not dry_run:
         if not json_output:
             _print_safe_interrupt_guidance()
             _print_preflight_warnings(preflight_warnings)
         _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=True)
+    elif not dry_run and not json_output:
+        _print_preflight_warnings(preflight_warnings)
 
     session_path = get_session_path(directory, output_dir) if not dry_run else None
     active_session = None
@@ -1519,23 +1629,24 @@ def encode_cmd(
         prior if resumed_from_session else None
     )
 
-    results, stopped_early = _normalize_loop_result(
-        _run_encode_loop(
-            jobs,
-            ffmpeg,
-            ffprobe,
-            display,
-            session=active_session,
-            session_path=session_path,
-            log_path=log_path,
-            stall_warning_seconds=float(stall_warning_seconds),
-            resumed_from_session=resumed_from_session,
-            previously_completed=resume_completed,
-            previously_skipped=resume_skipped,
-            on_file_failure=on_file_failure,
-            use_calibration=use_calibration,
+    if to_encode:
+        results, stopped_early = _normalize_loop_result(
+            _run_encode_loop(
+                jobs,
+                ffmpeg,
+                ffprobe,
+                display,
+                session=active_session,
+                session_path=session_path,
+                log_path=log_path,
+                stall_warning_seconds=float(stall_warning_seconds),
+                resumed_from_session=resumed_from_session,
+                previously_completed=resume_completed,
+                previously_skipped=resume_skipped,
+                on_file_failure=on_file_failure,
+                use_calibration=use_calibration,
+            )
         )
-    )
     cleaned_paths: list[Path] = []
     if cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
@@ -1798,36 +1909,63 @@ def apply(
         no_skip=False,
     )
 
+    jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
+        jobs,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        on_file_failure=_validate_failure_policy(on_file_failure),
+    )
+    for note in preflight_notes:
+        console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+    if incompatible and on_file_failure == "skip":
+        console.print(
+            f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
+        )
+    if incompatible and on_file_failure == "stop":
+        for note in incompatible:
+            console.print(f"[red]Compatibility check failed:[/red] {note}")
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+
     display.show_scan_table(jobs)
     to_encode = [job for job in jobs if not job.skip]
     if not to_encode:
-        console.print("[dim]Nothing to encode.[/dim]")
-        raise typer.Exit(code=EXIT_USER_CANCELLED)
+        results = _build_skipped_results(jobs)
+        if not results or not _has_incompatible_skips(jobs):
+            console.print("[dim]Nothing to encode.[/dim]")
+            raise typer.Exit(code=EXIT_USER_CANCELLED)
+        console.print("[dim]All manifest files were skipped before encode start.[/dim]")
+        stopped_early = False
+    else:
+        stopped_early = False
     preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
 
-    _print_safe_interrupt_guidance()
-    _print_preflight_warnings(preflight_warnings)
-    _maybe_warn_low_disk_space(
-        jobs,
-        output_dir or loaded_manifest.analyzed_directory,
-        overwrite,
-        assume_yes=yes,
-    )
-    if not yes and not display.confirm_proceed(len(to_encode)):
-        console.print("[dim]Aborted.[/dim]")
-        raise typer.Exit(code=EXIT_USER_CANCELLED)
-
-    results, stopped_early = _normalize_loop_result(
-        _run_encode_loop(
+    if to_encode:
+        _print_safe_interrupt_guidance()
+        _print_preflight_warnings(preflight_warnings)
+        _maybe_warn_low_disk_space(
             jobs,
-            ffmpeg,
-            ffprobe,
-            display,
-            stall_warning_seconds=float(stall_warning_seconds),
-            on_file_failure=_validate_failure_policy(on_file_failure),
-            use_calibration=use_calibration,
+            output_dir or loaded_manifest.analyzed_directory,
+            overwrite,
+            assume_yes=yes,
         )
-    )
+        if not yes and not display.confirm_proceed(len(to_encode)):
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(code=EXIT_USER_CANCELLED)
+    else:
+        _print_preflight_warnings(preflight_warnings)
+
+    if to_encode:
+        results, stopped_early = _normalize_loop_result(
+            _run_encode_loop(
+                jobs,
+                ffmpeg,
+                ffprobe,
+                display,
+                stall_warning_seconds=float(stall_warning_seconds),
+                on_file_failure=_validate_failure_policy(on_file_failure),
+                use_calibration=use_calibration,
+            )
+        )
     cleaned_paths: list[Path] = []
     if cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
@@ -2102,6 +2240,23 @@ def resume(
         console.print("[yellow]No resumable files remain in the saved session.[/yellow]")
         raise typer.Exit(code=EXIT_NO_FILES)
 
+    jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
+        jobs,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        on_file_failure=_validate_failure_policy(on_file_failure),
+    )
+    for note in preflight_notes:
+        console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+    if incompatible and on_file_failure == "skip":
+        console.print(
+            f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
+        )
+    if incompatible and on_file_failure == "stop":
+        for note in incompatible:
+            console.print(f"[red]Compatibility check failed:[/red] {note}")
+        raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+
     _reconcile_session_with_jobs(session, jobs)
     console.print(
         f"[cyan]Resuming session:[/cyan] {_format_resume_counts(session)}",
@@ -2109,22 +2264,30 @@ def resume(
     )
     console.print(f"[dim]Session path:[/dim] {session_path}")
     display.show_scan_table(jobs)
-    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
-    if not json_output:
-        _print_safe_interrupt_guidance()
-        _print_preflight_warnings(preflight_warnings)
-    _maybe_warn_low_disk_space(
-        jobs,
-        output_dir or directory,
-        session.overwrite,
-        assume_yes=yes,
-    )
-
     to_encode = [job for job in jobs if not job.skip]
+    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    if not json_output and to_encode:
+        _print_safe_interrupt_guidance()
+    if not json_output:
+        _print_preflight_warnings(preflight_warnings)
+    if to_encode:
+        _maybe_warn_low_disk_space(
+            jobs,
+            output_dir or directory,
+            session.overwrite,
+            assume_yes=yes,
+        )
+
     if not to_encode:
-        console.print("[dim]Nothing to encode.[/dim]")
-        raise typer.Exit(code=EXIT_USER_CANCELLED)
-    if not yes and not display.confirm_proceed(len(to_encode)):
+        results = _build_skipped_results(jobs)
+        if not results or not _has_incompatible_skips(jobs):
+            console.print("[dim]Nothing to encode.[/dim]")
+            raise typer.Exit(code=EXIT_USER_CANCELLED)
+        console.print("[dim]All resumable files were skipped before encode start.[/dim]")
+        stopped_early = False
+    else:
+        stopped_early = False
+    if to_encode and not yes and not display.confirm_proceed(len(to_encode)):
         console.print("[dim]Aborted.[/dim]")
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
@@ -2137,23 +2300,24 @@ def resume(
 
     resume_completed, resume_skipped = _resume_summary_counts(session)
 
-    results, stopped_early = _normalize_loop_result(
-        _run_encode_loop(
-            jobs,
-            ffmpeg,
-            ffprobe,
-            display,
-            session=session,
-            session_path=session_path,
-            log_path=log_path,
-            stall_warning_seconds=float(stall_warning_seconds),
-            resumed_from_session=True,
-            previously_completed=resume_completed,
-            previously_skipped=resume_skipped,
-            on_file_failure=_validate_failure_policy(on_file_failure),
-            use_calibration=use_calibration,
+    if to_encode:
+        results, stopped_early = _normalize_loop_result(
+            _run_encode_loop(
+                jobs,
+                ffmpeg,
+                ffprobe,
+                display,
+                session=session,
+                session_path=session_path,
+                log_path=log_path,
+                stall_warning_seconds=float(stall_warning_seconds),
+                resumed_from_session=True,
+                previously_completed=resume_completed,
+                previously_skipped=resume_skipped,
+                on_file_failure=_validate_failure_policy(on_file_failure),
+                use_calibration=use_calibration,
+            )
         )
-    )
     cleaned_paths: list[Path] = []
     if cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
@@ -2262,6 +2426,19 @@ def overnight(
         )
         raise typer.Exit(code=EXIT_NO_FILES)
 
+    jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
+        jobs,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        on_file_failure="skip",
+    )
+    for note in preflight_notes:
+        console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+    if incompatible:
+        console.print(
+            f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because overnight mode continues past file-level issues.[/yellow]"
+        )
+
     prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
     resumed_from_session = False
     if prior is not None:
@@ -2304,23 +2481,29 @@ def overnight(
     resume_completed, resume_skipped = _resume_summary_counts(
         session if resumed_from_session else None
     )
-    results, stopped_early = _normalize_loop_result(
-        _run_encode_loop(
-            jobs,
-            ffmpeg,
-            ffprobe,
-            display,
-            session=session,
-            session_path=session_path,
-            log_path=log_path,
-            stall_warning_seconds=float(stall_warning_seconds),
-            resumed_from_session=resumed_from_session,
-            previously_completed=resume_completed,
-            previously_skipped=resume_skipped,
-            on_file_failure="skip",
-            use_calibration=use_calibration,
+    to_encode = [job for job in jobs if not job.skip]
+    if to_encode:
+        results, stopped_early = _normalize_loop_result(
+            _run_encode_loop(
+                jobs,
+                ffmpeg,
+                ffprobe,
+                display,
+                session=session,
+                session_path=session_path,
+                log_path=log_path,
+                stall_warning_seconds=float(stall_warning_seconds),
+                resumed_from_session=resumed_from_session,
+                previously_completed=resume_completed,
+                previously_skipped=resume_skipped,
+                on_file_failure="skip",
+                use_calibration=use_calibration,
+            )
         )
-    )
+    else:
+        results = _build_skipped_results(jobs)
+        stopped_early = False
+        console.print("[dim]All overnight candidates were skipped before encode start.[/dim]")
     _record_cleanup_results(session, session_path, results, [])
     json_report, text_report = _write_batch_reports(
         mode="overnight",

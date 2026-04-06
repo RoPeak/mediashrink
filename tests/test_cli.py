@@ -1516,6 +1516,60 @@ def test_encode_overnight_flag_forces_skip_policy_and_verbose(tmp_path: Path) ->
     assert mock_loop.call_args.kwargs["use_calibration"] is True
 
 
+def test_encode_skip_policy_skips_incompatible_file_before_batch(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    ok_result = _make_result(
+        job, skipped=True, skip_reason="incompatible: unsupported container/stream combination"
+    )
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch(
+            "mediashrink.cli.preflight_encode_job",
+            return_value=_make_result(
+                job, success=False, output_size_bytes=0, error_message="Could not write header"
+            ),
+        ),
+        patch("mediashrink.cli.encode_file", return_value=ok_result),
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--yes", "--on-file-failure", "skip"])
+
+    assert result.exit_code == 0
+    assert "Skipping 1 incompatible file(s) before batch start" in result.stdout
+
+
+def test_encode_stop_policy_aborts_on_incompatible_file_before_batch(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch(
+            "mediashrink.cli.preflight_encode_job",
+            return_value=_make_result(
+                job, success=False, output_size_bytes=0, error_message="Could not write header"
+            ),
+        ),
+        patch("mediashrink.cli.encode_file") as mock_encode,
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--yes", "--on-file-failure", "stop"])
+
+    assert result.exit_code == 2
+    mock_encode.assert_not_called()
+    assert "Compatibility check failed" in result.stdout
+
+
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
