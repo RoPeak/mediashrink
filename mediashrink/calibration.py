@@ -248,8 +248,18 @@ def lookup_estimate(
     weighted_speed_samples = 0.0
     weighted_samples = 0.0
 
+    total_candidates = len(exact_matches) + len(loose_matches)
+
+    def _recency_weight(position: int) -> float:
+        if total_candidates <= 1:
+            return 1.0
+        return 0.75 + (position / max(total_candidates - 1, 1)) * 0.5
+
+    ordered_matches = exact_matches + loose_matches
+    positions = {id(raw): index for index, raw in enumerate(ordered_matches)}
+
     for raw in exact_matches:
-        weight = 1.0
+        weight = 1.0 * _recency_weight(positions[id(raw)])
         if int(raw.get("input_bytes", 0)) > 0 and int(raw.get("output_bytes", 0)) > 0:
             weighted_output_total += (
                 float(raw["output_bytes"]) / max(int(raw["input_bytes"]), 1)
@@ -261,7 +271,7 @@ def lookup_estimate(
         weighted_samples += weight
 
     for raw in loose_matches:
-        weight = 0.35
+        weight = 0.35 * _recency_weight(positions[id(raw)])
         if int(raw.get("input_bytes", 0)) > 0 and int(raw.get("output_bytes", 0)) > 0:
             weighted_output_total += (
                 float(raw["output_bytes"]) / max(int(raw["input_bytes"]), 1)

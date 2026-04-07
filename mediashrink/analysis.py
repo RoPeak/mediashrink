@@ -673,37 +673,62 @@ def display_analysis_summary(
     time_confidence: str | None = None,
     time_confidence_detail: str | None = None,
     notes: list[str] | None = None,
+    plain_output: bool = False,
 ) -> None:
     recommended = [item for item in items if item.recommendation == "recommended"]
     maybe = [item for item in items if item.recommendation == "maybe"]
     skipped = [item for item in items if item.recommendation == "skip"]
+    narrow = plain_output or console.width < 120
 
-    table = Table(title="Compression analysis", header_style="bold cyan", expand=True)
-    table.add_column("File")
-    table.add_column("Codec", justify="center", no_wrap=True)
-    table.add_column("Size", justify="right", no_wrap=True)
-    table.add_column("Est. Saving", justify="right", no_wrap=True)
-    table.add_column("Recommendation", justify="center", no_wrap=True)
-    table.add_column("Reason")
+    if plain_output:
+        console.print()
+        console.print("[bold cyan]Compression analysis[/bold cyan]")
+        _TABLE_LIMIT = 12
+        sorted_items = sorted(
+            items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True
+        )
+        for item in sorted_items[:_TABLE_LIMIT]:
+            savings_text = (
+                "-"
+                if item.estimated_savings_bytes <= 0
+                else f"~{_fmt_size(item.estimated_savings_bytes)}"
+            )
+            console.print(
+                f"- {item.source.name} | {item.codec or '?'} | {_fmt_size(item.size_bytes)}"
+                f" | {savings_text} | {item.recommendation.upper()} | {item.reason_text}",
+                highlight=False,
+            )
+        console.print()
+    else:
+        table = Table(title="Compression analysis", header_style="bold cyan", expand=True)
+        table.add_column("File")
+        table.add_column("Codec", justify="center", no_wrap=True)
+        table.add_column("Size", justify="right", no_wrap=True)
+        table.add_column("Est. Saving", justify="right", no_wrap=True)
+        table.add_column("Recommendation", justify="center", no_wrap=True)
+        if not narrow:
+            table.add_column("Reason")
 
-    _TABLE_LIMIT = 12
-    sorted_items = sorted(
-        items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True
-    )
-    for item in sorted_items[:_TABLE_LIMIT]:
-        savings_text = (
-            "-"
-            if item.estimated_savings_bytes <= 0
-            else f"~{_fmt_size(item.estimated_savings_bytes)}"
+        _TABLE_LIMIT = 12
+        sorted_items = sorted(
+            items, key=lambda candidate: candidate.estimated_savings_bytes, reverse=True
         )
-        table.add_row(
-            item.source.name,
-            item.codec or "?",
-            _fmt_size(item.size_bytes),
-            savings_text,
-            item.recommendation.upper(),
-            item.reason_text,
-        )
+        for item in sorted_items[:_TABLE_LIMIT]:
+            savings_text = (
+                "-"
+                if item.estimated_savings_bytes <= 0
+                else f"~{_fmt_size(item.estimated_savings_bytes)}"
+            )
+            row = [
+                item.source.name,
+                item.codec or "?",
+                _fmt_size(item.size_bytes),
+                savings_text,
+                item.recommendation.upper(),
+            ]
+            if not narrow:
+                row.append(item.reason_text)
+            table.add_row(*row)
 
     total_current = sum(item.size_bytes for item in recommended)
     total_estimated = sum(item.estimated_output_bytes for item in recommended)
@@ -712,8 +737,9 @@ def display_analysis_summary(
     maybe_total = sum(item.size_bytes for item in maybe)
     skipped_total = sum(item.size_bytes for item in skipped)
 
-    console.print()
-    console.print(table)
+    if not plain_output:
+        console.print()
+        console.print(table)
     if len(sorted_items) > _TABLE_LIMIT:
         hidden = len(sorted_items) - _TABLE_LIMIT
         console.print(
@@ -721,6 +747,8 @@ def display_analysis_summary(
             f"{hidden} more not shown — use --manifest-out to export the full list.[/dim]",
             highlight=False,
         )
+    if narrow and not plain_output:
+        console.print("[dim]Compact analysis view hides the longer reason column on narrow terminals.[/dim]")
     console.print(
         f"[bold]{len(items)}[/bold] file(s) scanned - "
         f"[green bold]{len(recommended)}[/green bold] recommended, "

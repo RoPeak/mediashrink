@@ -533,6 +533,22 @@ def _followup_notes_for_incompatible_details(details: list[str]) -> list[str]:
     return notes
 
 
+def _print_incompatibility_stream_details(
+    jobs: list[EncodeJob],
+    *,
+    ffprobe: Path,
+    prefix: str = "  ",
+) -> None:
+    for job in jobs[:5]:
+        notes = describe_output_container_constraints(job.source, job.output, ffprobe)
+        if not notes:
+            continue
+        console.print(
+            f"{prefix}[dim]{job.source.name}: {', '.join(notes)}[/dim]",
+            highlight=False,
+        )
+
+
 def _write_followup_manifest_for_jobs(
     *,
     directory: Path,
@@ -2737,6 +2753,11 @@ def wizard(
         "--show-all-profiles",
         help="Show every profile row instead of hiding near-duplicate trade-offs.",
     ),
+    plain_output: bool = typer.Option(
+        False,
+        "--plain-output",
+        help="Use a slimmer text-first layout for narrow terminals.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -2767,6 +2788,7 @@ def wizard(
         use_calibration=use_calibration,
         duplicate_policy=_validate_duplicate_policy(duplicate_policy),
         show_all_profiles=show_all_profiles,
+        plain_output=plain_output,
     )
 
     if action == "cancel":
@@ -2840,6 +2862,10 @@ def wizard(
                     style="yellow",
                     prefix="  ",
                 )
+                _print_incompatibility_stream_details(
+                    [job for job in followup_jobs if not job.skip],
+                    ffprobe=ffprobe,
+                )
                 console.print(
                     f'  [dim]Review manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
                 )
@@ -2858,6 +2884,10 @@ def wizard(
                             followup_details,
                             style="yellow",
                             prefix="  ",
+                        )
+                        _print_incompatibility_stream_details(
+                            [job for job in followup_jobs if not job.skip],
+                            ffprobe=ffprobe,
                         )
                         console.print(
                             "  [dim]These failures happened before the output header could be initialized. "

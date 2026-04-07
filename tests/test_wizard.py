@@ -428,6 +428,7 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
         patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
         patch("mediashrink.wizard.detect_device_labels", return_value={}),
         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard._targeted_profile_probe_failures", return_value={}),
         patch("mediashrink.wizard.display_profiles_table"),
         patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
         patch("mediashrink.wizard.maybe_save_profile"),
@@ -953,6 +954,15 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
         skip=False,
     )
     mkv_job = _job_for(mkv_source)
+    mp4_mkv_job = EncodeJob(
+        source=mp4_source,
+        output=tmp_path / "mediashrink_mkv_followup" / "movie.mkv",
+        tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_movie.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
     selected_profile = EncoderProfile(
         1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
     )
@@ -973,10 +983,12 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
         patch("mediashrink.wizard.build_jobs", return_value=[mp4_job, mkv_job]),
+        patch("mediashrink.wizard._build_mkv_followup_jobs", return_value=[mp4_mkv_job]),
         patch(
-            "mediashrink.wizard.preflight_encode_job",
+            "mediashrink.wizard._run_preflight_checks",
             side_effect=[
-                _fake_encode_result(mp4_source, success=False, error_message="Invalid argument"),
+                ([mkv_job], [(mp4_job, _fake_encode_result(mp4_source, success=False, error_message="Invalid argument"))]),
+                ([mp4_mkv_job], []),
             ],
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[True, True, True]),
@@ -987,9 +999,9 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
 
     output = console.export_text()
     assert action == "encode"
-    assert jobs == [mkv_job]
+    assert jobs == [mkv_job, mp4_mkv_job]
     assert "1 file(s) can run now with Balanced." in output
-    assert "moved to follow-up planning" in output
+    assert "switched to MKV sidecar output" in output
     assert "Predicted compatibility for this selection:" in output
 
 

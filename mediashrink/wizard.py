@@ -91,6 +91,16 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
+def _render_mode(console: Console, *, plain_output: bool = False) -> str:
+    if plain_output:
+        return "plain"
+    if console.width < 110:
+        return "narrow"
+    if console.width < 150:
+        return "compact"
+    return "wide"
+
+
 @dataclass
 class EncoderProfile:
     index: int
@@ -146,6 +156,16 @@ def _quality_rank(label: str) -> int:
 def _grouped_incompatibility_summary(grouped: dict[str, int]) -> str:
     if not grouped:
         return ""
+    parts = [
+        f"{count} {reason}"
+        for reason, count in sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    return "; ".join(parts[:2])
+
+
+def _format_grouped_reason_list(grouped: dict[str, int] | None) -> str:
+    if not grouped:
+        return "No likely follow-up."
     parts = [
         f"{count} {reason}"
         for reason, count in sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
@@ -475,6 +495,74 @@ def _format_ready_size_estimate(
         f"  Est. out: ~{_fmt_size(output_bytes)}  "
         f"(~{_fmt_size(saved_bytes)} saved, ~{saved_pct:.0f}%)"
     )
+
+
+def _summarize_mkv_suitable_candidates(
+    items: list[AnalysisItem],
+    ffprobe: Path,
+) -> tuple[int, dict[str, int], list[str]]:
+    grouped: dict[str, int] = {}
+    examples: list[str] = []
+    for item in items:
+        if item.source.suffix.lower() not in {".mp4", ".m4v"}:
+            continue
+        notes = describe_output_container_constraints(item.source, item.source, ffprobe)
+        actionable = [
+            note
+            for note in notes
+            if note.startswith("subtitle")
+            or note.startswith("attachment")
+            or note.startswith("auxiliary")
+            or note.startswith("audio copy")
+        ]
+        if not actionable:
+            continue
+        examples.append(item.source.name)
+        for note in actionable:
+            if note.startswith("subtitle"):
+                label = "subtitle streams would be dropped in MP4/M4V output"
+            elif note.startswith("attachment"):
+                label = "attachment streams need MKV output"
+            elif note.startswith("auxiliary"):
+                label = "auxiliary data streams need MKV output"
+            else:
+                label = "some copied audio streams may need MKV output or re-encode"
+            grouped[label] = grouped.get(label, 0) + 1
+    return len(examples), grouped, examples[:3]
+
+
+def _default_mkv_followup_dir(directory: Path, output_dir: Path | None) -> Path:
+    base = output_dir if output_dir is not None else directory
+    return base / "mediashrink_mkv_followup"
+
+
+def _build_mkv_followup_jobs(
+    items: list[AnalysisItem],
+    *,
+    output_dir: Path,
+    overwrite: bool,
+    crf: int,
+    preset: str,
+    ffprobe: Path,
+    no_skip: bool,
+) -> list[EncodeJob]:
+    source_set = {item.source for item in items}
+    jobs = build_jobs(
+        files=list(source_set),
+        output_dir=output_dir,
+        overwrite=overwrite,
+        crf=crf,
+        preset=preset,
+        dry_run=False,
+        ffprobe=ffprobe,
+        no_skip=no_skip,
+    )
+    filtered_jobs = [job for job in jobs if job.source in source_set]
+    for job in filtered_jobs:
+        mkv_name = job.source.with_suffix(".mkv").name
+        job.output = output_dir / mkv_name
+        job.tmp_output = job.output.parent / f".tmp_{job.output.stem}{job.output.suffix}"
+    return filtered_jobs
 
 
 def prepare_profile_planning(
@@ -1394,7 +1482,8 @@ def display_profiles_table(
     size_confidence_detail: str | None = None,
     size_error_by_preset: dict[str, float | None] | None = None,
     show_all_profiles: bool = False,
-) -> list[EncoderProfile]:
+    plain_output: bool = False,
+) -> tuple[list[EncoderProfile], dict[int, EncoderProfile]]:
     def dedupe_key(profile: EncoderProfile) -> tuple[object, ...]:
         encoder_family = (
             "hardware"
@@ -1420,11 +1509,20 @@ def display_profiles_table(
             output_bucket,
         )
 
-    visible_profiles = profiles
+    render_mode = _render_mode(console, plain_output=plain_output)
+    visible_profiles = [
+        profile
+        for profile in profiles
+        if not (
+            profile.name == "GPU Offload"
+            and profile.encoder_key not in _HW_ENCODERS
+            and profile.sw_preset is not None
+        )
+    ]
     if not show_all_profiles:
         seen: set[tuple[object, ...]] = set()
         filtered: list[EncoderProfile] = []
-        for profile in profiles:
+        for profile in visible_profiles:
             if profile.is_custom:
                 filtered.append(profile)
                 continue
@@ -1445,48 +1543,7 @@ def display_profiles_table(
         profile.index: display_idx for display_idx, profile in display_index_map.items()
     }
 
-    compact = console.width < 150
-    table = Table(
-        title="Available encoding profiles",
-        header_style="bold cyan",
-        expand=True,
-        show_lines=False,
-    )
-    table.add_column("#", justify="right", style="bold", no_wrap=True)
-    table.add_column("Intent", no_wrap=True)
-    table.add_column("Profile", no_wrap=True)
-    table.add_column("Encoder", style="dim cyan")
-    table.add_column("Est. Saving", justify="right", style="bold green", no_wrap=True)
-    table.add_column("Est. Time", justify="right", no_wrap=True)
-    if not compact:
-        table.add_column("Works for", justify="center", no_wrap=True)
-        table.add_column("Likely incompatible", justify="center", no_wrap=True)
-    table.add_column("Quality", no_wrap=True)
-    table.add_column("Why choose this", no_wrap=False)
-    if not compact:
-        table.add_column("CRF", justify="center", no_wrap=True)
-
-    for display_idx, profile in display_index_map.items():
-        if profile.is_custom:
-            row: list[str | Text] = [
-                str(display_idx),
-                profile.intent_label,
-                "Custom",
-                "-",
-                "-",
-                "-",
-                "-",
-                "Manual override.",
-            ]
-            if not compact:
-                row.insert(6, "-")
-                row.insert(7, "-")
-            if not compact:
-                row.append("-")
-            table.add_row(*row)
-            continue
-
-        encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
+    def _est_saving_text(profile: EncoderProfile) -> str:
         saved = total_input_bytes - profile.estimated_output_bytes
         saved_pct = saved / total_input_bytes * 100 if total_input_bytes else 0
         size_error = (size_error_by_preset or {}).get(profile.encoder_key)
@@ -1497,48 +1554,143 @@ def display_profiles_table(
             pct_low = saving_low / total_input_bytes * 100
             pct_high = saving_high / total_input_bytes * 100
             if (pct_high - pct_low) >= 35:
-                est_saving = "~highly variable"
-            else:
-                est_saving = f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
-        else:
-            est_saving = f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
-        if profile.estimated_encode_seconds > 0:
-            est_time = f"~{_fmt_duration(profile.estimated_encode_seconds)}"
-        elif profile.sw_preset in {"slow", "slower", "veryslow"}:
-            est_time = "~slower than Balanced"
-        else:
-            est_time = "~unknown"
-        quality_style = {
-            "Visually lossless": "green bold",
-            "Excellent": "green",
-            "Very good": "green",
-            "Good": "yellow",
-        }.get(profile.quality_label, "white")
-        profile_name: str | Text = (
-            Text.assemble(profile.name, " ", ("[recommended]", "bold cyan"))
-            if profile.is_recommended
-            else profile.name
-        )
+                return "~highly variable"
+            return f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
+        return f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
 
-        row = [
-            str(display_idx),
-            profile.intent_label,
-            profile_name,
-            encoder_display,
-            est_saving,
-            est_time,
-        ]
-        if not compact:
+    def _est_time_text(profile: EncoderProfile) -> str:
+        if profile.estimated_encode_seconds > 0:
+            return f"~{_fmt_duration(profile.estimated_encode_seconds)}"
+        if profile.sw_preset in {"slow", "slower", "veryslow"}:
+            return "~slower than Balanced"
+        return "~unknown"
+
+    if render_mode == "plain":
+        console.print()
+        console.print("[bold cyan]Available encoding profiles[/bold cyan]")
+        for display_idx, profile in display_index_map.items():
+            if profile.is_custom:
+                console.print(f"{display_idx}. Custom | manual override", highlight=False)
+                continue
+            recommended_tag = " [recommended]" if profile.is_recommended else ""
+            encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
+            fit = (
+                f"{profile.compatible_count} ok / {profile.incompatible_count} follow-up"
+                if candidate_count
+                else "-"
+            )
+            console.print(
+                f"{display_idx}. {profile.name}{recommended_tag} | {encoder_display} | {_est_saving_text(profile)} | {_est_time_text(profile)} | {profile.quality_label} | {fit}",
+                highlight=False,
+            )
+            console.print(f"   {profile.why_choose}", highlight=False)
+            if profile.grouped_incompatibilities:
+                console.print(
+                    f"   Follow-up risk: {_format_grouped_reason_list(profile.grouped_incompatibilities)}",
+                    highlight=False,
+                )
+    else:
+        compact = render_mode in {"compact", "narrow"}
+        narrow = render_mode == "narrow"
+        table = Table(
+            title="Available encoding profiles",
+            header_style="bold cyan",
+            expand=True,
+            show_lines=False,
+        )
+        table.add_column("#", justify="right", style="bold", no_wrap=True)
+        if not narrow:
+            table.add_column("Intent", no_wrap=True)
+        table.add_column("Profile", no_wrap=True)
+        table.add_column("Encoder", style="dim cyan")
+        table.add_column("Est. Saving", justify="right", style="bold green", no_wrap=True)
+        table.add_column("Est. Time", justify="right", no_wrap=True)
+        if narrow:
+            table.add_column("Fit", no_wrap=False)
+        else:
+            table.add_column("Quality", no_wrap=True)
+            if not compact:
+                table.add_column("Works for", justify="center", no_wrap=True)
+                table.add_column("Likely incompatible", justify="center", no_wrap=True)
+            table.add_column("Why choose this", no_wrap=False)
+            if not compact:
+                table.add_column("CRF", justify="center", no_wrap=True)
+
+        for display_idx, profile in display_index_map.items():
+            if profile.is_custom:
+                row: list[str | Text] = [str(display_idx)]
+                if not narrow:
+                    row.append(profile.intent_label)
+                row.extend(["Custom", "-", "-", "-"])
+                if narrow:
+                    row.append("Manual override.")
+                else:
+                    row.extend(["-", "-", "Manual override."] if not compact else ["-", "Manual override."])
+                    if not compact:
+                        row.append("-")
+                table.add_row(*row)
+                continue
+
+            encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
+            profile_name: str | Text = (
+                Text.assemble(profile.name, " ", ("[recommended]", "bold cyan"))
+                if profile.is_recommended
+                else profile.name
+            )
+            row = [
+                str(display_idx),
+            ]
+            if not narrow:
+                row.append(profile.intent_label)
             row.extend(
                 [
-                    str(profile.compatible_count) if candidate_count else "-",
-                    str(profile.incompatible_count) if candidate_count else "-",
+                    profile_name,
+                    encoder_display,
+                    _est_saving_text(profile),
+                    _est_time_text(profile),
                 ]
             )
-        row.extend([Text(profile.quality_label, style=quality_style), profile.why_choose])
-        if not compact:
-            row.append(str(profile.crf))
-        table.add_row(*row)
+            if narrow:
+                row.append(
+                    f"{profile.compatible_count} ok / {profile.incompatible_count} follow-up"
+                    if candidate_count
+                    else "-"
+                )
+            else:
+                quality_style = {
+                    "Visually lossless": "green bold",
+                    "Excellent": "green",
+                    "Very good": "green",
+                    "Good": "yellow",
+                }.get(profile.quality_label, "white")
+                row.append(Text(profile.quality_label, style=quality_style))
+                if not compact:
+                    row.extend(
+                        [
+                            str(profile.compatible_count) if candidate_count else "-",
+                            str(profile.incompatible_count) if candidate_count else "-",
+                        ]
+                    )
+                row.append(profile.why_choose)
+                if not compact:
+                    row.append(str(profile.crf))
+            table.add_row(*row)
+
+        console.print()
+        console.print(table)
+        if render_mode == "narrow":
+            console.print("  [dim]Narrow view keeps only the fields needed to compare profiles quickly.[/dim]")
+            for display_idx, profile in display_index_map.items():
+                if profile.is_custom:
+                    continue
+                console.print(
+                    f"  [dim]{display_idx}. {profile.name}: {profile.why_choose}[/dim]"
+                    + (
+                        f" [dim](follow-up risk: {_format_grouped_reason_list(profile.grouped_incompatibilities)})[/dim]"
+                        if profile.grouped_incompatibilities
+                        else ""
+                    )
+                )
 
     recommended = next((profile for profile in profiles if profile.is_recommended), None)
     fastest = min(
@@ -1551,8 +1703,6 @@ def display_profiles_table(
         default=None,
     )
 
-    console.print()
-    console.print(table)
     console.print(
         f"  [dim]Likely encode candidates: {candidate_count} file(s) / {_fmt_size(total_input_bytes)}[/dim]"
     )
@@ -1585,7 +1735,7 @@ def display_profiles_table(
             console.print(
                 f"  [dim]Default pick: {recommended.name} because it is estimated to work for {recommended.compatible_count} file(s) with {recommended.incompatible_count} likely left for follow-up.[/dim]"
             )
-    if compact:
+    if render_mode in {"compact", "narrow"}:
         console.print("  [dim]Compact view hides lower-priority columns on narrow terminals.[/dim]")
     if not show_all_profiles and len(visible_profiles) < len(profiles):
         console.print(
@@ -2016,6 +2166,7 @@ def _maybe_run_preview(
     crf: int,
     auto: bool,
     console: Console,
+    plain_output: bool = False,
 ) -> bool:
     if auto or not typer.confirm(
         "Test a 2-minute preview clip before the full batch?", default=False
@@ -2041,7 +2192,10 @@ def _maybe_run_preview(
         )
     from mediashrink.progress import EncodingDisplay
 
-    EncodingDisplay(console).show_summary(preview_results)
+    EncodingDisplay(
+        console,
+        render_mode="plain" if plain_output else "auto",
+    ).show_summary(preview_results)
     successful_previews = [
         result for result in preview_results if result.success and result.job.output.exists()
     ]
@@ -2083,6 +2237,7 @@ def run_wizard(
     use_calibration: bool = True,
     duplicate_policy: str = "prefer-mkv",
     show_all_profiles: bool = False,
+    plain_output: bool = False,
 ) -> tuple[list[EncodeJob], str, bool, Path | None]:
     """Run the interactive wizard and return (jobs, action, cleanup_after, followup_manifest_path)."""
     console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
@@ -2137,6 +2292,7 @@ def run_wizard(
             use_calibration=use_calibration,
         ),
         notes=duplicate_notes,
+        plain_output=plain_output,
     )
 
     recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
@@ -2146,6 +2302,25 @@ def run_wizard(
         return [], "cancel", False, None
 
     candidate_items = recommended_items + maybe_items
+    mkv_candidate_count, mkv_grouped_reasons, mkv_examples = _summarize_mkv_suitable_candidates(
+        candidate_items,
+        ffprobe,
+    )
+    if mkv_candidate_count and output_dir is None:
+        console.print(
+            f"[yellow]Early warning:[/yellow] {mkv_candidate_count} likely encode candidate(s) contain streams better suited to MKV sidecar output."
+        )
+        console.print(
+            f"  [dim]{_format_grouped_reason_list(mkv_grouped_reasons)}[/dim]"
+            + (
+                f" [dim](examples: {', '.join(mkv_examples)})[/dim]"
+                if mkv_examples
+                else ""
+            )
+        )
+        console.print(
+            "  [dim]If needed, the wizard can switch incompatible files into a MKV follow-up folder instead of leaving them only in a manifest.[/dim]"
+        )
     sample_pool = recommended_items or maybe_items or analysis_items
     sample_item = max(sample_pool, key=lambda item: item.size_bytes)
     sample_file = sample_item.source
@@ -2235,6 +2410,7 @@ def run_wizard(
         ),
         size_error_by_preset=size_error_by_preset,
         show_all_profiles=show_all_profiles,
+        plain_output=plain_output,
     )
     if isinstance(display_result, tuple):
         visible_profiles, display_index_map = display_result
@@ -2269,7 +2445,16 @@ def run_wizard(
             maybe_save_profile(preset, crf, display_label, console)
             profile_saved = True
 
-        if not _maybe_run_preview(preview_items, ffmpeg, ffprobe, preset, crf, auto, console):
+        if not _maybe_run_preview(
+            preview_items,
+            ffmpeg,
+            ffprobe,
+            preset,
+            crf,
+            auto,
+            console,
+            plain_output=plain_output,
+        ):
             return [], "cancel", False, None
 
         if not action_taken:
@@ -2447,18 +2632,67 @@ def run_wizard(
             incompatible_items = [
                 item for item in selected_items if item.source not in compatible_sources
             ]
+            remaining_incompatible_items = list(incompatible_items)
+            retained_jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
+            mkv_switched_jobs: list[EncodeJob] = []
+            mkv_safe_reasons = {
+                "unsupported copied audio codec",
+                "unsupported copied subtitle codec",
+                "attachment stream incompatibility",
+                "auxiliary data stream incompatibility",
+                "output header failure",
+            }
+            if (
+                output_dir is None
+                and grouped_failures
+                and all(reason in mkv_safe_reasons for reason in grouped_failures)
+            ):
+                mkv_followup_dir = _default_mkv_followup_dir(directory, output_dir)
+                should_switch_to_mkv = auto or typer.confirm(
+                    f"Write {len(incompatible_items)} incompatible file(s) to MKV in {mkv_followup_dir} and include them in this run?",
+                    default=True,
+                )
+                if should_switch_to_mkv:
+                    candidate_mkv_jobs = _build_mkv_followup_jobs(
+                        incompatible_items,
+                        output_dir=mkv_followup_dir,
+                        overwrite=False,
+                        crf=crf,
+                        preset=preset,
+                        ffprobe=ffprobe,
+                        no_skip=no_skip,
+                    )
+                    mkv_compatible_jobs, _mkv_failures = _run_preflight_checks(
+                        [job for job in candidate_mkv_jobs if not job.skip],
+                        ffmpeg,
+                        ffprobe,
+                        crf=crf,
+                        preset=preset,
+                        console=console,
+                    )
+                    mkv_sources = {job.source for job in mkv_compatible_jobs}
+                    if mkv_compatible_jobs:
+                        mkv_switched_jobs = mkv_compatible_jobs
+                        retained_jobs.extend(mkv_compatible_jobs)
+                        remaining_incompatible_items = [
+                            item for item in incompatible_items if item.source not in mkv_sources
+                        ]
+                        console.print(
+                            f"[green]Switched {len(mkv_compatible_jobs)} file(s) to MKV sidecar output in[/green] {mkv_followup_dir}"
+                        )
             followup_manifest = _write_followup_manifest(
                 directory,
                 recursive,
                 preset,
                 crf,
-                incompatible_items,
+                remaining_incompatible_items,
             )
             followup_manifest_path = followup_manifest
-            followup_count = len(preflight_failures)
-            selected_items = [item for item in selected_items if item.source in compatible_sources]
-            jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
-            to_encode = compatible_jobs
+            followup_count = len(remaining_incompatible_items)
+            included_sources = compatible_sources | {job.source for job in mkv_switched_jobs}
+            selected_items = [item for item in selected_items if item.source in included_sources]
+            jobs = retained_jobs
+            to_encode = compatible_jobs + mkv_switched_jobs
             estimated_total_encode_seconds = estimate_analysis_encode_seconds(
                 items=selected_items,
                 preset=preset,
@@ -2493,14 +2727,44 @@ def run_wizard(
                 )
                 compatibility_prediction_note = (
                     f"Predicted compatibility for this selection: {predicted_compatible} compatible / "
-                    f"{predicted_incompatible} likely follow-up; preflight confirmed {len(compatible_jobs)} compatible / "
-                    f"{len(preflight_failures)} moved to follow-up."
+                    f"{predicted_incompatible} likely follow-up; preflight confirmed {len(compatible_jobs)} in-place compatible"
+                    + (
+                        f", {len(mkv_switched_jobs)} switched to MKV"
+                        if mkv_switched_jobs
+                        else ""
+                    )
+                    + (
+                        f", {len(remaining_incompatible_items)} moved to follow-up."
+                        if remaining_incompatible_items
+                        else "."
+                    )
                 )
             else:
-                compatibility_prediction_note = f"Preflight confirmed {len(compatible_jobs)} compatible / {len(preflight_failures)} moved to follow-up."
+                compatibility_prediction_note = (
+                    f"Preflight confirmed {len(compatible_jobs)} in-place compatible"
+                    + (
+                        f", {len(mkv_switched_jobs)} switched to MKV"
+                        if mkv_switched_jobs
+                        else ""
+                    )
+                    + (
+                        f", {len(remaining_incompatible_items)} moved to follow-up."
+                        if remaining_incompatible_items
+                        else "."
+                    )
+                )
             console.print(
                 f"[yellow]{len(compatible_jobs)} file(s) can run now with {display_label}. "
-                f"{len(preflight_failures)} incompatible file(s) were moved to follow-up planning.[/yellow]"
+                + (
+                    f"{len(mkv_switched_jobs)} file(s) were switched to MKV sidecar output, "
+                    if mkv_switched_jobs
+                    else ""
+                )
+                + (
+                    f"{len(remaining_incompatible_items)} incompatible file(s) were moved to follow-up planning.[/yellow]"
+                    if remaining_incompatible_items
+                    else "no manual follow-up remains.[/yellow]"
+                )
             )
             if followup_manifest is not None:
                 console.print(f"[dim]Follow-up manifest:[/dim] {followup_manifest}")

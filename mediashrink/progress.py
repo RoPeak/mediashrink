@@ -128,11 +128,41 @@ def _skip_bucket(result: EncodeResult) -> str:
 
 
 class EncodingDisplay:
-    def __init__(self, console: Console | None = None) -> None:
+    def __init__(self, console: Console | None = None, *, render_mode: str = "auto") -> None:
         self.console = console or Console()
+        self.render_mode = render_mode
+
+    def _use_plain_output(self) -> bool:
+        return self.render_mode == "plain"
+
+    def _is_narrow(self) -> bool:
+        return self._use_plain_output() or self.console.width < 120
 
     def show_scan_table(self, jobs: list[EncodeJob]) -> None:
         show_estimates = any(job.dry_run and job.estimated_output_bytes > 0 for job in jobs)
+
+        if self._use_plain_output():
+            self.console.print()
+            self.console.print("[bold cyan]Files found[/bold cyan]")
+            for job in jobs:
+                action = "SKIP" if job.skip else "DRY RUN" if job.dry_run else "ENCODE"
+                line = f"- {job.source.name} | {job.source_codec or '?'} | {_fmt_size(job.source.stat().st_size)} | {action}"
+                if show_estimates and not job.skip and job.estimated_output_bytes > 0:
+                    est_saved = job.source.stat().st_size - job.estimated_output_bytes
+                    est_pct = (
+                        (est_saved / job.source.stat().st_size * 100)
+                        if job.source.stat().st_size
+                        else 0
+                    )
+                    line += (
+                        f" | est {_fmt_size(job.estimated_output_bytes)}"
+                        f" | save {_fmt_size(est_saved)} (~{est_pct:.0f}%)"
+                    )
+                if job.skip and job.skip_reason:
+                    line += f" | {job.skip_reason}"
+                self.console.print(line, highlight=False)
+            self.console.print()
+            return
 
         table = Table(
             title="Files found",
@@ -241,6 +271,91 @@ class EncodingDisplay:
         is_dry_run = any(result.job.dry_run for result in results)
         is_preview = bool(results) and all(_is_preview_result(result) for result in results)
         preview_duration = _preview_duration_note(results)
+        narrow = self._is_narrow()
+
+        if self._use_plain_output():
+            title = (
+                "Preview summary"
+                if is_preview
+                else "Encoding summary"
+                if not is_dry_run
+                else "Dry-run summary (estimates)"
+            )
+            self.console.print()
+            self.console.print(f"[bold cyan]{title}[/bold cyan]")
+            successful_results = [result for result in results if result.success and not result.skipped]
+            failed_results = [result for result in results if not result.success and not result.skipped]
+            skipped_results = [result for result in results if result.skipped]
+            total_input = 0
+            total_output = 0
+            total_saved = 0
+            total_time = 0.0
+
+            for result in successful_results + failed_results + skipped_results:
+                if result.skipped:
+                    self.console.print(
+                        f"- SKIPPED | {result.job.source.name} | {_fmt_size(result.input_size_bytes)}"
+                        + (
+                            f" | {result.skip_reason}"
+                            if result.skip_reason
+                            else ""
+                        ),
+                        highlight=False,
+                    )
+                    continue
+                if not result.success:
+                    self.console.print(
+                        f"- FAILED | {result.job.source.name} | {_fmt_size(result.input_size_bytes)}"
+                        + (
+                            f" | {_fmt_duration(result.duration_seconds)}"
+                            if not is_dry_run and result.duration_seconds > 0
+                            else ""
+                        )
+                        + (
+                            f" | {result.error_message}"
+                            if result.error_message
+                            else ""
+                        ),
+                        highlight=False,
+                    )
+                    continue
+
+                saved = result.size_reduction_bytes
+                pct = result.size_reduction_pct
+                total_input += result.input_size_bytes
+                total_output += result.output_size_bytes
+                total_saved += saved
+                total_time += result.duration_seconds
+                speed_str = "-"
+                if result.duration_seconds > 0 and result.media_duration_seconds > 0:
+                    speed_str = f"{result.media_duration_seconds / result.duration_seconds:.2f}x"
+                self.console.print(
+                    f"- OK | {result.job.source.name} | {_fmt_size(result.input_size_bytes)} -> {_fmt_size(result.output_size_bytes)}"
+                    f" | save {_fmt_size(saved)} ({pct:.1f}%)"
+                    + (
+                        f" | {_fmt_duration(result.duration_seconds)} | {speed_str}"
+                        if not is_dry_run
+                        else ""
+                    ),
+                    highlight=False,
+                )
+
+            overall_pct = (total_saved / total_input) * 100 if total_input > 0 else 0.0
+            self.console.print(
+                f"[bold]{len(successful_results)}[/bold] succeeded, "
+                f"[red bold]{len(failed_results)}[/red bold] failed, "
+                f"[dim]{len(skipped_results)}[/dim] skipped",
+                highlight=False,
+            )
+            if total_input > 0:
+                self.console.print(
+                    f"Total: {_fmt_size(total_input)} -> {_fmt_size(total_output)} "
+                    f"({_fmt_size(total_saved)} saved, {overall_pct:.1f}%)"
+                    + (f" | {_fmt_duration(total_time)} elapsed" if total_time > 0 else ""),
+                    highlight=False,
+                )
+            self.console.print()
+            return
 
         table = Table(
             title=(
@@ -254,20 +369,25 @@ class EncodingDisplay:
             header_style="bold cyan",
             expand=True,
         )
-        table.add_column("File", style="white", no_wrap=False)
-        table.add_column("Before", style="yellow", justify="right", no_wrap=True)
-        table.add_column(
-            "Preview clip" if is_preview else "After",
-            style="green",
-            justify="right",
-            no_wrap=True,
-        )
-        table.add_column("Saving", style="bold green", justify="right", no_wrap=True)
-        table.add_column("Reduction", justify="right", no_wrap=True)
-        if not is_dry_run:
-            table.add_column("Time", justify="right", no_wrap=True)
-            table.add_column("Speed", justify="right", no_wrap=True)
-        table.add_column("Status", justify="center", no_wrap=True)
+        if narrow:
+            table.add_column("File", style="white", no_wrap=False)
+            table.add_column("Result", style="white", no_wrap=False)
+            table.add_column("Status", justify="center", no_wrap=True)
+        else:
+            table.add_column("File", style="white", no_wrap=False)
+            table.add_column("Before", style="yellow", justify="right", no_wrap=True)
+            table.add_column(
+                "Preview clip" if is_preview else "After",
+                style="green",
+                justify="right",
+                no_wrap=True,
+            )
+            table.add_column("Saving", style="bold green", justify="right", no_wrap=True)
+            table.add_column("Reduction", justify="right", no_wrap=True)
+            if not is_dry_run:
+                table.add_column("Time", justify="right", no_wrap=True)
+                table.add_column("Speed", justify="right", no_wrap=True)
+            table.add_column("Status", justify="center", no_wrap=True)
 
         successful_results = [result for result in results if result.success and not result.skipped]
         failed_results = [result for result in results if not result.success and not result.skipped]
@@ -286,24 +406,37 @@ class EncodingDisplay:
 
         for result in successful_results + failed_results + skipped_results:
             if result.skipped:
-                row: list[str | Text] = [
-                    result.job.source.name,
-                    _fmt_size(result.input_size_bytes),
-                    "-",
-                    "-",
-                    "-",
-                ]
-                if not is_dry_run:
-                    row += ["-", "-"]
-                row.append(Text("SKIPPED", style="dim"))
+                if narrow:
+                    row = [
+                        result.job.source.name,
+                        result.skip_reason or "Skipped before encode",
+                        Text("SKIPPED", style="dim"),
+                    ]
+                else:
+                    row = [
+                        result.job.source.name,
+                        _fmt_size(result.input_size_bytes),
+                        "-",
+                        "-",
+                        "-",
+                    ]
+                    if not is_dry_run:
+                        row += ["-", "-"]
+                    row.append(Text("SKIPPED", style="dim"))
                 table.add_row(*row)
                 continue
 
             if not result.success:
-                row = [result.job.source.name, _fmt_size(result.input_size_bytes), "-", "-", "-"]
-                if not is_dry_run:
-                    row += [_fmt_duration(result.duration_seconds), "-"]
-                row.append(Text("FAILED", style="red bold"))
+                if narrow:
+                    detail = result.error_message or "Encode failed"
+                    if not is_dry_run and result.duration_seconds > 0:
+                        detail += f" after {_fmt_duration(result.duration_seconds)}"
+                    row = [result.job.source.name, detail, Text("FAILED", style="red bold")]
+                else:
+                    row = [result.job.source.name, _fmt_size(result.input_size_bytes), "-", "-", "-"]
+                    if not is_dry_run:
+                        row += [_fmt_duration(result.duration_seconds), "-"]
+                    row.append(Text("FAILED", style="red bold"))
                 table.add_row(*row)
                 continue
 
@@ -317,26 +450,41 @@ class EncodingDisplay:
                     pct_style = (
                         "green bold" if est_pct >= 30 else "yellow" if est_pct >= 10 else "red"
                     )
-                    row = [
-                        result.job.source.name,
-                        _fmt_size(result.input_size_bytes),
-                        f"~{_fmt_size(est)}",
-                        f"~{_fmt_size(est_saved)}",
-                        Text(f"~{est_pct:.0f}%", style=pct_style),
-                        Text("DRY RUN", style="cyan"),
-                    ]
+                    if narrow:
+                        row = [
+                            result.job.source.name,
+                            f"~{_fmt_size(est)} out | save ~{_fmt_size(est_saved)} (~{est_pct:.0f}%)",
+                            Text("DRY RUN", style="cyan"),
+                        ]
+                    else:
+                        row = [
+                            result.job.source.name,
+                            _fmt_size(result.input_size_bytes),
+                            f"~{_fmt_size(est)}",
+                            f"~{_fmt_size(est_saved)}",
+                            Text(f"~{est_pct:.0f}%", style=pct_style),
+                            Text("DRY RUN", style="cyan"),
+                        ]
                     total_input += result.input_size_bytes
                     total_output += est
                     total_saved += est_saved
                 else:
-                    row = [
-                        result.job.source.name,
-                        _fmt_size(result.input_size_bytes),
-                        "-",
-                        "-",
-                        "-",
-                        Text("DRY RUN", style="cyan"),
-                    ]
+                    row = (
+                        [
+                            result.job.source.name,
+                            "Estimate unavailable",
+                            Text("DRY RUN", style="cyan"),
+                        ]
+                        if narrow
+                        else [
+                            result.job.source.name,
+                            _fmt_size(result.input_size_bytes),
+                            "-",
+                            "-",
+                            "-",
+                            Text("DRY RUN", style="cyan"),
+                        ]
+                    )
                 table.add_row(*row)
                 continue
 
@@ -349,16 +497,25 @@ class EncodingDisplay:
                 speed_x = result.media_duration_seconds / result.duration_seconds
                 speed_str = f"{speed_x:.2f}x"
 
-            row = [
-                result.job.source.name,
-                _fmt_size(result.input_size_bytes),
-                _fmt_size(result.output_size_bytes),
-                _fmt_size(saved),
-                Text(f"{pct:.1f}%", style=pct_style),
-                _fmt_duration(result.duration_seconds),
-                speed_str,
-                Text("OK", style="green bold"),
-            ]
+            if narrow:
+                detail = (
+                    f"{_fmt_size(result.input_size_bytes)} -> {_fmt_size(result.output_size_bytes)}"
+                    f" | save {_fmt_size(saved)} ({pct:.1f}%)"
+                )
+                if not is_dry_run:
+                    detail += f" | {_fmt_duration(result.duration_seconds)} | {speed_str}"
+                row = [result.job.source.name, detail, Text("OK", style="green bold")]
+            else:
+                row = [
+                    result.job.source.name,
+                    _fmt_size(result.input_size_bytes),
+                    _fmt_size(result.output_size_bytes),
+                    _fmt_size(saved),
+                    Text(f"{pct:.1f}%", style=pct_style),
+                    _fmt_duration(result.duration_seconds),
+                    speed_str,
+                    Text("OK", style="green bold"),
+                ]
             table.add_row(*row)
 
             total_input += result.input_size_bytes
