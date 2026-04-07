@@ -546,6 +546,48 @@ def _write_followup_manifest_for_jobs(
     return path
 
 
+def _preflight_failure_results(
+    jobs: list[EncodeJob],
+    *,
+    ffmpeg: Path,
+    ffprobe: Path,
+) -> tuple[list[EncodeJob], list[EncodeResult], list[str]]:
+    compatible_jobs: list[EncodeJob] = []
+    failed_results: list[EncodeResult] = []
+    details: list[str] = []
+    for job in jobs:
+        result = preflight_encode_job(
+            job.source,
+            ffmpeg,
+            ffprobe,
+            crf=job.crf,
+            preset=job.preset,
+        )
+        if result.success:
+            compatible_jobs.append(job)
+            continue
+        diagnosed = _apply_failure_diagnostics(result)
+        reason = _classify_incompatible_reason(diagnosed.error_message, job, ffprobe=ffprobe)
+        diagnosed.error_message = (
+            f"{diagnosed.error_message or 'Compatibility check failed'} "
+            "(at output-header initialization)"
+        )
+        if diagnosed.attempts:
+            last_attempt = diagnosed.attempts[-1]
+            diagnosed.attempts[-1] = EncodeAttempt(
+                preset=last_attempt.preset,
+                crf=last_attempt.crf,
+                success=last_attempt.success,
+                duration_seconds=last_attempt.duration_seconds,
+                progress_pct=last_attempt.progress_pct,
+                error_message=diagnosed.error_message,
+                retry_kind=last_attempt.retry_kind,
+            )
+        failed_results.append(diagnosed)
+        details.append(f"{job.source.name}: {reason}")
+    return compatible_jobs, failed_results, details
+
+
 def _print_preflight_warnings(warnings: list[str]) -> None:
     for warning in warnings:
         console.print(f"[yellow]{warning}[/yellow]")
@@ -1210,6 +1252,12 @@ def _run_encode_loop(
         overall_task = progress.add_task(
             f"[cyan]Overall ({len(to_encode)} file(s))",
             total=total_bytes,
+            completed_files=0,
+            remaining_files=len(to_encode),
+            last_update_at=time.monotonic(),
+            stall_warning_seconds=stall_warning_seconds,
+            heartbeat_state="active",
+            eta_confident=False,
         )
         file_task = progress.add_task("", total=1)
 
@@ -1231,6 +1279,15 @@ def _run_encode_loop(
                 stall_warning_seconds=stall_warning_seconds,
                 heartbeat_state="active",
                 eta_confident=False,
+            )
+            progress.update(
+                overall_task,
+                completed_files=files_done,
+                remaining_files=files_remaining + 1,
+                last_update_at=time.monotonic(),
+                stall_warning_seconds=stall_warning_seconds,
+                heartbeat_state="active",
+                eta_confident=bytes_done > 0,
             )
             started_at = _now_iso()
             stall_state = {
@@ -1284,6 +1341,12 @@ def _run_encode_loop(
                         last_update_at=stall_state["last_update"],
                         stall_warning_seconds=stall_warning_seconds,
                     )
+                    progress.update(
+                        overall_task,
+                        heartbeat_state=state,
+                        last_update_at=stall_state["last_update"],
+                        stall_warning_seconds=stall_warning_seconds,
+                    )
                     if stall_state["warned"] or state != "stalled":
                         continue
                     if idle_for >= stall_warning_seconds * grace_multiplier:
@@ -1313,6 +1376,16 @@ def _run_encode_loop(
                         stall_warning_seconds=stall_warning_seconds,
                         heartbeat_state="active",
                         eta_confident=pct >= 5.0,
+                    )
+                    progress.update(
+                        overall_task,
+                        completed=bytes_done + (fb * pct / 100),
+                        completed_files=files_done,
+                        remaining_files=files_remaining + 1,
+                        last_update_at=stall_state["last_update"],
+                        stall_warning_seconds=stall_warning_seconds,
+                        heartbeat_state="active",
+                        eta_confident=pct >= 5.0 or bytes_done > 0,
                     )
                     if session is not None and session_path is not None:
                         update_session_entry(
@@ -1511,11 +1584,26 @@ def _run_encode_loop(
 
             if not job.skip:
                 bytes_done += file_size
-                progress.update(overall_task, completed=bytes_done)
+                progress.update(
+                    overall_task,
+                    completed=bytes_done,
+                    completed_files=min(len(results), len(to_encode)),
+                    remaining_files=max(len(to_encode) - len(results), 0),
+                    last_update_at=time.monotonic(),
+                    heartbeat_state="active",
+                    eta_confident=bytes_done > 0,
+                )
                 progress.update(file_task, completed=task_total)
             if stopped_early:
                 break
 
+        progress.update(
+            overall_task,
+            completed_files=len(to_encode),
+            remaining_files=0,
+            heartbeat_state="complete",
+            eta_confident=True,
+        )
         progress.update(
             file_task,
             completed_files=len(to_encode),
@@ -2686,7 +2774,8 @@ def wizard(
             use_calibration=use_calibration,
         )
     )
-    # Offer to immediately encode the follow-up manifest with a software fallback profile.
+    # Offer to immediately preflight and, if viable, encode the follow-up manifest with a
+    # software diagnostic profile.
     if (
         followup_manifest_path is not None
         and followup_manifest_path.exists()
@@ -2695,8 +2784,8 @@ def wizard(
     ):
         fallback_preset, fallback_crf = "faster", 22
         run_followup = auto or typer.confirm(
-            f"Run follow-up manifest now with software profile (libx265 {fallback_preset}, CRF {fallback_crf})?",
-            default=False,
+            f"Run follow-up manifest now with software diagnostic retry (libx265 {fallback_preset}, CRF {fallback_crf})?",
+            default=True,
         )
         if run_followup:
             followup_manifest_data = load_manifest(followup_manifest_path)
@@ -2714,20 +2803,45 @@ def wizard(
                     ffprobe=ffprobe,
                     no_skip=False,
                 )
-                followup_results, followup_stopped = _normalize_loop_result(
-                    _run_encode_loop(
+                compatible_followup_jobs, preflight_followup_results, followup_details = (
+                    _preflight_failure_results(
                         followup_jobs,
-                        ffmpeg,
-                        ffprobe,
-                        display,
-                        stall_warning_seconds=float(stall_warning_seconds),
-                        on_file_failure=on_file_failure,
-                        use_calibration=use_calibration,
+                        ffmpeg=ffmpeg,
+                        ffprobe=ffprobe,
                     )
                 )
-                results = results + followup_results
-                if followup_stopped:
-                    stopped_early = True
+                if followup_details:
+                    console.print(
+                        "[yellow]Follow-up preflight found remaining incompatibilities.[/yellow]"
+                    )
+                    _print_grouped_preflight_details(
+                        followup_details,
+                        style="yellow",
+                        prefix="  ",
+                    )
+                    console.print(
+                        "  [dim]These failures happened before the output header could be initialized. "
+                        "This points to container or copied-stream compatibility, not just the hardware encoder.[/dim]"
+                    )
+                    console.print(
+                        f'  [dim]Retry manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
+                    )
+                results = results + preflight_followup_results
+                if compatible_followup_jobs:
+                    followup_results, followup_stopped = _normalize_loop_result(
+                        _run_encode_loop(
+                            compatible_followup_jobs,
+                            ffmpeg,
+                            ffprobe,
+                            display,
+                            stall_warning_seconds=float(stall_warning_seconds),
+                            on_file_failure=on_file_failure,
+                            use_calibration=use_calibration,
+                        )
+                    )
+                    results = results + followup_results
+                    if followup_stopped:
+                        stopped_early = True
 
     cleaned_paths: list[Path] = []
     if wizard_cleanup:

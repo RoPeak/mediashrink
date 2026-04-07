@@ -1020,7 +1020,8 @@ def test_run_encode_loop_removes_file_task_and_updates_overall_only_on_completio
         for args, kwargs in mock_progress.update.call_args_list
         if args and args[0] == 0 and "completed" in kwargs
     ]
-    assert overall_updates == [5_000_000]
+    assert overall_updates[-1] == 5_000_000
+    assert any(update < 5_000_000 for update in overall_updates)
     mock_progress.remove_task.assert_called_once_with(1)
     mock_display.show_summary.assert_called_once_with(
         [ok_result],
@@ -1891,6 +1892,71 @@ def test_encode_warns_about_attachment_data_and_audio_container_constraints(tmp_
     assert "Attachment warning:" in result.stdout
     assert "Auxiliary data warning:" in result.stdout
     assert "Audio compatibility warning:" in result.stdout
+
+
+def test_wizard_followup_rerun_preflights_before_encoding(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mkv"
+    source.write_bytes(b"x" * 1000)
+    followup = tmp_path / "mediashrink_followup_20260407_120000.json"
+    save_manifest(
+        build_manifest(
+            directory=tmp_path,
+            recursive=True,
+            preset="amf",
+            crf=22,
+            profile_name=None,
+            estimated_total_encode_seconds=None,
+            estimate_confidence=None,
+            size_confidence=None,
+            size_confidence_detail=None,
+            time_confidence=None,
+            time_confidence_detail=None,
+            duplicate_policy=None,
+            items=[
+                AnalysisItem(
+                    source=source,
+                    codec="h264",
+                    size_bytes=1000,
+                    duration_seconds=120.0,
+                    bitrate_kbps=8000.0,
+                    estimated_output_bytes=500,
+                    estimated_savings_bytes=500,
+                    recommendation="recommended",
+                    reason_code="reason",
+                    reason_text="reason",
+                )
+            ],
+        ),
+        followup,
+    )
+    primary_job = _make_job(source)
+    primary_result = _make_result(primary_job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch(
+            "mediashrink.wizard.run_wizard",
+            return_value=([primary_job], "encode", False, followup),
+        ),
+        patch("mediashrink.cli._run_encode_loop", return_value=[primary_result]) as mock_loop,
+        patch(
+            "mediashrink.cli.preflight_encode_job",
+            return_value=_make_result(
+                _make_job(source),
+                success=False,
+                output_size_bytes=0,
+                error_message="Could not write header (incorrect codec parameters ?): Invalid argument",
+            ),
+        ),
+    ):
+        result = runner.invoke(app, ["wizard", str(tmp_path)], input="y\n")
+
+    assert result.exit_code == 2
+    assert mock_loop.call_count == 1
+    assert "Follow-up preflight found remaining incompatibilities." in result.stdout
+    assert "before the output header could be initialized" in result.stdout
 
 
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:

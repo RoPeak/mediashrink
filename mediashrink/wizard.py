@@ -70,6 +70,7 @@ _HW_ENCODER_CAVEATS: dict[str, str] = {
     "amf": "AMF: quality may vary on older Radeon GPUs; test output before batch use.",
 }
 _DEFAULT_FALLBACK_PROFILE = ("faster", 22, "Fast", "faster")
+_CONFIDENCE_LEVELS = ("Low", "Medium", "High")
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -155,6 +156,116 @@ def _profile_predicted_incompatibility(
     ):
         return "hardware encoder startup failure"
     return None
+
+
+def _downgrade_confidence(label: str, steps: int = 1) -> str:
+    try:
+        index = _CONFIDENCE_LEVELS.index(label)
+    except ValueError:
+        return label
+    return _CONFIDENCE_LEVELS[max(index - steps, 0)]
+
+
+def _estimate_selected_output_bytes(
+    items: list[AnalysisItem],
+    *,
+    ffprobe: Path,
+    preset: str,
+    crf: int,
+    use_calibration: bool,
+    calibration_store: dict[str, object] | None,
+) -> int:
+    total = 0
+    for item in items:
+        estimated = estimate_output_size(
+            item.source,
+            ffprobe,
+            codec=item.codec,
+            crf=crf,
+            preset=preset,
+            use_calibration=use_calibration,
+            calibration_store=calibration_store,
+        )
+        total += estimated if estimated > 0 else item.estimated_output_bytes
+    return total
+
+
+def _post_split_confidence_labels(
+    items: list[AnalysisItem],
+    *,
+    original_items: list[AnalysisItem],
+    preset: str,
+    use_calibration: bool,
+    benchmarked_files: int,
+) -> tuple[str, str]:
+    size_conf = estimate_size_confidence(
+        items,
+        preset=preset,
+        use_calibration=use_calibration,
+    )
+    time_conf = estimate_time_confidence(
+        items,
+        benchmarked_files=benchmarked_files,
+        preset=preset,
+        use_calibration=use_calibration,
+    )
+    if len(items) <= 1 < len(original_items):
+        return _downgrade_confidence(size_conf), _downgrade_confidence(time_conf)
+    if len(items) < len(original_items):
+        size_codecs = {item.codec or "unknown" for item in items}
+        original_codecs = {item.codec or "unknown" for item in original_items}
+        if size_codecs != original_codecs or len(items) <= max(1, len(original_items) // 2):
+            return _downgrade_confidence(size_conf), _downgrade_confidence(time_conf)
+    return size_conf, time_conf
+
+
+def _select_risky_probe_items(
+    items: list[AnalysisItem],
+    ffprobe: Path,
+    *,
+    limit: int = 3,
+) -> list[AnalysisItem]:
+    risky: list[AnalysisItem] = []
+    for item in items:
+        suffix = item.source.suffix.lower()
+        if suffix in {".mp4", ".m4v"}:
+            risky.append(item)
+            continue
+        if describe_container_incompatibility(item.source, item.source, ffprobe) is not None:
+            risky.append(item)
+    risky.sort(key=lambda item: item.size_bytes, reverse=True)
+    return risky[:limit]
+
+
+def _targeted_profile_probe_failures(
+    *,
+    items: list[AnalysisItem],
+    available_hw: list[str],
+    ffmpeg: Path,
+    ffprobe: Path,
+    console: Console,
+) -> dict[tuple[str, int], dict[Path, str]]:
+    risky_items = _select_risky_probe_items(items, ffprobe)
+    if not risky_items or not available_hw:
+        return {}
+    failures: dict[tuple[str, int], dict[Path, str]] = {}
+    probe_targets = [(key, crf) for key in available_hw for crf in (20, 22)]
+    with console.status(
+        "[dim]Smoke-probing risky profile/file combinations...[/dim]", spinner="dots"
+    ):
+        for preset, crf in probe_targets:
+            for item in risky_items:
+                result = preflight_encode_job(
+                    item.source,
+                    ffmpeg,
+                    ffprobe,
+                    crf=crf,
+                    preset=preset,
+                )
+                if result.success:
+                    continue
+                failures.setdefault((preset, crf), {})[item.source] = result.error_message or ""
+    return failures
 
 
 def _adjust_profile_speed_with_calibration(
@@ -500,6 +611,7 @@ def build_profiles(
     policy: str = "fastest-wall-clock",
     use_calibration: bool = True,
     calibration_store: dict[str, object] | None = None,
+    observed_probe_failures: dict[tuple[str, int], dict[Path, str]] | None = None,
 ) -> list[EncoderProfile]:
     profiles: list[EncoderProfile] = []
     idx = 1
@@ -747,12 +859,36 @@ def build_profiles(
         if candidate_items and ffprobe is not None:
             compatible_items = []
             for item in candidate_items:
-                reason = _profile_predicted_incompatibility(
-                    item,
-                    profile,
-                    ffprobe,
-                    failure_rates.get(profile.encoder_key, 0.0),
+                observed_reason = (
+                    (observed_probe_failures or {})
+                    .get((profile.encoder_key, profile.crf), {})
+                    .get(item.source)
                 )
+                if observed_reason:
+                    lowered = observed_reason.lower()
+                    if "audio codec copy" in lowered:
+                        reason = "unsupported copied audio codec"
+                    elif "subtitle" in lowered or "mov_text" in lowered:
+                        reason = "subtitle codec is not supported by the chosen output container"
+                    elif "attachment" in lowered:
+                        reason = (
+                            "attachment streams are not supported by the chosen output container"
+                        )
+                    elif "data" in lowered or "bin_data" in lowered:
+                        reason = "auxiliary data streams are not supported by the chosen output container"
+                    elif (
+                        "could not open encoder before eof" in lowered or "internal bug" in lowered
+                    ):
+                        reason = "hardware encoder startup failure"
+                    else:
+                        reason = "output header failure"
+                else:
+                    reason = _profile_predicted_incompatibility(
+                        item,
+                        profile,
+                        ffprobe,
+                        failure_rates.get(profile.encoder_key, 0.0),
+                    )
                 if reason is None:
                     compatible_items.append(item)
                 else:
@@ -939,9 +1075,10 @@ def display_profiles_table(
             saving_high = saved + offset
             pct_low = saving_low / total_input_bytes * 100
             pct_high = saving_high / total_input_bytes * 100
-            est_saving = (
-                f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
-            )
+            if (pct_high - pct_low) >= 35:
+                est_saving = "~highly variable"
+            else:
+                est_saving = f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
         else:
             est_saving = f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
         if profile.estimated_encode_seconds > 0:
@@ -1595,6 +1732,13 @@ def run_wizard(
             )
 
     active_calibration = load_calibration_store() if use_calibration else None
+    observed_probe_failures = _targeted_profile_probe_failures(
+        items=candidate_items,
+        available_hw=available_hw,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        console=console,
+    )
     profiles = build_profiles(
         available_hw=available_hw,
         benchmark_speeds=benchmark_speeds,
@@ -1605,6 +1749,7 @@ def run_wizard(
         policy=policy,
         use_calibration=use_calibration,
         calibration_store=active_calibration,
+        observed_probe_failures=observed_probe_failures,
     )
     # Pre-compute per-preset size error bounds from calibration for estimate range display.
     _seen_presets: set[str] = set()
@@ -1691,6 +1836,7 @@ def run_wizard(
     selected_items = list(recommended_items)
     estimated_total_encode_seconds: float | None = None
     followup_manifest_path: Path | None = None
+    compatibility_prediction_note: str | None = None
     while True:
         preset, crf, sw_preset, display_label = _select_profile_interactively(
             visible_profiles,
@@ -1875,6 +2021,10 @@ def run_wizard(
                 ffmpeg=ffmpeg,
                 known_speed=benchmark_speeds.get(preset),
             )
+            compatibility_prediction_note = (
+                f"Predicted compatibility: {len(selected_items) + followup_count} file(s); "
+                f"preflight confirmed {len(compatible_jobs)} compatible / {len(preflight_failures)} moved to follow-up."
+            )
             console.print(
                 f"[yellow]{len(compatible_jobs)} file(s) can run now with {display_label}. "
                 f"{len(preflight_failures)} incompatible file(s) were moved to follow-up planning.[/yellow]"
@@ -1990,12 +2140,24 @@ def run_wizard(
     )
     console.print(f"  CRF:      {crf}")
     selected_input_bytes = sum(item.size_bytes for item in selected_items)
-    selected_output_bytes = sum(
-        item.estimated_output_bytes for item in selected_items if item.estimated_output_bytes > 0
+    selected_output_bytes = _estimate_selected_output_bytes(
+        selected_items,
+        ffprobe=ffprobe,
+        preset=preset,
+        crf=crf,
+        use_calibration=use_calibration,
+        calibration_store=active_calibration,
     )
-    selected_saved_bytes = sum(item.estimated_savings_bytes for item in selected_items)
+    selected_saved_bytes = max(selected_input_bytes - selected_output_bytes, 0)
     selected_saved_pct = (
         selected_saved_bytes / selected_input_bytes * 100 if selected_input_bytes else 0.0
+    )
+    size_confidence_label, time_confidence_label = _post_split_confidence_labels(
+        selected_items,
+        original_items=candidate_items,
+        preset=preset,
+        use_calibration=use_calibration,
+        benchmarked_files=1,
     )
     console.print(f"  Input:    {_fmt_size(selected_input_bytes)}")
     maybe_skip_out = len(analysis_items) - len(selected_items) - followup_count
@@ -2004,6 +2166,8 @@ def run_wizard(
             f"  [yellow]Moved to follow-up:[/yellow] {followup_count} file(s) failed "
             "compatibility check — see follow-up manifest above."
         )
+    if compatibility_prediction_note:
+        console.print(f"  [dim]{compatibility_prediction_note}[/dim]")
     if maybe_skip_out > 0:
         console.print(
             f"  [dim]Not in this run:[/dim] {maybe_skip_out} file(s) left out as maybe/skip candidates."
@@ -2015,12 +2179,8 @@ def run_wizard(
         )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
-    console.print(
-        f"  Size confidence: {estimate_size_confidence(selected_items, preset=preset, use_calibration=use_calibration)}"
-    )
-    console.print(
-        f"  Time confidence: {estimate_time_confidence(selected_items, benchmarked_files=1, preset=preset, use_calibration=use_calibration)}"
-    )
+    console.print(f"  Size confidence: {size_confidence_label}")
+    console.print(f"  Time confidence: {time_confidence_label}")
     if preset in _HW_ENCODERS:
         console.print(
             "  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]"

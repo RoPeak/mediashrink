@@ -187,6 +187,28 @@ def test_build_profiles_highest_confidence_downranks_unreliable_hardware(tmp_pat
     assert recommended.encoder_key != "amf"
 
 
+def test_build_profiles_downranks_hardware_with_observed_probe_failures(tmp_path: Path) -> None:
+    candidate = _analysis_item(tmp_path / "candidate.mp4", "recommended")
+
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 10.0, "fast": 1.0, "faster": 1.1},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+        candidate_items=[candidate],
+        ffprobe=FFPROBE,
+        policy="fastest-wall-clock",
+        observed_probe_failures={
+            ("amf", 20): {candidate.source: "Could not write header"},
+            ("amf", 22): {candidate.source: "Could not write header"},
+        },
+    )
+
+    recommended = next(profile for profile in profiles if profile.is_recommended)
+    assert recommended.encoder_key in {"fast", "faster"}
+    assert recommended.encoder_key != "amf"
+
+
 def test_build_profiles_adjusts_time_estimate_from_speed_error_history(tmp_path: Path) -> None:
     calibration_store = {
         "version": 1,
@@ -923,6 +945,7 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
     assert jobs == [mkv_job]
     assert "1 file(s) can run now with Balanced." in output
     assert "moved to follow-up planning" in output
+    assert "Predicted compatibility:" in output
 
 
 # ---------------------------------------------------------------------------
