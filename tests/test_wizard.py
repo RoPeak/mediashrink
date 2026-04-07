@@ -9,6 +9,7 @@ from rich.console import Console
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.wizard import (
     _sum_media_durations,
+    _summarize_mkv_suitable_candidates,
     EncoderProfile,
     ProfilePlanningResult,
     benchmark_encoder,
@@ -92,6 +93,32 @@ def test_sum_media_durations_uses_average_fallback(tmp_path: Path) -> None:
         total = _sum_media_durations(files, FFPROBE)
 
     assert total == pytest.approx(450.0)
+
+
+def test_summarize_mkv_suitable_candidates_groups_container_constraints(tmp_path: Path) -> None:
+    candidate = AnalysisItem(
+        source=tmp_path / "movie.mp4",
+        codec="h264",
+        size_bytes=1_000,
+        duration_seconds=100.0,
+        bitrate_kbps=2_000.0,
+        estimated_output_bytes=700,
+        estimated_savings_bytes=300,
+        recommendation="maybe",
+        reason_code="borderline_candidate",
+        reason_text="borderline",
+    )
+    candidate.source.write_bytes(b"fake")
+
+    with patch(
+        "mediashrink.wizard.describe_output_container_constraints",
+        return_value=["attachment streams will be dropped for MP4/M4V compatibility"],
+    ):
+        count, grouped, examples = _summarize_mkv_suitable_candidates([candidate], FFPROBE)
+
+    assert count == 1
+    assert grouped == {"attachment streams need MKV output": 1}
+    assert examples == ["movie.mp4"]
 
 
 def test_build_profiles_recommends_fastest_hardware() -> None:

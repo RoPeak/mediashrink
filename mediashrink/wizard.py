@@ -36,6 +36,7 @@ from mediashrink.encoder import (
     _HW_ENCODERS,
     describe_container_incompatibilities,
     describe_container_incompatibility,
+    describe_output_container_constraints,
     encode_preview,
     estimate_output_size,
     get_duration_seconds,
