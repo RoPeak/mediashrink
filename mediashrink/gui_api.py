@@ -4,28 +4,25 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from rich.console import Console
-
 from mediashrink.analysis import (
     AnalysisItem,
     analyze_files,
     apply_duplicate_policy_to_items,
     estimate_analysis_encode_seconds,
+    estimate_size_confidence,
+    estimate_time_confidence,
 )
 from mediashrink.cli import _run_encode_loop
 from mediashrink.models import EncodeResult
 from mediashrink.platform_utils import (
     check_ffmpeg_available,
-    detect_device_labels,
     find_ffmpeg,
     find_ffprobe,
 )
 from mediashrink.scanner import build_jobs, scan_directory
 from mediashrink.wizard import (
     EncoderProfile,
-    benchmark_encoder,
-    build_profiles,
-    detect_available_encoders,
+    prepare_profile_planning,
 )
 
 
@@ -60,6 +57,14 @@ class EncodePreparation:
     estimated_total_seconds: float | None
     on_file_failure: str
     use_calibration: bool
+    size_confidence: str | None = None
+    time_confidence: str | None = None
+    compatible_count: int = 0
+    incompatible_count: int = 0
+    grouped_incompatibilities: dict[str, int] | None = None
+    followup_manifest_path: Path | None = None
+    recommendation_reason: str | None = None
+    stage_messages: list[str] | None = None
 
 
 def prepare_tools() -> tuple[Path, Path]:
@@ -77,40 +82,17 @@ def auto_select_profile(
     policy: str = "fastest-wall-clock",
     use_calibration: bool = True,
 ) -> EncoderProfile | None:
-    candidate_items = [item for item in items if item.recommendation in {"recommended", "maybe"}]
-    if not candidate_items:
-        return None
-    total_input_bytes = sum(item.size_bytes for item in candidate_items)
-    total_media_seconds = sum(
-        item.duration_seconds for item in candidate_items if item.duration_seconds > 0
-    )
-    if total_media_seconds <= 0:
-        total_media_seconds = 3600.0 * len(candidate_items)
-    sample_item = max(candidate_items, key=lambda item: item.size_bytes)
-    sample_duration = sample_item.duration_seconds if sample_item.duration_seconds > 0 else 3600.0
-    quiet_console = Console(quiet=True)
-    available_hw = detect_available_encoders(
-        ffmpeg,
-        quiet_console,
-        sample_file=sample_item.source,
-        ffprobe=ffprobe,
-    )
-    benchmark_speeds: dict[str, float | None] = {}
-    for key in list(available_hw) + ["fast", "faster"]:
-        benchmark_speeds[key] = benchmark_encoder(
-            key, sample_item.source, sample_duration, 20, ffmpeg
-        )
-    profiles = build_profiles(
-        available_hw=available_hw,
-        benchmark_speeds=benchmark_speeds,
-        total_media_seconds=total_media_seconds,
-        total_input_bytes=total_input_bytes,
-        candidate_items=candidate_items,
+    planning = prepare_profile_planning(
+        analysis_items=items,
+        ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         policy=policy,
         use_calibration=use_calibration,
+        console=None,
     )
-    return next((profile for profile in profiles if profile.is_recommended), None)
+    if planning is None:
+        return None
+    return next((profile for profile in planning.profiles if profile.is_recommended), None)
 
 
 def prepare_encode_run(
@@ -146,6 +128,7 @@ def prepare_encode_run(
             estimated_total_seconds=0.0,
             on_file_failure=on_file_failure,
             use_calibration=use_calibration,
+            stage_messages=[],
         )
     items = analyze_files(
         files,
@@ -158,12 +141,18 @@ def prepare_encode_run(
         use_calibration=use_calibration,
     )
     items, duplicate_warnings = apply_duplicate_policy_to_items(items, policy=duplicate_policy)
-    profile = auto_select_profile(
-        items,
+    planning = prepare_profile_planning(
+        analysis_items=items,
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
         policy=policy,
         use_calibration=use_calibration,
+        console=None,
+    )
+    profile = (
+        next((candidate for candidate in planning.profiles if candidate.is_recommended), None)
+        if planning is not None
+        else None
     )
     selected_items = [item for item in items if item.recommendation == "recommended"]
     if not selected_items:
@@ -191,6 +180,7 @@ def prepare_encode_run(
             ffmpeg=ffmpeg,
             known_speed=None,
             use_calibration=use_calibration,
+            calibration_store=planning.active_calibration if planning is not None else None,
         )
         selected_input_bytes = sum(item.size_bytes for item in selected_items)
         selected_estimated_output_bytes = sum(
@@ -216,6 +206,31 @@ def prepare_encode_run(
         estimated_total_seconds=estimated_total_seconds,
         on_file_failure=on_file_failure,
         use_calibration=use_calibration,
+        size_confidence=(
+            estimate_size_confidence(
+                selected_items, preset=profile.encoder_key, use_calibration=use_calibration
+            )
+            if profile is not None
+            else None
+        ),
+        time_confidence=(
+            estimate_time_confidence(
+                selected_items,
+                benchmarked_files=1 if planning is not None and planning.benchmark_speeds else 0,
+                preset=profile.encoder_key,
+                use_calibration=use_calibration,
+            )
+            if profile is not None
+            else None
+        ),
+        compatible_count=profile.compatible_count if profile is not None else 0,
+        incompatible_count=profile.incompatible_count if profile is not None else 0,
+        grouped_incompatibilities=profile.grouped_incompatibilities
+        if profile is not None
+        else None,
+        followup_manifest_path=None,
+        recommendation_reason=profile.why_choose if profile is not None else None,
+        stage_messages=planning.stage_messages if planning is not None else [],
     )
 
 

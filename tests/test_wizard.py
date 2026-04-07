@@ -971,6 +971,7 @@ def test_next_step_menu_no_maybe_items() -> None:
     assert action == "compress_recommended"
     joined = "\n".join(output_lines)
     assert "Review maybe" not in joined
+    assert "Compress recommended files (3 file(s))" in joined
     # Options should be 1, 2, 3 (not 1, 3, 4)
     assert "2." in joined
     assert "3." in joined

@@ -10,6 +10,7 @@ from mediashrink.gui_api import (
     run_encode_plan,
 )
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
+from mediashrink.wizard import EncoderProfile, ProfilePlanningResult
 
 FFMPEG = Path("/usr/bin/ffmpeg")
 FFPROBE = Path("/usr/bin/ffprobe")
@@ -46,14 +47,35 @@ def test_prepare_encode_run_returns_empty_plan_for_empty_directory(tmp_path: Pat
 
 def test_auto_select_profile_returns_recommended_profile(tmp_path: Path) -> None:
     item = _analysis_item(tmp_path / "movie.mkv")
-
-    with (
-        patch("mediashrink.gui_api.detect_available_encoders", return_value=[]),
-        patch(
-            "mediashrink.gui_api.benchmark_encoder",
-            side_effect=lambda key, *_args: {"fast": 1.0, "faster": 2.0}.get(key, None),
-        ),
-    ):
+    planning = ProfilePlanningResult(
+        candidate_items=[item],
+        candidate_input_bytes=item.size_bytes,
+        candidate_media_seconds=item.duration_seconds,
+        sample_item=item,
+        sample_duration=item.duration_seconds,
+        preview_items=[item],
+        available_hw=[],
+        benchmark_speeds={"fast": 1.0, "faster": 2.0},
+        observed_probe_failures={},
+        profiles=[
+            EncoderProfile(
+                index=1,
+                intent_label="Fast",
+                name="Fast",
+                encoder_key="faster",
+                crf=22,
+                sw_preset="faster",
+                estimated_output_bytes=item.estimated_output_bytes,
+                estimated_encode_seconds=900.0,
+                quality_label="Very good",
+                is_recommended=True,
+            )
+        ],
+        active_calibration=None,
+        size_error_by_preset={},
+        stage_messages=["Benchmarking profiles... 2/2"],
+    )
+    with patch("mediashrink.gui_api.prepare_profile_planning", return_value=planning):
         profile = auto_select_profile([item], ffmpeg=FFMPEG, ffprobe=FFPROBE)
 
     assert profile is not None
@@ -95,6 +117,7 @@ def test_run_encode_plan_forwards_progress_and_results(tmp_path: Path) -> None:
         estimated_total_seconds=60.0,
         on_file_failure="retry",
         use_calibration=True,
+        stage_messages=[],
     )
     progress_events: list[EncodeProgress] = []
     result = EncodeResult(
@@ -125,3 +148,57 @@ def test_run_encode_plan_forwards_progress_and_results(tmp_path: Path) -> None:
     assert results == [result]
     assert progress_events
     assert progress_events[-1].overall_progress == 0.5
+
+
+def test_prepare_encode_run_exposes_structured_planning_fields(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mp4"
+    item = _analysis_item(source)
+    planning = ProfilePlanningResult(
+        candidate_items=[item],
+        candidate_input_bytes=item.size_bytes,
+        candidate_media_seconds=item.duration_seconds,
+        sample_item=item,
+        sample_duration=item.duration_seconds,
+        preview_items=[item],
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 6.0, "fast": 1.0, "faster": 2.0},
+        observed_probe_failures={},
+        profiles=[
+            EncoderProfile(
+                index=1,
+                intent_label="Fast",
+                name="Fast",
+                encoder_key="faster",
+                crf=22,
+                sw_preset="faster",
+                estimated_output_bytes=item.estimated_output_bytes,
+                estimated_encode_seconds=900.0,
+                quality_label="Very good",
+                is_recommended=True,
+                compatible_count=1,
+                incompatible_count=0,
+                grouped_incompatibilities={"attachment stream incompatibility": 1},
+                why_choose="Fastest wait: AMF, but Fast covers all 1 file(s) while AMF likely leaves 1 for follow-up.",
+            )
+        ],
+        active_calibration=None,
+        size_error_by_preset={},
+        stage_messages=[
+            "Benchmarking profiles... 3/3",
+            "Smoke-probing risky container/profile combinations... 2/2",
+        ],
+    )
+    with (
+        patch("mediashrink.gui_api.prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.gui_api.scan_directory", return_value=[source]),
+        patch("mediashrink.gui_api.analyze_files", return_value=[item]),
+        patch("mediashrink.gui_api.prepare_profile_planning", return_value=planning),
+        patch("mediashrink.gui_api.build_jobs", return_value=[]),
+        patch("mediashrink.gui_api.estimate_analysis_encode_seconds", return_value=120.0),
+    ):
+        result = prepare_encode_run(directory=tmp_path)
+
+    assert result.recommendation_reason is not None
+    assert result.compatible_count == 1
+    assert result.grouped_incompatibilities == {"attachment stream incompatibility": 1}
+    assert result.stage_messages == planning.stage_messages

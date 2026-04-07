@@ -8,11 +8,18 @@ from rich.console import Console
 from rich.table import Table
 
 from mediashrink.calibration import (
+    bitrate_bucket,
     describe_calibration_estimate,
     load_calibration_store,
     lookup_estimate,
+    resolution_bucket,
 )
-from mediashrink.encoder import estimate_output_size, get_duration_seconds, get_video_bitrate_kbps
+from mediashrink.encoder import (
+    _HW_ENCODERS,
+    estimate_output_size,
+    get_duration_seconds,
+    get_video_bitrate_kbps,
+)
 from mediashrink.models import AnalysisItem, AnalysisManifest
 from mediashrink.scanner import (
     apply_duplicate_title_policy,
@@ -262,19 +269,40 @@ def estimate_analysis_encode_seconds(
             active_store = (
                 calibration_store if calibration_store is not None else load_calibration_store()
             )
-            sample = recommended[0]
-            lookup = lookup_estimate(
-                active_store,
-                codec=sample.codec,
-                resolution="unknown",
-                bitrate="unknown",
-                preset=preset,
-                container=sample.source.suffix.lower() or ".mkv",
-            )
-            if lookup is not None and lookup.speed is not None and lookup.speed > 0:
-                speed = lookup.speed
+            weighted_speeds: list[tuple[float, float]] = []
+            for item in recommended:
+                resolution = (
+                    resolution_bucket(item.width, item.height)
+                    if getattr(item, "width", 0) and getattr(item, "height", 0)
+                    else "unknown"
+                )
+                bitrate = (
+                    bitrate_bucket(item.bitrate_kbps)
+                    if item.bitrate_kbps and item.bitrate_kbps > 0
+                    else "unknown"
+                )
+                lookup = lookup_estimate(
+                    active_store,
+                    codec=item.codec,
+                    resolution=resolution,
+                    bitrate=bitrate,
+                    preset=preset,
+                    container=item.source.suffix.lower() or ".mkv",
+                )
+                if lookup is None or lookup.speed is None or lookup.speed <= 0:
+                    continue
+                calibrated_speed = lookup.speed
                 if lookup.average_speed_error is not None:
-                    speed = max(0.05, speed * (1.0 + lookup.average_speed_error))
+                    calibrated_speed = max(
+                        0.05, calibrated_speed * (1.0 + lookup.average_speed_error)
+                    )
+                weight = max(item.duration_seconds, 1.0)
+                if preset not in _HW_ENCODERS and resolution != "unknown":
+                    weight *= 1.25
+                weighted_speeds.append((calibrated_speed, weight))
+            if weighted_speeds:
+                total_weight = sum(weight for _, weight in weighted_speeds)
+                speed = sum(value * weight for value, weight in weighted_speeds) / total_weight
             else:
                 speed = None
         else:
