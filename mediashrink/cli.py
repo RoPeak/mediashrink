@@ -14,13 +14,18 @@ from rich.console import Console
 from typer.core import TyperGroup
 
 from mediashrink.analysis import (
+    apply_duplicate_policy_to_items,
     analyze_files,
     build_manifest,
+    describe_size_confidence,
+    describe_time_confidence,
     describe_estimate_calibration,
     describe_estimate_confidence,
     display_analysis_summary,
     estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
+    estimate_size_confidence,
+    estimate_time_confidence,
     load_manifest,
     save_manifest,
     select_representative_items,
@@ -33,6 +38,7 @@ from mediashrink.calibration import (
     bitrate_bucket,
     estimate_failure_rate,
     load_calibration_store,
+    lookup_estimate,
     resolution_bucket,
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
@@ -62,7 +68,12 @@ from mediashrink.models import (
 from mediashrink.platform_utils import check_ffmpeg_available, find_ffmpeg, find_ffprobe
 from mediashrink.profiles import delete_profile, get_profile, list_all_profiles
 from mediashrink.progress import EncodingDisplay
-from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
+from mediashrink.scanner import (
+    build_jobs,
+    duplicate_policy_choices,
+    scan_directory,
+    supported_formats_label,
+)
 from mediashrink.session import (
     build_session,
     find_resumable_session,
@@ -117,6 +128,7 @@ _POLICY_CHOICES = {
 _FAILURE_POLICY_CHOICES = {"skip", "retry", "stop"}
 _RETRY_MODE_CHOICES = {"conservative", "balanced", "aggressive"}
 _QUEUE_STRATEGY_CHOICES = {"original", "safe-first"}
+_DUPLICATE_POLICY_CHOICES = set(duplicate_policy_choices())
 
 
 def _now_iso() -> str:
@@ -187,6 +199,12 @@ def _validate_retry_mode(value: str) -> str:
 def _validate_queue_strategy(value: str) -> str:
     if value not in _QUEUE_STRATEGY_CHOICES:
         raise typer.BadParameter(f"invalid queue strategy '{value}'")
+    return value
+
+
+def _validate_duplicate_policy(value: str) -> str:
+    if value not in _DUPLICATE_POLICY_CHOICES:
+        raise typer.BadParameter(f"invalid duplicate policy '{value}'")
     return value
 
 
@@ -460,6 +478,74 @@ def _apply_batch_preflight_policy(
     return jobs, warnings, skipped or stop_errors
 
 
+def _group_incompatibility_details(details: list[str]) -> list[str]:
+    grouped: dict[str, list[str]] = {}
+    for detail in details:
+        name, _, reason = detail.partition(": ")
+        label = reason or detail
+        grouped.setdefault(label, []).append(name or detail)
+    summaries: list[str] = []
+    for reason, names in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+        examples = ", ".join(names[:3])
+        summary = f"{len(names)} file(s): {reason}"
+        if examples:
+            summary += f" ({examples})"
+        summaries.append(summary)
+    return summaries
+
+
+def _print_grouped_preflight_details(details: list[str], *, style: str, prefix: str) -> None:
+    for summary in _group_incompatibility_details(details):
+        console.print(f"[{style}]{prefix}[/]{summary}")
+
+
+def _followup_notes_for_incompatible_details(details: list[str]) -> list[str]:
+    if not details:
+        return []
+    notes = ["Automatically generated from files left out by preflight compatibility checks."]
+    notes.extend(_group_incompatibility_details(details))
+    notes.append("Suggested retry: prefer MKV outputs or rerun with --policy highest-confidence.")
+    return notes
+
+
+def _write_followup_manifest_for_jobs(
+    *,
+    directory: Path,
+    recursive: bool,
+    preset: str,
+    crf: int,
+    jobs: list[EncodeJob],
+    ffprobe: Path,
+    duplicate_policy: str | None,
+    details: list[str],
+) -> Path | None:
+    sources = [job.source for job in jobs if job.source.exists()]
+    if not sources:
+        return None
+    items = analyze_files(sources, ffprobe, preset=preset, crf=crf)
+    manifest = build_manifest(
+        directory=directory,
+        recursive=recursive,
+        preset=preset,
+        crf=crf,
+        profile_name=None,
+        estimated_total_encode_seconds=None,
+        estimate_confidence=None,
+        size_confidence=None,
+        size_confidence_detail=None,
+        time_confidence=None,
+        time_confidence_detail=None,
+        duplicate_policy=duplicate_policy,
+        recommended_only=False,
+        notes=_followup_notes_for_incompatible_details(details),
+        items=items,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = directory / f"mediashrink_followup_{timestamp}.json"
+    save_manifest(manifest, path)
+    return path
+
+
 def _print_preflight_warnings(warnings: list[str]) -> None:
     for warning in warnings:
         console.print(f"[yellow]{warning}[/yellow]")
@@ -523,6 +609,9 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
         guidance.append(
             f"Skipped incompatible files likely need MKV outputs or a different preset path for: {directory}"
         )
+    followup_manifest = payload.get("split_followup_manifest")
+    if isinstance(followup_manifest, str) and followup_manifest:
+        guidance.append(f"Review the follow-up manifest for left-out files: {followup_manifest}")
     if not guidance:
         guidance.append("No manual follow-up is suggested from this report.")
     return guidance
@@ -542,6 +631,21 @@ def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
     effective_speed = (
         duration_seconds / result.duration_seconds if result.duration_seconds > 0 else 0.0
     )
+    active_store = load_calibration_store()
+    width, height = get_video_resolution(result.job.source, ffprobe)
+    lookup = lookup_estimate(
+        active_store,
+        codec=codec,
+        resolution=resolution_bucket(width, height),
+        bitrate=bitrate_bucket(bitrate_kbps),
+        preset=result.job.preset,
+        container=result.job.output.suffix.lower() or ".mkv",
+    )
+    predicted_output_ratio = (
+        result.job.estimated_output_bytes / result.input_size_bytes
+        if result.input_size_bytes > 0 and result.job.estimated_output_bytes > 0
+        else None
+    )
     append_success_record(
         CalibrationRecord(
             codec=codec,
@@ -558,6 +662,8 @@ def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
             effective_speed=effective_speed,
             fallback_used=result.fallback_used,
             retry_used=result.retry_count > 0,
+            predicted_output_ratio=predicted_output_ratio,
+            predicted_speed=lookup.speed if lookup is not None else None,
         )
     )
 
@@ -620,6 +726,49 @@ def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
     }
 
 
+def _estimate_miss_summary(results: list[EncodeResult]) -> str | None:
+    successful = [result for result in results if result.success and not result.skipped]
+    estimated_inputs = [
+        result.job.estimated_output_bytes
+        for result in successful
+        if result.job.estimated_output_bytes > 0 and result.input_size_bytes > 0
+    ]
+    if not successful or not estimated_inputs:
+        return None
+    estimated_output = sum(
+        result.job.estimated_output_bytes
+        for result in successful
+        if result.job.estimated_output_bytes > 0
+    )
+    actual_output = sum(result.output_size_bytes for result in successful)
+    if estimated_output <= 0:
+        return None
+    delta_pct = ((actual_output - estimated_output) / estimated_output) * 100
+    if abs(delta_pct) < 5:
+        return "Actual output size stayed close to the estimate."
+    direction = "larger" if delta_pct > 0 else "smaller"
+    return f"Actual output size was {abs(delta_pct):.0f}% {direction} than estimated across successful files."
+
+
+def _group_incompatible_results(results: list[EncodeResult]) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for result in results:
+        if _classify_result_status(result) != "skipped_incompatible":
+            continue
+        reason = result.skip_reason or "incompatible"
+        if reason.startswith("incompatible: "):
+            reason = reason[len("incompatible: ") :]
+        entry = grouped.setdefault(reason, {"reason": reason, "count": 0, "examples": []})
+        entry["count"] = int(entry["count"]) + 1
+        examples = entry["examples"]
+        if isinstance(examples, list) and len(examples) < 3:
+            examples.append(result.job.source.name)
+    return sorted(
+        grouped.values(),
+        key=lambda item: (-int(item["count"]), str(item["reason"])),
+    )
+
+
 def _write_batch_reports(
     *,
     mode: str,
@@ -642,6 +791,10 @@ def _write_batch_reports(
     on_file_failure: str | None = None,
     retry_mode: str | None = None,
     queue_strategy: str | None = None,
+    size_confidence: str | None = None,
+    time_confidence: str | None = None,
+    split_followup_manifest: Path | None = None,
+    estimate_miss_summary: str | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -649,6 +802,7 @@ def _write_batch_reports(
     json_path = report_dir / f"mediashrink_report_{timestamp}.json"
     text_path = report_dir / f"mediashrink_report_{timestamp}.txt"
     totals = _results_totals(results)
+    grouped_incompatibilities = _group_incompatible_results(results)
     files = []
     for result in results:
         status = _classify_result_status(result)
@@ -703,6 +857,13 @@ def _write_batch_reports(
         "on_file_failure": on_file_failure,
         "retry_mode": retry_mode,
         "queue_strategy": queue_strategy,
+        "size_confidence": size_confidence,
+        "time_confidence": time_confidence,
+        "split_followup_manifest": (
+            str(split_followup_manifest) if split_followup_manifest is not None else None
+        ),
+        "estimate_miss_summary": estimate_miss_summary,
+        "grouped_incompatibilities": grouped_incompatibilities,
         "files": files,
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -725,6 +886,17 @@ def _write_batch_reports(
         else "On file failure: -",
         f"Retry mode: {retry_mode}" if retry_mode is not None else "Retry mode: -",
         f"Queue strategy: {queue_strategy}" if queue_strategy is not None else "Queue strategy: -",
+        f"Size confidence: {size_confidence}"
+        if size_confidence is not None
+        else "Size confidence: -",
+        f"Time confidence: {time_confidence}"
+        if time_confidence is not None
+        else "Time confidence: -",
+        (
+            f"Split follow-up manifest: {split_followup_manifest}"
+            if split_followup_manifest is not None
+            else "Split follow-up manifest: -"
+        ),
         f"Started: {started_at}",
         f"Finished: {finished_at}",
         "",
@@ -746,10 +918,19 @@ def _write_batch_reports(
             f"  Input: {_fmt_size(int(totals['input_bytes']))}",
             f"  Output: {_fmt_size(int(totals['output_bytes']))}",
             f"  Saved: {_fmt_size(int(totals['saved_bytes']))}",
-            "",
-            "Files",
         ]
     )
+    if grouped_incompatibilities:
+        lines.extend(["", "Grouped incompatibilities"])
+        for entry in grouped_incompatibilities:
+            examples = entry.get("examples") or []
+            example_text = (
+                f" (examples: {', '.join(str(name) for name in examples)})"
+                if isinstance(examples, list) and examples
+                else ""
+            )
+            lines.append(f"  - {entry['count']}: {entry['reason']}{example_text}")
+    lines.extend(["", "Files"])
     for result in results:
         status = _classify_result_status(result).upper()
         lines.append(f"- {result.job.source.name}: {status}")
@@ -786,6 +967,8 @@ def _write_batch_reports(
                 lines.append(
                     f"  Attempt {index}: {attempt.preset} / CRF {attempt.crf} - {status}{extra}"
                 )
+    if estimate_miss_summary:
+        lines.extend(["", "Estimate miss summary", f"  - {estimate_miss_summary}"])
     text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return json_path, text_path
 
@@ -1046,12 +1229,17 @@ def _run_encode_loop(
                 remaining_files=files_remaining,
                 last_update_at=time.monotonic(),
                 stall_warning_seconds=stall_warning_seconds,
+                heartbeat_state="active",
+                eta_confident=False,
             )
             started_at = _now_iso()
             stall_state = {
                 "last_update": time.monotonic(),
                 "last_percent": 0.0,
                 "warned": False,
+                "last_output_growth": time.monotonic(),
+                "last_output_size": 0,
+                "heartbeat_state": "active",
             }
             stall_stop = threading.Event()
 
@@ -1068,16 +1256,42 @@ def _run_encode_loop(
                 save_session(session, session_path)
 
             def watch_for_stall() -> None:
+                grace_multiplier = (
+                    2.0 if is_hardware_preset(job.preset) or file_size >= 4 * _GB else 1.0
+                )
                 while not stall_stop.wait(STALL_POLL_SECONDS):
-                    if stall_state["warned"]:
-                        continue
+                    try:
+                        current_size = (
+                            job.tmp_output.stat().st_size if job.tmp_output.exists() else 0
+                        )
+                    except OSError:
+                        current_size = 0
+                    if current_size > stall_state["last_output_size"]:
+                        stall_state["last_output_size"] = current_size
+                        stall_state["last_output_growth"] = time.monotonic()
                     idle_for = time.monotonic() - stall_state["last_update"]
-                    if idle_for >= stall_warning_seconds:
+                    since_growth = time.monotonic() - stall_state["last_output_growth"]
+                    if idle_for < min(15.0, stall_warning_seconds / 2):
+                        state = "active"
+                    elif since_growth < stall_warning_seconds * grace_multiplier:
+                        state = "quiet"
+                    else:
+                        state = "stalled"
+                    stall_state["heartbeat_state"] = state
+                    progress.update(
+                        file_task,
+                        heartbeat_state=state,
+                        last_update_at=stall_state["last_update"],
+                        stall_warning_seconds=stall_warning_seconds,
+                    )
+                    if stall_state["warned"] or state != "stalled":
+                        continue
+                    if idle_for >= stall_warning_seconds * grace_multiplier:
                         console.print(
                             f"\n[yellow]No progress update from FFmpeg for about {int(idle_for)}s while encoding {filename}.[/yellow]"
                         )
                         console.print(
-                            "[dim]The encoder may still be working. If you stop now, completed files stay done and the next run can resume from the session file.[/dim]"
+                            "[dim]FFmpeg still appears to be alive, but progress looks sparse. If you stop now, completed files stay done and the next run can resume from the session file.[/dim]"
                         )
                         stall_state["warned"] = True
 
@@ -1097,6 +1311,8 @@ def _run_encode_loop(
                         remaining_files=files_remaining,
                         last_update_at=stall_state["last_update"],
                         stall_warning_seconds=stall_warning_seconds,
+                        heartbeat_state="active",
+                        eta_confident=pct >= 5.0,
                     )
                     if session is not None and session_path is not None:
                         update_session_entry(
@@ -1469,6 +1685,7 @@ def _prepare_overnight_jobs(
     ffprobe: Path,
     policy: str,
     use_calibration: bool,
+    duplicate_policy: str,
 ) -> tuple[list[EncodeJob], str, int]:
     from mediashrink.wizard import (
         _run_preflight_checks,
@@ -1482,6 +1699,7 @@ def _prepare_overnight_jobs(
     if not files:
         return [], "fast", 20
     items = analyze_files(files, ffprobe, use_calibration=use_calibration)
+    items, _ = apply_duplicate_policy_to_items(items, policy=duplicate_policy)
     recommended_items = [item for item in items if item.recommendation == "recommended"]
     maybe_items = [item for item in items if item.recommendation == "maybe"]
     selected_items = recommended_items or maybe_items
@@ -1728,6 +1946,7 @@ def encode_cmd(
         no_skip=no_skip,
     )
     jobs = _prioritize_jobs(jobs, queue_strategy)
+    split_followup_manifest: Path | None = None
 
     prior: SessionManifest | None = None
     resumed_from_session = False
@@ -1764,17 +1983,41 @@ def encode_cmd(
             on_file_failure=on_file_failure,
         )
         if preflight_notes:
-            for note in preflight_notes:
-                console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+            _print_grouped_preflight_details(
+                preflight_notes,
+                style="yellow",
+                prefix="Compatibility summary: ",
+            )
         if incompatible and on_file_failure == "skip":
+            incompatible_jobs = [
+                job for job in jobs if (job.skip_reason or "").startswith("incompatible:")
+            ]
+            split_followup_manifest = _write_followup_manifest_for_jobs(
+                directory=directory,
+                recursive=recursive,
+                preset=effective_preset,
+                crf=effective_crf,
+                jobs=incompatible_jobs,
+                ffprobe=ffprobe,
+                duplicate_policy=None,
+                details=incompatible,
+            )
             console.print(
                 f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
             )
-            for note in incompatible[:5]:
-                console.print(f"[yellow]  - {note}[/yellow]")
+            _print_grouped_preflight_details(
+                incompatible,
+                style="yellow",
+                prefix="  ",
+            )
+            if split_followup_manifest is not None:
+                console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
         if incompatible and on_file_failure == "stop":
-            for note in incompatible:
-                console.print(f"[red]Compatibility check failed:[/red] {note}")
+            _print_grouped_preflight_details(
+                incompatible,
+                style="red",
+                prefix="Compatibility check failed: ",
+            )
             raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
     to_encode = [job for job in jobs if not job.skip]
@@ -1885,6 +2128,8 @@ def encode_cmd(
             on_file_failure=on_file_failure,
             retry_mode=retry_mode,
             queue_strategy=queue_strategy,
+            split_followup_manifest=split_followup_manifest,
+            estimate_miss_summary=_estimate_miss_summary(results),
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -1948,6 +2193,11 @@ def analyze(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results to improve estimates.",
     ),
+    duplicate_policy: str = typer.Option(
+        "prefer-mkv",
+        "--duplicate-policy",
+        help="How to handle likely duplicate titles across formats: prefer-mkv, all, or skip-title.",
+    ),
 ) -> None:
     quiet_console = Console(quiet=True) if json_output else console
     ffmpeg, ffprobe = _prepare_tools(None)
@@ -1962,6 +2212,10 @@ def analyze(
         preset=effective_preset,
         crf=effective_crf,
         use_calibration=use_calibration,
+    )
+    items, duplicate_notes = apply_duplicate_policy_to_items(
+        items,
+        policy=_validate_duplicate_policy(duplicate_policy),
     )
     if not items:
         if json_output:
@@ -1981,6 +2235,28 @@ def analyze(
     )
     estimate_confidence = estimate_analysis_confidence(items)
     estimate_confidence_detail = describe_estimate_confidence(items)
+    size_confidence = estimate_size_confidence(
+        items,
+        preset=effective_preset,
+        use_calibration=use_calibration,
+    )
+    size_confidence_detail = describe_size_confidence(
+        items,
+        preset=effective_preset,
+        use_calibration=use_calibration,
+    )
+    time_confidence = estimate_time_confidence(
+        items,
+        benchmarked_files=0,
+        preset=effective_preset,
+        use_calibration=use_calibration,
+    )
+    time_confidence_detail = describe_time_confidence(
+        items,
+        benchmarked_files=0,
+        preset=effective_preset,
+        use_calibration=use_calibration,
+    )
     calibration_detail = describe_estimate_calibration(
         items,
         preset=effective_preset,
@@ -1998,6 +2274,11 @@ def analyze(
             profile_name=profile_name,
             estimated_total_encode_seconds=estimated_total_encode_seconds,
             estimate_confidence=estimate_confidence,
+            size_confidence=size_confidence,
+            size_confidence_detail=size_confidence_detail,
+            time_confidence=time_confidence,
+            time_confidence_detail=time_confidence_detail,
+            duplicate_policy=duplicate_policy,
             items=items,
         )
         print(json.dumps(manifest.to_dict()))
@@ -2008,6 +2289,11 @@ def analyze(
             quiet_console,
             estimate_confidence=estimate_confidence,
             estimate_confidence_detail=estimate_confidence_detail,
+            size_confidence=size_confidence,
+            size_confidence_detail=size_confidence_detail,
+            time_confidence=time_confidence,
+            time_confidence_detail=time_confidence_detail,
+            notes=duplicate_notes,
         )
 
     if manifest_out is not None:
@@ -2019,6 +2305,11 @@ def analyze(
             profile_name=profile_name,
             estimated_total_encode_seconds=estimated_total_encode_seconds,
             estimate_confidence=estimate_confidence,
+            size_confidence=size_confidence,
+            size_confidence_detail=size_confidence_detail,
+            time_confidence=time_confidence,
+            time_confidence_detail=time_confidence_detail,
+            duplicate_policy=duplicate_policy,
             items=items,
         )
         save_manifest(manifest, manifest_out)
@@ -2137,6 +2428,7 @@ def apply(
         no_skip=False,
     )
     jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
+    split_followup_manifest: Path | None = None
 
     jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
         jobs,
@@ -2144,17 +2436,38 @@ def apply(
         ffprobe=ffprobe,
         on_file_failure=_validate_failure_policy(on_file_failure),
     )
-    for note in preflight_notes:
-        console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+    if preflight_notes:
+        _print_grouped_preflight_details(
+            preflight_notes,
+            style="yellow",
+            prefix="Compatibility summary: ",
+        )
     if incompatible and on_file_failure == "skip":
+        incompatible_jobs = [
+            job for job in jobs if (job.skip_reason or "").startswith("incompatible:")
+        ]
+        split_followup_manifest = _write_followup_manifest_for_jobs(
+            directory=loaded_manifest.analyzed_directory,
+            recursive=loaded_manifest.recursive,
+            preset=effective_preset,
+            crf=effective_crf,
+            jobs=incompatible_jobs,
+            ffprobe=ffprobe,
+            duplicate_policy=loaded_manifest.duplicate_policy,
+            details=incompatible,
+        )
         console.print(
             f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
         )
-        for note in incompatible[:5]:
-            console.print(f"[yellow]  - {note}[/yellow]")
+        _print_grouped_preflight_details(incompatible, style="yellow", prefix="  ")
+        if split_followup_manifest is not None:
+            console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
     if incompatible and on_file_failure == "stop":
-        for note in incompatible:
-            console.print(f"[red]Compatibility check failed:[/red] {note}")
+        _print_grouped_preflight_details(
+            incompatible,
+            style="red",
+            prefix="Compatibility check failed: ",
+        )
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
     display.show_scan_table(jobs)
@@ -2225,6 +2538,8 @@ def apply(
         on_file_failure=on_file_failure,
         retry_mode=_validate_retry_mode(retry_mode),
         queue_strategy=_validate_queue_strategy(queue_strategy),
+        split_followup_manifest=split_followup_manifest,
+        estimate_miss_summary=_estimate_miss_summary(results),
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
@@ -2292,6 +2607,16 @@ def wizard(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results to improve estimates and recommendations.",
     ),
+    duplicate_policy: str = typer.Option(
+        "prefer-mkv",
+        "--duplicate-policy",
+        help="How to handle likely duplicate titles across formats: prefer-mkv, all, or skip-title.",
+    ),
+    show_all_profiles: bool = typer.Option(
+        False,
+        "--show-all-profiles",
+        help="Show every profile row instead of hiding near-duplicate trade-offs.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -2320,6 +2645,8 @@ def wizard(
         policy=_validate_policy(policy),
         on_file_failure=_validate_failure_policy(on_file_failure),
         use_calibration=use_calibration,
+        duplicate_policy=_validate_duplicate_policy(duplicate_policy),
+        show_all_profiles=show_all_profiles,
     )
 
     if action == "cancel":
@@ -2377,6 +2704,7 @@ def wizard(
         warnings=preflight_warnings,
         policy=policy,
         on_file_failure=on_file_failure,
+        estimate_miss_summary=_estimate_miss_summary(results),
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -2481,6 +2809,7 @@ def resume(
         raise typer.Exit(code=EXIT_NO_FILES)
     jobs = _build_resume_jobs(session, ffprobe=ffprobe)
     jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
+    split_followup_manifest: Path | None = None
     if not jobs:
         console.print("[yellow]No resumable files remain in the saved session.[/yellow]")
         raise typer.Exit(code=EXIT_NO_FILES)
@@ -2491,17 +2820,38 @@ def resume(
         ffprobe=ffprobe,
         on_file_failure=_validate_failure_policy(on_file_failure),
     )
-    for note in preflight_notes:
-        console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+    if preflight_notes:
+        _print_grouped_preflight_details(
+            preflight_notes,
+            style="yellow",
+            prefix="Compatibility summary: ",
+        )
     if incompatible and on_file_failure == "skip":
+        incompatible_jobs = [
+            job for job in jobs if (job.skip_reason or "").startswith("incompatible:")
+        ]
+        split_followup_manifest = _write_followup_manifest_for_jobs(
+            directory=directory,
+            recursive=False,
+            preset=session.preset,
+            crf=session.crf,
+            jobs=incompatible_jobs,
+            ffprobe=ffprobe,
+            duplicate_policy=None,
+            details=incompatible,
+        )
         console.print(
             f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because --on-file-failure=skip.[/yellow]"
         )
-        for note in incompatible[:5]:
-            console.print(f"[yellow]  - {note}[/yellow]")
+        _print_grouped_preflight_details(incompatible, style="yellow", prefix="  ")
+        if split_followup_manifest is not None:
+            console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
     if incompatible and on_file_failure == "stop":
-        for note in incompatible:
-            console.print(f"[red]Compatibility check failed:[/red] {note}")
+        _print_grouped_preflight_details(
+            incompatible,
+            style="red",
+            prefix="Compatibility check failed: ",
+        )
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
     _reconcile_session_with_jobs(session, jobs)
@@ -2592,6 +2942,8 @@ def resume(
         warnings=preflight_warnings,
         policy=_validate_policy(policy),
         on_file_failure=on_file_failure,
+        split_followup_manifest=split_followup_manifest,
+        estimate_miss_summary=_estimate_miss_summary(results),
         retry_mode=_validate_retry_mode(retry_mode),
         queue_strategy=_validate_queue_strategy(queue_strategy),
     )
@@ -2648,6 +3000,11 @@ def overnight(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results to improve estimates and profile ranking.",
     ),
+    duplicate_policy: str = typer.Option(
+        "prefer-mkv",
+        "--duplicate-policy",
+        help="How to handle likely duplicate titles across formats: prefer-mkv, all, or skip-title.",
+    ),
     retry_mode: str = typer.Option(
         "conservative",
         "--retry-mode",
@@ -2679,10 +3036,12 @@ def overnight(
         ffprobe=ffprobe,
         policy=policy,
         use_calibration=use_calibration,
+        duplicate_policy=_validate_duplicate_policy(duplicate_policy),
     )
     queue_strategy = _validate_queue_strategy(queue_strategy)
     retry_mode = _validate_retry_mode(retry_mode)
     jobs = _prioritize_jobs(jobs, queue_strategy)
+    split_followup_manifest: Path | None = None
     if not jobs:
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
@@ -2695,14 +3054,32 @@ def overnight(
         ffprobe=ffprobe,
         on_file_failure="skip",
     )
-    for note in preflight_notes:
-        console.print(f"[yellow]Compatibility warning:[/yellow] {note}")
+    if preflight_notes:
+        _print_grouped_preflight_details(
+            preflight_notes,
+            style="yellow",
+            prefix="Compatibility summary: ",
+        )
     if incompatible:
+        incompatible_jobs = [
+            job for job in jobs if (job.skip_reason or "").startswith("incompatible:")
+        ]
+        split_followup_manifest = _write_followup_manifest_for_jobs(
+            directory=directory,
+            recursive=recursive,
+            preset=effective_preset,
+            crf=effective_crf,
+            jobs=incompatible_jobs,
+            ffprobe=ffprobe,
+            duplicate_policy=duplicate_policy,
+            details=incompatible,
+        )
         console.print(
             f"[yellow]Skipping {len(incompatible)} incompatible file(s) before batch start because overnight mode continues past file-level issues.[/yellow]"
         )
-        for note in incompatible[:5]:
-            console.print(f"[yellow]  - {note}[/yellow]")
+        _print_grouped_preflight_details(incompatible, style="yellow", prefix="  ")
+        if split_followup_manifest is not None:
+            console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
 
     prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
     resumed_from_session = False
@@ -2794,6 +3171,8 @@ def overnight(
         on_file_failure="skip",
         retry_mode=retry_mode,
         queue_strategy=queue_strategy,
+        split_followup_manifest=split_followup_manifest,
+        estimate_miss_summary=_estimate_miss_summary(results),
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
     if stopped_early or any(not r.success and not r.skipped for r in results):
@@ -2834,10 +3213,33 @@ def review(
         f"Mode: {payload.get('mode', '-')}, policy: {payload.get('policy', '-')}, retry mode: {payload.get('retry_mode', '-')}, queue: {payload.get('queue_strategy', '-')}",
         highlight=False,
     )
+    if payload.get("size_confidence") or payload.get("time_confidence"):
+        console.print(
+            f"Size confidence: {payload.get('size_confidence', '-')}, time confidence: {payload.get('time_confidence', '-')}",
+            highlight=False,
+        )
     console.print(
         f"Succeeded: {totals.get('succeeded', 0)}, failed: {totals.get('failed', 0)}, skipped incompatible: {totals.get('skipped_incompatible', 0)}, skipped by policy: {totals.get('skipped_by_policy', 0)}",
         highlight=False,
     )
+    estimate_miss = payload.get("estimate_miss_summary")
+    if isinstance(estimate_miss, str) and estimate_miss:
+        console.print(f"Estimate miss: {estimate_miss}", highlight=False)
+    grouped_incompatibilities = payload.get("grouped_incompatibilities")
+    if isinstance(grouped_incompatibilities, list) and grouped_incompatibilities:
+        console.print("[bold]Grouped incompatibilities[/bold]")
+        for entry in grouped_incompatibilities[:5]:
+            if not isinstance(entry, dict):
+                continue
+            reason = entry.get("reason", "incompatible")
+            count = entry.get("count", 0)
+            examples = entry.get("examples")
+            suffix = (
+                f" (examples: {', '.join(str(name) for name in examples[:3])})"
+                if isinstance(examples, list) and examples
+                else ""
+            )
+            console.print(f"  - {count}: {reason}{suffix}", highlight=False)
     warnings = payload.get("warnings")
     if isinstance(warnings, list) and warnings:
         console.print("[bold]Warnings[/bold]")

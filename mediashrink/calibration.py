@@ -27,6 +27,8 @@ class CalibrationRecord:
     effective_speed: float
     fallback_used: bool
     retry_used: bool
+    predicted_output_ratio: float | None = None
+    predicted_speed: float | None = None
 
 
 @dataclass
@@ -47,6 +49,8 @@ class CalibrationEstimate:
     loose_matches: int
     weighted_samples: float
     source: str
+    average_size_error: float | None = None
+    average_speed_error: float | None = None
 
 
 def get_calibration_path() -> Path:
@@ -290,6 +294,10 @@ def lookup_estimate(
         loose_matches=loose_count,
         weighted_samples=weighted_samples,
         source="exact" if exact_count > 0 else "related",
+        average_size_error=_average_prediction_error(
+            exact_matches + loose_matches, "predicted_output_ratio", "input_bytes", "output_bytes"
+        ),
+        average_speed_error=_average_speed_error(exact_matches + loose_matches),
     )
 
 
@@ -344,4 +352,49 @@ def describe_calibration_estimate(estimate: CalibrationEstimate | None) -> str |
     note = ", ".join(sample_parts)
     if estimate.failure_rate > 0:
         note += f", {estimate.failure_rate * 100:.0f}% failure history"
+    if estimate.average_size_error is not None and abs(estimate.average_size_error) >= 0.08:
+        note += ", size estimates tend to " + (
+            "underestimate output size"
+            if estimate.average_size_error > 0
+            else "overestimate output size"
+        )
     return note
+
+
+def _average_prediction_error(
+    records: list[dict[str, object]],
+    predicted_key: str,
+    input_key: str,
+    output_key: str,
+) -> float | None:
+    errors: list[float] = []
+    for raw in records:
+        predicted = raw.get(predicted_key)
+        input_bytes = raw.get(input_key)
+        output_bytes = raw.get(output_key)
+        if not isinstance(predicted, (int, float)) or predicted <= 0:
+            continue
+        if not isinstance(input_bytes, (int, float)) or input_bytes <= 0:
+            continue
+        if not isinstance(output_bytes, (int, float)) or output_bytes < 0:
+            continue
+        actual_ratio = float(output_bytes) / max(float(input_bytes), 1.0)
+        errors.append(actual_ratio - float(predicted))
+    if not errors:
+        return None
+    return sum(errors) / len(errors)
+
+
+def _average_speed_error(records: list[dict[str, object]]) -> float | None:
+    errors: list[float] = []
+    for raw in records:
+        predicted = raw.get("predicted_speed")
+        actual = raw.get("effective_speed")
+        if not isinstance(predicted, (int, float)) or predicted <= 0:
+            continue
+        if not isinstance(actual, (int, float)) or actual <= 0:
+            continue
+        errors.append((float(actual) - float(predicted)) / float(predicted))
+    if not errors:
+        return None
+    return sum(errors) / len(errors)

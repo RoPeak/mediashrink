@@ -187,6 +187,49 @@ def test_build_profiles_highest_confidence_downranks_unreliable_hardware(tmp_pat
     assert recommended.encoder_key != "amf"
 
 
+def test_build_profiles_adjusts_time_estimate_from_speed_error_history(tmp_path: Path) -> None:
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "1080p",
+                "bitrate_bucket": "high",
+                "preset": "faster",
+                "preset_family": "software",
+                "crf": 22,
+                "input_bytes": 1000,
+                "output_bytes": 500,
+                "duration_seconds": 100.0,
+                "wall_seconds": 200.0,
+                "effective_speed": 0.5,
+                "predicted_speed": 1.0,
+                "fallback_used": False,
+                "retry_used": False,
+            }
+        ],
+        "failures": [],
+    }
+    candidate = _analysis_item(tmp_path / "candidate.mkv", "recommended")
+
+    with patch("mediashrink.wizard.get_video_resolution", return_value=(1200, 1080)):
+        profiles = build_profiles(
+            available_hw=[],
+            benchmark_speeds={"fast": 1.0, "faster": 1.0},
+            total_media_seconds=120.0,
+            total_input_bytes=2 * 1024**3,
+            candidate_items=[candidate],
+            ffprobe=FFPROBE,
+            calibration_store=calibration_store,
+        )
+
+    fast = next(profile for profile in profiles if profile.name == "Fast")
+    balanced = next(profile for profile in profiles if profile.name == "Balanced")
+    assert fast.estimated_encode_seconds == pytest.approx(240.0)
+    assert balanced.estimated_encode_seconds == pytest.approx(240.0)
+
+
 def test_build_profiles_recommends_balanced_without_hw() -> None:
     profiles = build_profiles(
         available_hw=[],
@@ -245,7 +288,7 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
     display_profiles_table(profiles, 10 * 1024**3, 3, {"amf": "AMD Test"}, console)
 
     output = console.export_text()
-    assert "Why choose this" in output
+    assert "Why choose" in output
     assert "Intent" in output
     assert "Lowest estimated wait: Fast" in output
     assert "Default pick: Fast" in output
@@ -759,7 +802,7 @@ def test_run_wizard_switches_to_fallback_when_preflight_encode_fails(tmp_path: P
     assert action == "encode"
     assert jobs == [fake_job]
     assert "failed a short compatibility check" in output
-    assert "Could not write header" in output
+    assert "output header failure" in output
     assert "Retrying with" in output
     presets = [call.kwargs["preset"] for call in mock_build_jobs.call_args_list]
     assert presets == ["fast", "faster"]
@@ -862,7 +905,8 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
     output = console.export_text()
     assert action == "encode"
     assert jobs == [mkv_job]
-    assert "Skipping 1 incompatible file(s) for this run." in output
+    assert "1 file(s) can run now with Balanced." in output
+    assert "moved to follow-up planning" in output
 
 
 # ---------------------------------------------------------------------------

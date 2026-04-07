@@ -6,14 +6,19 @@ from unittest.mock import patch
 from rich.console import Console
 
 from mediashrink.analysis import (
+    apply_duplicate_policy_to_items,
     analyze_files,
     build_analysis_item,
     build_manifest,
     describe_estimate_calibration,
     describe_estimate_confidence,
+    describe_size_confidence,
+    describe_time_confidence,
     display_analysis_summary,
     estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
+    estimate_size_confidence,
+    estimate_time_confidence,
     load_manifest,
     save_manifest,
     select_representative_items,
@@ -207,7 +212,8 @@ def test_display_analysis_summary_prints_counts(tmp_path: Path) -> None:
     assert "maybe 1" in output
     assert "skip 1" in output
     assert "Rough encode time" in output
-    assert "Estimate confidence: High" in output
+    assert "Size confidence: High" in output
+    assert "Time confidence: High" in output
 
 
 def test_estimate_analysis_confidence_prefers_known_durations_and_low_codec_mix(
@@ -282,6 +288,102 @@ def test_describe_estimate_calibration_mentions_local_history(tmp_path: Path) ->
 
     assert detail is not None
     assert "close local match" in detail
+
+
+def test_duplicate_policy_prefers_mkv_copy(tmp_path: Path) -> None:
+    mkv_item = build_analysis_item_dict_item(
+        source=tmp_path / "Film (2005).mkv",
+        recommendation="recommended",
+    )
+    mp4_item = build_analysis_item_dict_item(
+        source=tmp_path / "Film (2005).mp4",
+        recommendation="recommended",
+    )
+
+    updated, notes = apply_duplicate_policy_to_items([mp4_item, mkv_item], policy="prefer-mkv")
+
+    assert [item.source.suffix for item in updated if item.recommendation != "skip"] == [".mkv"]
+    assert any("Preferred" in note for note in notes)
+
+
+def test_size_and_time_confidence_can_diverge(tmp_path: Path) -> None:
+    item = build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "unknown",
+                "preset": "fast",
+                "preset_family": "software",
+                "crf": 20,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "duration_seconds": 100.0,
+                "wall_seconds": 200.0,
+                "effective_speed": 0.5,
+                "fallback_used": False,
+                "retry_used": False,
+                "predicted_output_ratio": 0.4,
+                "predicted_speed": 1.0,
+            }
+        ],
+        "failures": [],
+    }
+
+    size_conf = estimate_size_confidence([item], preset="fast", calibration_store=calibration_store)
+    time_conf = estimate_time_confidence(
+        [item],
+        benchmarked_files=1,
+        preset="fast",
+        calibration_store=calibration_store,
+    )
+    size_detail = describe_size_confidence(
+        [item], preset="fast", calibration_store=calibration_store
+    )
+    time_detail = describe_time_confidence(
+        [item],
+        benchmarked_files=1,
+        preset="fast",
+        calibration_store=calibration_store,
+    )
+
+    assert size_conf in {"Medium", "High"}
+    assert time_conf in {"Medium", "High"}
+    assert "local history" in size_detail
+    assert "benchmark sample" in time_detail
+
+
+def test_manifest_round_trip_keeps_duplicate_policy_and_notes(tmp_path: Path) -> None:
+    recommended = build_analysis_item_dict_item(
+        source=tmp_path / "recommended.mkv",
+        recommendation="recommended",
+    )
+
+    manifest = build_manifest(
+        directory=tmp_path,
+        recursive=True,
+        preset="fast",
+        crf=20,
+        profile_name=None,
+        estimated_total_encode_seconds=1234.0,
+        estimate_confidence="Medium",
+        size_confidence="Low",
+        size_confidence_detail="heuristic only",
+        time_confidence="High",
+        time_confidence_detail="1 benchmark sample",
+        duplicate_policy="prefer-mkv",
+        notes=["Preferred MKV copy over duplicate MP4"],
+        items=[recommended],
+    )
+    path = tmp_path / "analysis.json"
+    save_manifest(manifest, path)
+    loaded = load_manifest(path)
+
+    assert loaded.duplicate_policy == "prefer-mkv"
+    assert loaded.notes == ["Preferred MKV copy over duplicate MP4"]
 
 
 def build_analysis_item_dict_item(

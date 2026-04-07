@@ -183,7 +183,10 @@ def estimate_output_size(
                 container=path.suffix.lower() or ".mkv",
             )
             if lookup is not None and lookup.output_ratio is not None and lookup.output_ratio > 0:
-                calibrated_estimate = int(input_size * lookup.output_ratio)
+                corrected_ratio = lookup.output_ratio
+                if lookup.average_size_error is not None:
+                    corrected_ratio = max(0.05, corrected_ratio + lookup.average_size_error)
+                calibrated_estimate = int(input_size * corrected_ratio)
                 if lookup.confidence == "High":
                     return calibrated_estimate
                 if lookup.confidence == "Medium":

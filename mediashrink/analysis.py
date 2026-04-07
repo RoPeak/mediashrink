@@ -14,7 +14,12 @@ from mediashrink.calibration import (
 )
 from mediashrink.encoder import estimate_output_size, get_duration_seconds, get_video_bitrate_kbps
 from mediashrink.models import AnalysisItem, AnalysisManifest
-from mediashrink.scanner import is_already_compressed, probe_video_codec, scan_directory
+from mediashrink.scanner import (
+    apply_duplicate_title_policy,
+    is_already_compressed,
+    probe_video_codec,
+    scan_directory,
+)
 
 MANIFEST_VERSION = 1
 
@@ -181,6 +186,47 @@ def analyze_files(
     return items
 
 
+def apply_duplicate_policy_to_items(
+    items: list[AnalysisItem],
+    *,
+    policy: str = "prefer-mkv",
+) -> tuple[list[AnalysisItem], list[str]]:
+    if policy == "all":
+        return items, []
+    selected, warnings, deprioritized = apply_duplicate_title_policy(
+        [item.source for item in items],
+        policy=policy,
+    )
+    selected_set = {path for path in selected}
+    suppressed = {path for paths in deprioritized.values() for path in paths}
+    updated: list[AnalysisItem] = []
+    for item in items:
+        if item.source in selected_set or item.source not in suppressed:
+            updated.append(item)
+            continue
+        updated.append(
+            AnalysisItem(
+                source=item.source,
+                codec=item.codec,
+                size_bytes=item.size_bytes,
+                duration_seconds=item.duration_seconds,
+                bitrate_kbps=item.bitrate_kbps,
+                estimated_output_bytes=item.estimated_output_bytes,
+                estimated_savings_bytes=item.estimated_savings_bytes,
+                recommendation="skip",
+                reason_code="duplicate_preferred_format"
+                if policy == "prefer-mkv"
+                else "duplicate_title_group",
+                reason_text=(
+                    "same title also exists as a preferred .mkv copy"
+                    if policy == "prefer-mkv"
+                    else "same title appears in multiple formats and was skipped as a group"
+                ),
+            )
+        )
+    return updated, warnings
+
+
 def analyze_directory(
     directory: Path,
     recursive: bool,
@@ -227,6 +273,8 @@ def estimate_analysis_encode_seconds(
             )
             if lookup is not None and lookup.speed is not None and lookup.speed > 0:
                 speed = lookup.speed
+                if lookup.average_speed_error is not None:
+                    speed = max(0.05, speed * (1.0 + lookup.average_speed_error))
             else:
                 speed = None
         else:
@@ -298,6 +346,14 @@ def build_manifest(
     profile_name: str | None,
     estimated_total_encode_seconds: float | None,
     estimate_confidence: str | None,
+    *,
+    size_confidence: str | None = None,
+    size_confidence_detail: str | None = None,
+    time_confidence: str | None = None,
+    time_confidence_detail: str | None = None,
+    duplicate_policy: str | None = None,
+    recommended_only: bool = True,
+    notes: list[str] | None = None,
     items: list[AnalysisItem],
 ) -> AnalysisManifest:
     return AnalysisManifest(
@@ -309,7 +365,17 @@ def build_manifest(
         profile_name=profile_name,
         estimated_total_encode_seconds=estimated_total_encode_seconds,
         estimate_confidence=estimate_confidence,
-        items=[item for item in items if item.recommendation == "recommended"],
+        size_confidence=size_confidence,
+        size_confidence_detail=size_confidence_detail,
+        time_confidence=time_confidence,
+        time_confidence_detail=time_confidence_detail,
+        duplicate_policy=duplicate_policy,
+        items=(
+            [item for item in items if item.recommendation == "recommended"]
+            if recommended_only
+            else list(items)
+        ),
+        notes=notes,
     )
 
 
@@ -354,6 +420,81 @@ def estimate_analysis_confidence(
     return "Low"
 
 
+def estimate_size_confidence(
+    items: list[AnalysisItem],
+    *,
+    preset: str = "fast",
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> str:
+    candidates = [item for item in items if item.recommendation != "skip"]
+    if not candidates:
+        return "Low"
+    known_estimates = sum(1 for item in candidates if item.estimated_output_bytes > 0)
+    known_ratio = known_estimates / len(candidates)
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    calibration_hits = 0
+    for item in candidates[:5]:
+        estimate = lookup_estimate(
+            active_store if use_calibration else None,
+            codec=item.codec,
+            resolution="unknown",
+            bitrate="unknown",
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if estimate is not None and estimate.output_ratio is not None:
+            calibration_hits += 1
+    score = 0
+    if known_ratio >= 0.95:
+        score += 2
+    elif known_ratio >= 0.70:
+        score += 1
+    else:
+        score -= 1
+    if calibration_hits >= min(3, len(candidates)):
+        score += 2
+    elif calibration_hits >= 1:
+        score += 1
+    if score >= 3:
+        return "High"
+    if score >= 1:
+        return "Medium"
+    return "Low"
+
+
+def estimate_time_confidence(
+    items: list[AnalysisItem],
+    *,
+    benchmarked_files: int = 0,
+    preset: str = "fast",
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> str:
+    base = estimate_analysis_confidence(items, benchmarked_files=benchmarked_files)
+    candidates = [item for item in items if item.recommendation != "skip"]
+    if not candidates:
+        return "Low"
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    speed_hits = 0
+    for item in candidates[:5]:
+        estimate = lookup_estimate(
+            active_store if use_calibration else None,
+            codec=item.codec,
+            resolution="unknown",
+            bitrate="unknown",
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if estimate is not None and estimate.speed is not None and estimate.speed > 0:
+            speed_hits += 1
+    if base == "High" or (base == "Medium" and speed_hits >= 2):
+        return "High"
+    if base == "Low" and speed_hits == 0:
+        return "Low"
+    return "Medium"
+
+
 def describe_estimate_confidence(
     items: list[AnalysisItem],
     *,
@@ -380,6 +521,60 @@ def describe_estimate_confidence(
     if fallback_estimates:
         detail += (
             f", {fallback_estimates} estimate fallback{'s' if fallback_estimates != 1 else ''}"
+        )
+    return detail
+
+
+def describe_size_confidence(
+    items: list[AnalysisItem],
+    *,
+    preset: str = "fast",
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> str:
+    candidates = [item for item in items if item.recommendation != "skip"]
+    if not candidates:
+        return "no encodable files"
+    known_estimates = sum(1 for item in candidates if item.estimated_output_bytes > 0)
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    calibration_note = describe_estimate_calibration(
+        candidates,
+        preset=preset,
+        use_calibration=use_calibration,
+        calibration_store=active_store,
+    )
+    detail = f"{known_estimates}/{len(candidates)} output size estimates available"
+    if calibration_note:
+        detail += f"; local history: {calibration_note}"
+    return detail
+
+
+def describe_time_confidence(
+    items: list[AnalysisItem],
+    *,
+    benchmarked_files: int = 0,
+    preset: str = "fast",
+    use_calibration: bool = True,
+    calibration_store: dict[str, object] | None = None,
+) -> str:
+    detail = describe_estimate_confidence(items, benchmarked_files=benchmarked_files)
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    candidates = [item for item in items if item.recommendation != "skip"]
+    speed_notes = 0
+    for item in candidates[:5]:
+        estimate = lookup_estimate(
+            active_store if use_calibration else None,
+            codec=item.codec,
+            resolution="unknown",
+            bitrate="unknown",
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if estimate is not None and estimate.speed is not None:
+            speed_notes += 1
+    if speed_notes:
+        detail += (
+            f"; local speed matches for {speed_notes}/{min(len(candidates), 5)} sample file(s)"
         )
     return detail
 
@@ -431,6 +626,11 @@ def display_analysis_summary(
     console: Console,
     estimate_confidence: str | None = None,
     estimate_confidence_detail: str | None = None,
+    size_confidence: str | None = None,
+    size_confidence_detail: str | None = None,
+    time_confidence: str | None = None,
+    time_confidence_detail: str | None = None,
+    notes: list[str] | None = None,
 ) -> None:
     recommended = [item for item in items if item.recommendation == "recommended"]
     maybe = [item for item in items if item.recommendation == "maybe"]
@@ -505,10 +705,23 @@ def display_analysis_summary(
             f"Rough encode time: [cyan]~{_fmt_duration(estimated_total_encode_seconds)}[/cyan]"
         )
     confidence = estimate_confidence or estimate_analysis_confidence(items)
+    resolved_size_confidence = size_confidence or confidence
+    resolved_time_confidence = time_confidence or confidence
     console.print(
-        f"Estimate confidence: [cyan]{confidence}[/cyan]"
-        + (f" [dim]({estimate_confidence_detail})[/dim]" if estimate_confidence_detail else "")
+        f"Size confidence: [cyan]{resolved_size_confidence}[/cyan]"
+        + (f" [dim]({size_confidence_detail})[/dim]" if size_confidence_detail else "")
     )
+    console.print(
+        f"Time confidence: [cyan]{resolved_time_confidence}[/cyan]"
+        + (
+            f" [dim]({time_confidence_detail or estimate_confidence_detail})[/dim]"
+            if (time_confidence_detail or estimate_confidence_detail)
+            else ""
+        )
+    )
+    if notes:
+        for note in notes:
+            console.print(f"[dim yellow]{note}[/dim yellow]")
     console.print("[dim]Analysis estimates are approximate.[/dim]")
     console.print(
         "[dim]Hardware encoders are faster, but source duration, bitrate, and resolution still dominate total runtime.[/dim]"

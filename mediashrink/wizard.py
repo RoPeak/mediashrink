@@ -13,23 +13,31 @@ from rich.table import Table
 from rich.text import Text
 
 from mediashrink.analysis import (
+    apply_duplicate_policy_to_items,
     analyze_files,
     build_manifest,
     describe_estimate_calibration,
     describe_estimate_confidence,
+    describe_size_confidence,
+    describe_time_confidence,
     display_analysis_summary,
     estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
+    estimate_size_confidence,
+    estimate_time_confidence,
     save_manifest,
     select_representative_items,
 )
 from mediashrink.calibration import estimate_failure_rate, load_calibration_store
+from mediashrink.calibration import bitrate_bucket, lookup_estimate, resolution_bucket
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import (
     _HW_ENCODERS,
+    describe_container_incompatibility,
     encode_preview,
     estimate_output_size,
     get_duration_seconds,
+    get_video_resolution,
     preflight_encode_job,
     probe_encoder_available,
     source_has_subtitle_streams,
@@ -39,7 +47,12 @@ from mediashrink.encoder import (
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.platform_utils import detect_device_labels
 from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
-from mediashrink.scanner import build_jobs, scan_directory, supported_formats_label
+from mediashrink.scanner import (
+    build_jobs,
+    duplicate_policy_choices,
+    scan_directory,
+    supported_formats_label,
+)
 
 _GB = 1024**3
 _MB = 1024**2
@@ -90,6 +103,11 @@ class EncoderProfile:
     why_choose: str = ""
     is_custom: bool = False
     is_builtin: bool = False
+    compatible_count: int = 0
+    incompatible_count: int = 0
+    compatibility_summary: str = ""
+    grouped_incompatibilities: dict[str, int] | None = None
+    effective_input_bytes: int = 0
 
 
 _QUALITY_RANK = {
@@ -105,6 +123,77 @@ def _quality_rank(label: str) -> int:
     return _QUALITY_RANK.get(label, -1)
 
 
+def _grouped_incompatibility_summary(grouped: dict[str, int]) -> str:
+    if not grouped:
+        return ""
+    parts = [
+        f"{count} {reason}"
+        for reason, count in sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    return "; ".join(parts[:2])
+
+
+def _profile_predicted_incompatibility(
+    item: AnalysisItem,
+    profile: EncoderProfile,
+    ffprobe: Path | None,
+    failure_rate: float,
+) -> str | None:
+    output_suffix = item.source.suffix.lower() or ".mkv"
+    if output_suffix in {".mp4", ".m4v"} and ffprobe is not None:
+        reason = describe_container_incompatibility(item.source, item.source, ffprobe)
+        if reason is not None:
+            if "audio codec copy" in reason:
+                return "unsupported copied audio codec"
+            if "attachment" in reason or "auxiliary data" in reason or "subtitle" in reason:
+                return "MP4/M4V stream-layout incompatibility"
+            return "output header failure"
+    if (
+        profile.encoder_key in _HW_ENCODERS
+        and output_suffix in {".mp4", ".m4v"}
+        and failure_rate >= 0.35
+    ):
+        return "hardware encoder startup failure"
+    return None
+
+
+def _adjust_profile_speed_with_calibration(
+    *,
+    base_speed: float | None,
+    preset: str,
+    items: list[AnalysisItem],
+    ffprobe: Path | None,
+    calibration_store: dict[str, object] | None,
+) -> float | None:
+    if (
+        base_speed is None
+        or base_speed <= 0
+        or ffprobe is None
+        or not items
+        or not calibration_store
+    ):
+        return base_speed
+    factors: list[float] = []
+    for item in items[:5]:
+        width, height = get_video_resolution(item.source, ffprobe)
+        if width <= 0 or height <= 0:
+            continue
+        lookup = lookup_estimate(
+            calibration_store,
+            codec=item.codec,
+            resolution=resolution_bucket(width, height),
+            bitrate=bitrate_bucket(item.bitrate_kbps),
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if lookup is None or lookup.average_speed_error is None:
+            continue
+        factors.append(max(0.2, 1.0 + lookup.average_speed_error))
+    if not factors:
+        return base_speed
+    return base_speed * (sum(factors) / len(factors))
+
+
 def _is_profile_dominated(profile: EncoderProfile, peers: list[EncoderProfile]) -> bool:
     if profile.is_custom or profile.estimated_encode_seconds <= 0:
         return False
@@ -117,11 +206,13 @@ def _is_profile_dominated(profile: EncoderProfile, peers: list[EncoderProfile]) 
         peer_saved = peer.estimated_output_bytes
         peer_quality = _quality_rank(peer.quality_label)
         if (
-            peer.estimated_encode_seconds <= profile.estimated_encode_seconds
+            peer.compatible_count >= profile.compatible_count
+            and peer.estimated_encode_seconds <= profile.estimated_encode_seconds
             and peer_saved <= profile_saved
             and peer_quality >= profile_quality
             and (
-                peer.estimated_encode_seconds < profile.estimated_encode_seconds
+                peer.compatible_count > profile.compatible_count
+                or peer.estimated_encode_seconds < profile.estimated_encode_seconds
                 or peer_saved < profile_saved
                 or peer_quality > profile_quality
             )
@@ -138,33 +229,40 @@ def _policy_sort_key(
 ) -> tuple[float, ...]:
     hardware_bias = 0.0 if profile.encoder_key in _HW_ENCODERS else 1.0
     quality_bias = float(_quality_rank(profile.quality_label) * -1)
+    compatibility_penalty = float(max(profile.incompatible_count, 0))
+    effective_wait = float(profile.estimated_encode_seconds or 0.0)
+    effective_size = float(profile.estimated_output_bytes or 0.0)
     if policy == "best-compression":
         return (
-            float(profile.estimated_output_bytes),
+            compatibility_penalty,
+            effective_size,
             quality_bias,
-            float(profile.estimated_encode_seconds),
+            effective_wait,
             failure_rate,
         )
     if policy == "lowest-cpu":
         return (
+            compatibility_penalty,
             hardware_bias,
             failure_rate,
-            float(profile.estimated_encode_seconds),
-            float(profile.estimated_output_bytes),
+            effective_wait,
+            effective_size,
         )
     if policy == "highest-confidence":
         return (
+            compatibility_penalty,
             failure_rate,
             hardware_bias,
-            float(profile.estimated_encode_seconds),
+            effective_wait,
             quality_bias,
-            float(profile.estimated_output_bytes),
+            effective_size,
         )
     return (
-        float(profile.estimated_encode_seconds),
+        compatibility_penalty,
+        effective_wait,
         failure_rate,
         quality_bias,
-        float(profile.estimated_output_bytes),
+        effective_size,
     )
 
 
@@ -367,7 +465,17 @@ def _profile_why_choose(profile: EncoderProfile, recommended: EncoderProfile | N
     if profile.is_custom:
         return "Manual override for exact settings."
     if recommended is profile:
-        return "Best default from the current time, size, and quality estimates."
+        coverage = f" Covers {profile.compatible_count} file(s)" if profile.compatible_count else ""
+        return (
+            "Best default from the current time, size, quality, and compatibility estimates."
+            + coverage
+            + "."
+        )
+    if profile.incompatible_count:
+        return (
+            f"Likely works for {profile.compatible_count} file(s); "
+            f"{profile.incompatible_count} may need a safer follow-up profile."
+        )
     if profile.encoder_key in _HW_ENCODERS:
         return "Uses GPU hardware to reduce CPU load and keep the encode on the hardware path."
     if profile.intent_label == "GPU offload":
@@ -631,7 +739,86 @@ def build_profiles(
             if recommended is not None:
                 recommended.is_recommended = True
 
-    recommended = next((profile for profile in profiles if profile.is_recommended), None)
+    for profile in profiles:
+        if profile.is_custom:
+            continue
+        grouped: dict[str, int] = {}
+        compatible_items = candidate_items or []
+        if candidate_items and ffprobe is not None:
+            compatible_items = []
+            for item in candidate_items:
+                reason = _profile_predicted_incompatibility(
+                    item,
+                    profile,
+                    ffprobe,
+                    failure_rates.get(profile.encoder_key, 0.0),
+                )
+                if reason is None:
+                    compatible_items.append(item)
+                else:
+                    grouped[reason] = grouped.get(reason, 0) + 1
+        profile.compatible_count = len(compatible_items) if candidate_items else 0
+        profile.incompatible_count = sum(grouped.values()) if candidate_items else 0
+        profile.grouped_incompatibilities = grouped or None
+        profile.compatibility_summary = _grouped_incompatibility_summary(grouped)
+        profile.effective_input_bytes = sum(item.size_bytes for item in compatible_items)
+        if compatible_items:
+            speed_key = (
+                profile.encoder_key
+                if profile.encoder_key in benchmark_speeds
+                else (profile.sw_preset or profile.encoder_key)
+            )
+            profile.estimated_output_bytes = sum(
+                estimate_output_size(
+                    item.source,
+                    ffprobe,
+                    codec=item.codec,
+                    crf=profile.crf,
+                    preset=profile.encoder_key,
+                    use_calibration=use_calibration,
+                    calibration_store=active_calibration,
+                )
+                if ffprobe is not None
+                else item.estimated_output_bytes
+                for item in compatible_items
+            )
+            calibrated_speed = _adjust_profile_speed_with_calibration(
+                base_speed=benchmark_speeds.get(speed_key),
+                preset=profile.encoder_key,
+                items=compatible_items,
+                ffprobe=ffprobe,
+                calibration_store=active_calibration,
+            )
+            profile.estimated_encode_seconds = _estimate_time(
+                _sum_item_durations(compatible_items),
+                calibrated_speed,
+            )
+        elif candidate_items:
+            profile.estimated_output_bytes = 0
+            profile.estimated_encode_seconds = 0.0
+    for profile in profiles:
+        profile.is_recommended = False
+    if candidate_items:
+        recommended = _select_recommended_profile(
+            profiles,
+            policy=policy,
+            failure_rates=failure_rates,
+        )
+        if recommended is not None:
+            recommended.is_recommended = True
+    elif not hardware_profiles:
+        balanced = next((profile for profile in profiles if profile.name == "Balanced"), None)
+        if balanced is not None and not _is_profile_dominated(balanced, profiles):
+            balanced.is_recommended = True
+        recommended = next((profile for profile in profiles if profile.is_recommended), None)
+    else:
+        recommended = _select_recommended_profile(
+            profiles,
+            policy=policy,
+            failure_rates=failure_rates,
+        )
+        if recommended is not None:
+            recommended.is_recommended = True
     for profile in profiles:
         profile.why_choose = _profile_why_choose(profile, recommended)
 
@@ -644,10 +831,53 @@ def display_profiles_table(
     candidate_count: int,
     device_labels: dict[str, str],
     console: Console,
-    estimate_confidence: str | None = None,
-    estimate_confidence_detail: str | None = None,
-) -> None:
-    compact = console.width < 120
+    time_confidence: str | None = None,
+    time_confidence_detail: str | None = None,
+    size_confidence: str | None = None,
+    size_confidence_detail: str | None = None,
+    show_all_profiles: bool = False,
+) -> list[EncoderProfile]:
+    def dedupe_key(profile: EncoderProfile) -> tuple[object, ...]:
+        encoder_family = (
+            "hardware"
+            if profile.encoder_key in _HW_ENCODERS
+            else profile.sw_preset or profile.encoder_key
+        )
+        time_bucket = (
+            round(profile.estimated_encode_seconds / 1800)
+            if profile.estimated_encode_seconds > 0
+            else -1
+        )
+        output_bucket = (
+            round(profile.estimated_output_bytes / (5 * _GB))
+            if profile.estimated_output_bytes > 0
+            else -1
+        )
+        return (
+            profile.intent_label,
+            encoder_family,
+            profile.crf // 2,
+            profile.compatible_count,
+            time_bucket,
+            output_bucket,
+        )
+
+    visible_profiles = profiles
+    if not show_all_profiles:
+        seen: set[tuple[object, ...]] = set()
+        filtered: list[EncoderProfile] = []
+        for profile in profiles:
+            if profile.is_custom:
+                filtered.append(profile)
+                continue
+            key = dedupe_key(profile)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(profile)
+        visible_profiles = filtered
+
+    compact = console.width < 150
     table = Table(
         title="Available encoding profiles",
         header_style="bold cyan",
@@ -660,12 +890,15 @@ def display_profiles_table(
     table.add_column("Encoder", style="dim cyan")
     table.add_column("Est. Saving", justify="right", style="bold green", no_wrap=True)
     table.add_column("Est. Time", justify="right", no_wrap=True)
+    if not compact:
+        table.add_column("Works for", justify="center", no_wrap=True)
+        table.add_column("Likely incompatible", justify="center", no_wrap=True)
     table.add_column("Quality", no_wrap=True)
-    table.add_column("Why choose this")
+    table.add_column("Why choose this", no_wrap=False)
     if not compact:
         table.add_column("CRF", justify="center", no_wrap=True)
 
-    for profile in profiles:
+    for profile in visible_profiles:
         if profile.is_custom:
             row: list[str | Text] = [
                 str(profile.index),
@@ -677,6 +910,9 @@ def display_profiles_table(
                 "-",
                 "Manual override.",
             ]
+            if not compact:
+                row.insert(6, "-")
+                row.insert(7, "-")
             if not compact:
                 row.append("-")
             table.add_row(*row)
@@ -710,9 +946,15 @@ def display_profiles_table(
             encoder_display,
             est_saving,
             est_time,
-            Text(profile.quality_label, style=quality_style),
-            profile.why_choose,
         ]
+        if not compact:
+            row.extend(
+                [
+                    str(profile.compatible_count) if candidate_count else "-",
+                    str(profile.incompatible_count) if candidate_count else "-",
+                ]
+            )
+        row.extend([Text(profile.quality_label, style=quality_style), profile.why_choose])
         if not compact:
             row.append(str(profile.crf))
         table.add_row(*row)
@@ -739,23 +981,34 @@ def display_profiles_table(
     console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
-    if estimate_confidence is not None:
+    if time_confidence is not None:
         console.print(
-            f"  [dim]Estimate confidence: {estimate_confidence}"
-            + (f" ({estimate_confidence_detail})" if estimate_confidence_detail else "")
+            f"  [dim]Time confidence: {time_confidence}"
+            + (f" ({time_confidence_detail})" if time_confidence_detail else "")
+            + ".[/dim]"
+        )
+    if size_confidence is not None:
+        console.print(
+            f"  [dim]Size confidence: {size_confidence}"
+            + (f" ({size_confidence_detail})" if size_confidence_detail else "")
             + ".[/dim]"
         )
     if fastest is not None:
         console.print(
-            f"  [dim]Lowest estimated wait: {fastest.name} (~{_fmt_duration(fastest.estimated_encode_seconds)}).[/dim]"
+            f"  [dim]Lowest estimated wait: {fastest.name} (~{_fmt_duration(fastest.estimated_encode_seconds)}), working for {fastest.compatible_count} file(s).[/dim]"
         )
     if recommended is not None:
         console.print(
-            f"  [dim]Default pick: {recommended.name} because it offers the best non-dominated trade-off for this batch.[/dim]"
+            f"  [dim]Default pick: {recommended.name} because it is estimated to work for {recommended.compatible_count} file(s) with {recommended.incompatible_count} likely left for follow-up.[/dim]"
         )
     if compact:
         console.print("  [dim]Compact view hides lower-priority columns on narrow terminals.[/dim]")
+    if not show_all_profiles and len(visible_profiles) < len(profiles):
+        console.print(
+            f"  [dim]Hidden {len(profiles) - len(visible_profiles)} near-duplicate profile row(s). Use --show-all-profiles to inspect every profile.[/dim]"
+        )
     console.print()
+    return visible_profiles
 
 
 def prompt_profile_selection(profiles: list[EncoderProfile], console: Console) -> EncoderProfile:
@@ -994,6 +1247,64 @@ def _run_preflight_checks(
     return passthrough + compatible, failed
 
 
+def _group_preflight_failures(
+    failures: list[tuple[EncodeJob, EncodeResult]],
+    ffprobe: Path,
+) -> dict[str, list[EncodeJob]]:
+    grouped: dict[str, list[EncodeJob]] = {}
+    for job, result in failures:
+        reason = result.error_message or ""
+        lowered = reason.lower()
+        label = "unknown compatibility failure"
+        if "could not open encoder before eof" in lowered or "internal bug" in lowered:
+            label = "hardware encoder startup failure"
+        elif "audio codec copy is not supported" in lowered:
+            label = "unsupported copied audio codec"
+        elif "could not write header" in lowered:
+            container_reason = describe_container_incompatibility(job.source, job.output, ffprobe)
+            if container_reason and "audio codec copy" in container_reason:
+                label = "unsupported copied audio codec"
+            elif container_reason:
+                label = "MP4/M4V stream-layout incompatibility"
+            else:
+                label = "output header failure"
+        elif job.output.suffix.lower() in {".mp4", ".m4v"}:
+            label = "MP4/M4V stream-layout incompatibility"
+        grouped.setdefault(label, []).append(job)
+    return grouped
+
+
+def _write_followup_manifest(
+    directory: Path,
+    recursive: bool,
+    preset: str,
+    crf: int,
+    incompatible_items: list[AnalysisItem],
+) -> Path | None:
+    if not incompatible_items:
+        return None
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    manifest_path = directory / f"mediashrink_followup_{timestamp}.json"
+    manifest = build_manifest(
+        directory=directory,
+        recursive=recursive,
+        preset=preset,
+        crf=crf,
+        profile_name=None,
+        estimated_total_encode_seconds=None,
+        estimate_confidence=None,
+        size_confidence=None,
+        size_confidence_detail=None,
+        time_confidence=None,
+        time_confidence_detail=None,
+        duplicate_policy=None,
+        recommended_only=False,
+        items=incompatible_items,
+    )
+    save_manifest(manifest, manifest_path)
+    return manifest_path
+
+
 def _select_profile_interactively(
     profiles: list[EncoderProfile],
     available_hw: list[str],
@@ -1145,6 +1456,8 @@ def run_wizard(
     policy: str = "fastest-wall-clock",
     on_file_failure: str = "retry",
     use_calibration: bool = True,
+    duplicate_policy: str = "prefer-mkv",
+    show_all_profiles: bool = False,
 ) -> tuple[list[EncodeJob], str, bool]:
     """Run the interactive wizard and return (jobs, action)."""
     console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
@@ -1169,6 +1482,10 @@ def run_wizard(
         console,
         use_calibration=use_calibration,
     )
+    analysis_items, duplicate_notes = apply_duplicate_policy_to_items(
+        analysis_items,
+        policy=duplicate_policy,
+    )
     initial_confidence = estimate_analysis_confidence(analysis_items)
     display_analysis_summary(
         analysis_items,
@@ -1176,6 +1493,25 @@ def run_wizard(
         console,
         estimate_confidence=initial_confidence,
         estimate_confidence_detail=describe_estimate_confidence(analysis_items),
+        size_confidence=estimate_size_confidence(
+            analysis_items,
+            use_calibration=use_calibration,
+        ),
+        size_confidence_detail=describe_size_confidence(
+            analysis_items,
+            use_calibration=use_calibration,
+        ),
+        time_confidence=estimate_time_confidence(
+            analysis_items,
+            benchmarked_files=0,
+            use_calibration=use_calibration,
+        ),
+        time_confidence_detail=describe_time_confidence(
+            analysis_items,
+            benchmarked_files=0,
+            use_calibration=use_calibration,
+        ),
+        notes=duplicate_notes,
     )
 
     recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
@@ -1242,22 +1578,52 @@ def run_wizard(
         ),
         use_calibration=use_calibration,
     )
-    display_profiles_table(
+    display_result = display_profiles_table(
         profiles,
         candidate_input_bytes,
         len(candidate_items),
         device_labels,
         console,
-        estimate_confidence=profile_estimate_confidence,
-        estimate_confidence_detail=(
-            describe_estimate_confidence(candidate_items, benchmarked_files=1)
+        time_confidence=estimate_time_confidence(
+            candidate_items,
+            benchmarked_files=1,
+            preset=next(
+                (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
+            ),
+            use_calibration=use_calibration,
+        ),
+        time_confidence_detail=describe_time_confidence(
+            candidate_items,
+            benchmarked_files=1,
+            preset=next(
+                (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
+            ),
+            use_calibration=use_calibration,
+        ),
+        size_confidence=estimate_size_confidence(
+            candidate_items,
+            preset=next(
+                (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
+            ),
+            use_calibration=use_calibration,
+        ),
+        size_confidence_detail=(
+            describe_size_confidence(
+                candidate_items,
+                preset=next(
+                    (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
+                ),
+                use_calibration=use_calibration,
+            )
             + (
                 f"; local history: {profile_calibration_detail}"
                 if profile_calibration_detail
                 else ""
             )
         ),
+        show_all_profiles=show_all_profiles,
     )
+    visible_profiles = display_result if isinstance(display_result, list) else profiles
 
     for hw_key in available_hw:
         if hw_key in _HW_ENCODER_CAVEATS:
@@ -1271,7 +1637,7 @@ def run_wizard(
     estimated_total_encode_seconds: float | None = None
     while True:
         preset, crf, sw_preset, display_label = _select_profile_interactively(
-            profiles, available_hw, device_labels, auto, console
+            visible_profiles, available_hw, device_labels, auto, console
         )
 
         if not auto and not profile_saved:
@@ -1307,6 +1673,29 @@ def run_wizard(
                     estimate_confidence=estimate_analysis_confidence(
                         recommended_items, benchmarked_files=1
                     ),
+                    size_confidence=estimate_size_confidence(
+                        analysis_items,
+                        preset=preset,
+                        use_calibration=use_calibration,
+                    ),
+                    size_confidence_detail=describe_size_confidence(
+                        analysis_items,
+                        preset=preset,
+                        use_calibration=use_calibration,
+                    ),
+                    time_confidence=estimate_time_confidence(
+                        analysis_items,
+                        benchmarked_files=1,
+                        preset=preset,
+                        use_calibration=use_calibration,
+                    ),
+                    time_confidence_detail=describe_time_confidence(
+                        analysis_items,
+                        benchmarked_files=1,
+                        preset=preset,
+                        use_calibration=use_calibration,
+                    ),
+                    duplicate_policy=duplicate_policy,
                     items=analysis_items,
                 )
                 default_manifest_path = directory / "mediashrink-analysis.json"
@@ -1368,14 +1757,12 @@ def run_wizard(
             f"[red]Profile:[/red] {display_label} "
             f"([red]encoder:[/red] {_encoder_display_name(preset, device_labels) if preset in _HW_ENCODERS else f'libx265 ({sw_preset or preset})'})"
         )
-        for failed_job, preflight_result in preflight_failures[:5]:
-            if preflight_result.error_message:
-                console.print(
-                    f"[red]{failed_job.source.name}:[/red] {preflight_result.error_message}"
-                )
-        if len(preflight_failures) > 5:
+        grouped_failures = _group_preflight_failures(preflight_failures, ffprobe)
+        for reason, jobs_for_reason in grouped_failures.items():
+            examples = ", ".join(job.source.name for job in jobs_for_reason[:3])
             console.print(
-                f"[dim]...and {len(preflight_failures) - 5} more compatibility failure(s).[/dim]"
+                f"[yellow]{len(jobs_for_reason)} file(s):[/yellow] {reason}"
+                + (f" [dim]({examples})[/dim]" if examples else "")
             )
         if any(job.output.suffix.lower() != ".mkv" for job, _ in preflight_failures):
             console.print(
@@ -1384,32 +1771,33 @@ def run_wizard(
 
         if compatible_jobs and len(compatible_jobs) < len(to_encode):
             compatible_sources = {job.source for job in compatible_jobs}
-            skip_default = True
-            skip_prompt = (
-                f"Skip {len(preflight_failures)} incompatible file(s) and continue with "
-                f"{len(compatible_jobs)} compatible file(s)?"
+            incompatible_items = [
+                item for item in selected_items if item.source not in compatible_sources
+            ]
+            followup_manifest = _write_followup_manifest(
+                directory,
+                recursive,
+                preset,
+                crf,
+                incompatible_items,
             )
-            if (
-                on_file_failure == "skip"
-                or auto
-                or typer.confirm(skip_prompt, default=skip_default)
-            ):
-                selected_items = [
-                    item for item in selected_items if item.source in compatible_sources
-                ]
-                jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
-                to_encode = compatible_jobs
-                estimated_total_encode_seconds = estimate_analysis_encode_seconds(
-                    items=selected_items,
-                    preset=preset,
-                    crf=crf,
-                    ffmpeg=ffmpeg,
-                    known_speed=benchmark_speeds.get(preset),
-                )
-                console.print(
-                    f"[yellow]Skipping {len(preflight_failures)} incompatible file(s) for this run.[/yellow]"
-                )
-                break
+            selected_items = [item for item in selected_items if item.source in compatible_sources]
+            jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
+            to_encode = compatible_jobs
+            estimated_total_encode_seconds = estimate_analysis_encode_seconds(
+                items=selected_items,
+                preset=preset,
+                crf=crf,
+                ffmpeg=ffmpeg,
+                known_speed=benchmark_speeds.get(preset),
+            )
+            console.print(
+                f"[yellow]{len(compatible_jobs)} file(s) can run now with {display_label}. "
+                f"{len(preflight_failures)} incompatible file(s) were moved to follow-up planning.[/yellow]"
+            )
+            if followup_manifest is not None:
+                console.print(f"[dim]Follow-up manifest:[/dim] {followup_manifest}")
+            break
 
         fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = (
             _DEFAULT_FALLBACK_PROFILE
@@ -1533,7 +1921,10 @@ def run_wizard(
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
     console.print(
-        f"  Estimate confidence: {estimate_analysis_confidence(selected_items, benchmarked_files=1)}"
+        f"  Size confidence: {estimate_size_confidence(selected_items, preset=preset, use_calibration=use_calibration)}"
+    )
+    console.print(
+        f"  Time confidence: {estimate_time_confidence(selected_items, benchmarked_files=1, preset=preset, use_calibration=use_calibration)}"
     )
     if preset in _HW_ENCODERS:
         console.print(

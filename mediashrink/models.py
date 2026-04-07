@@ -331,7 +331,13 @@ class AnalysisManifest:
     profile_name: str | None
     estimated_total_encode_seconds: float | None
     estimate_confidence: str | None
+    size_confidence: str | None
+    size_confidence_detail: str | None
+    time_confidence: str | None
+    time_confidence_detail: str | None
+    duplicate_policy: str | None
     items: list[AnalysisItem]
+    notes: list[str] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -343,6 +349,12 @@ class AnalysisManifest:
             "profile_name": self.profile_name,
             "estimated_total_encode_seconds": self.estimated_total_encode_seconds,
             "estimate_confidence": self.estimate_confidence,
+            "size_confidence": self.size_confidence,
+            "size_confidence_detail": self.size_confidence_detail,
+            "time_confidence": self.time_confidence,
+            "time_confidence_detail": self.time_confidence_detail,
+            "duplicate_policy": self.duplicate_policy,
+            "notes": self.notes or [],
             "items": [item.to_dict() for item in self.items],
         }
 
@@ -366,6 +378,24 @@ class AnalysisManifest:
         estimate_confidence = raw.get("estimate_confidence")
         if estimate_confidence is not None and not isinstance(estimate_confidence, str):
             raise ValueError("manifest estimate_confidence must be a string or null")
+        size_confidence = raw.get("size_confidence")
+        if size_confidence is not None and not isinstance(size_confidence, str):
+            raise ValueError("manifest size_confidence must be a string or null")
+        size_confidence_detail = raw.get("size_confidence_detail")
+        if size_confidence_detail is not None and not isinstance(size_confidence_detail, str):
+            raise ValueError("manifest size_confidence_detail must be a string or null")
+        time_confidence = raw.get("time_confidence")
+        if time_confidence is not None and not isinstance(time_confidence, str):
+            raise ValueError("manifest time_confidence must be a string or null")
+        time_confidence_detail = raw.get("time_confidence_detail")
+        if time_confidence_detail is not None and not isinstance(time_confidence_detail, str):
+            raise ValueError("manifest time_confidence_detail must be a string or null")
+        duplicate_policy = raw.get("duplicate_policy")
+        if duplicate_policy is not None and not isinstance(duplicate_policy, str):
+            raise ValueError("manifest duplicate_policy must be a string or null")
+        raw_notes = raw.get("notes", [])
+        if not isinstance(raw_notes, list):
+            raise ValueError("manifest notes must be a list")
         return cls(
             version=int(raw.get("version", 0)),
             analyzed_directory=Path(analyzed_directory),
@@ -375,5 +405,11 @@ class AnalysisManifest:
             profile_name=profile_name,
             estimated_total_encode_seconds=estimated_total,
             estimate_confidence=estimate_confidence,
+            size_confidence=size_confidence,
+            size_confidence_detail=size_confidence_detail,
+            time_confidence=time_confidence,
+            time_confidence_detail=time_confidence_detail,
+            duplicate_policy=duplicate_policy,
+            notes=[note for note in raw_notes if isinstance(note, str)] or None,
             items=[AnalysisItem.from_dict(item) for item in raw_items],
         )

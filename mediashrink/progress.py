@@ -49,6 +49,8 @@ class _CompletedSizeColumn(ProgressColumn):
 
 class _EtaColumn(ProgressColumn):
     def render(self, task) -> Text:
+        if task.fields.get("eta_confident") is False:
+            return Text("ETA unavailable", style="progress.remaining")
         remaining = task.time_remaining
         if remaining is None:
             return Text("ETA unavailable", style="progress.remaining")
@@ -66,6 +68,14 @@ class _FileCountsColumn(ProgressColumn):
 
 class _HeartbeatColumn(ProgressColumn):
     def render(self, task) -> Text:
+        state = task.fields.get("heartbeat_state")
+        if isinstance(state, str):
+            if state == "active":
+                return Text("active", style="green")
+            if state == "quiet":
+                return Text("quiet but healthy", style="cyan")
+            if state == "stalled":
+                return Text("likely stalled", style="yellow")
         last_update_at = task.fields.get("last_update_at")
         stall_warning_seconds = task.fields.get("stall_warning_seconds")
         if not isinstance(last_update_at, (int, float)):

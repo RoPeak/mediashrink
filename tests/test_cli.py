@@ -1703,6 +1703,85 @@ def test_review_command_json_includes_guidance(tmp_path: Path) -> None:
     assert payload["review_guidance"] == ["No manual follow-up is suggested from this report."]
 
 
+def test_review_command_mentions_followup_manifest_and_estimate_miss(tmp_path: Path) -> None:
+    report = tmp_path / "mediashrink_report_20260406_120000.json"
+    followup = tmp_path / "mediashrink_followup_20260406_120000.json"
+    followup.write_text('{"version": 1, "items": []}', encoding="utf-8")
+    report.write_text(
+        json.dumps(
+            {
+                "mode": "encode",
+                "directory": str(tmp_path),
+                "policy": "highest-confidence",
+                "retry_mode": "balanced",
+                "queue_strategy": "original",
+                "split_followup_manifest": str(followup),
+                "estimate_miss_summary": "Actual output size was 20% larger than estimated across successful files.",
+                "grouped_incompatibilities": [
+                    {
+                        "reason": "unsupported container/stream combination",
+                        "count": 2,
+                        "examples": ["episode-a.mp4", "episode-b.mp4"],
+                    }
+                ],
+                "totals": {
+                    "succeeded": 3,
+                    "failed": 0,
+                    "skipped_incompatible": 2,
+                    "skipped_by_policy": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["review", str(report)])
+
+    assert result.exit_code == 0
+    assert "follow-up manifest" in result.stdout.lower()
+    assert "Estimate miss:" in result.stdout
+    assert "Grouped incompatibilities" in result.stdout
+    assert "unsupported container/stream combination" in result.stdout
+
+
+def test_encode_skip_policy_writes_followup_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    ok_result = _make_result(
+        job, skipped=True, skip_reason="incompatible: unsupported container/stream combination"
+    )
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch(
+            "mediashrink.cli.preflight_encode_job",
+            return_value=_make_result(
+                job, success=False, output_size_bytes=0, error_message="Could not write header"
+            ),
+        ),
+        patch("mediashrink.cli.encode_file", return_value=ok_result),
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--yes", "--on-file-failure", "skip"])
+
+    assert result.exit_code == 0
+    followup = next(tmp_path.glob("mediashrink_followup_*.json"))
+    report_json = next(tmp_path.glob("mediashrink_report_*.json"))
+    payload = json.loads(report_json.read_text(encoding="utf-8"))
+    assert payload["split_followup_manifest"] == str(followup)
+    assert payload["grouped_incompatibilities"] == [
+        {
+            "reason": "output container cannot safely carry one or more copied streams",
+            "count": 1,
+            "examples": ["episode.mp4"],
+        }
+    ]
+
+
 def test_encode_skip_policy_skips_incompatible_file_before_batch(tmp_path: Path) -> None:
     source = tmp_path / "episode.mp4"
     source.write_bytes(b"x" * 1000)
