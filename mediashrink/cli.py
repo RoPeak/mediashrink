@@ -43,6 +43,7 @@ from mediashrink.calibration import (
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import (
+    describe_container_incompatibilities,
     describe_container_incompatibility,
     describe_output_container_constraints,
     encode_file,
@@ -416,6 +417,11 @@ def _classify_incompatible_reason(
         return "audio codec is not supported by the chosen output container"
     if "could not write header" in lowered and "invalid argument" in lowered:
         if ffprobe is not None:
+            classified_reasons = describe_container_incompatibilities(
+                job.source, job.output, ffprobe
+            )
+            if classified_reasons:
+                return classified_reasons[0]
             classified = describe_container_incompatibility(job.source, job.output, ffprobe)
             if classified is not None:
                 return classified
@@ -424,6 +430,11 @@ def _classify_incompatible_reason(
         return "encoder/container combination appears unreliable on this device"
     if job.output.suffix.lower() in {".mp4", ".m4v"}:
         if ffprobe is not None:
+            classified_reasons = describe_container_incompatibilities(
+                job.source, job.output, ffprobe
+            )
+            if classified_reasons:
+                return classified_reasons[0]
             classified = describe_container_incompatibility(job.source, job.output, ffprobe)
             if classified is not None:
                 return classified
@@ -492,6 +503,20 @@ def _group_incompatibility_details(details: list[str]) -> list[str]:
             summary += f" ({examples})"
         summaries.append(summary)
     return summaries
+
+
+def _followup_retry_is_actionable(details: list[str]) -> bool:
+    if not details:
+        return False
+    blocking_prefixes = (
+        "unsupported copied audio codec",
+        "unsupported copied subtitle codec",
+        "attachment stream incompatibility",
+        "auxiliary data stream incompatibility",
+        "output container cannot safely carry one or more copied streams",
+    )
+    reasons = [detail.partition(": ")[2] or detail for detail in details]
+    return not reasons or any(not reason.startswith(blocking_prefixes) for reason in reasons)
 
 
 def _print_grouped_preflight_details(details: list[str], *, style: str, prefix: str) -> None:
@@ -2783,65 +2808,80 @@ def wizard(
         and not json_output
     ):
         fallback_preset, fallback_crf = "faster", 22
-        run_followup = auto or typer.confirm(
-            f"Run follow-up manifest now with software diagnostic retry (libx265 {fallback_preset}, CRF {fallback_crf})?",
-            default=True,
-        )
-        if run_followup:
-            followup_manifest_data = load_manifest(followup_manifest_path)
-            existing_followup_files = [
-                item.source for item in followup_manifest_data.items if item.source.exists()
-            ]
-            if existing_followup_files:
-                followup_jobs = build_jobs(
-                    files=existing_followup_files,
-                    output_dir=output_dir,
-                    overwrite=overwrite,
-                    crf=fallback_crf,
-                    preset=fallback_preset,
-                    dry_run=False,
+        followup_manifest_data = load_manifest(followup_manifest_path)
+        existing_followup_files = [
+            item.source for item in followup_manifest_data.items if item.source.exists()
+        ]
+        if existing_followup_files:
+            followup_jobs = build_jobs(
+                files=existing_followup_files,
+                output_dir=output_dir,
+                overwrite=overwrite,
+                crf=fallback_crf,
+                preset=fallback_preset,
+                dry_run=False,
+                ffprobe=ffprobe,
+                no_skip=False,
+            )
+            compatible_followup_jobs, preflight_followup_results, followup_details = (
+                _preflight_failure_results(
+                    followup_jobs,
+                    ffmpeg=ffmpeg,
                     ffprobe=ffprobe,
-                    no_skip=False,
                 )
-                compatible_followup_jobs, preflight_followup_results, followup_details = (
-                    _preflight_failure_results(
-                        followup_jobs,
-                        ffmpeg=ffmpeg,
-                        ffprobe=ffprobe,
-                    )
+            )
+            actionable_retry = _followup_retry_is_actionable(followup_details)
+            if not actionable_retry and followup_details:
+                console.print(
+                    "[yellow]Follow-up manifest contains container/copied-stream issues that a software retry is unlikely to fix automatically.[/yellow]"
                 )
-                if followup_details:
-                    console.print(
-                        "[yellow]Follow-up preflight found remaining incompatibilities.[/yellow]"
-                    )
-                    _print_grouped_preflight_details(
-                        followup_details,
-                        style="yellow",
-                        prefix="  ",
-                    )
-                    console.print(
-                        "  [dim]These failures happened before the output header could be initialized. "
-                        "This points to container or copied-stream compatibility, not just the hardware encoder.[/dim]"
-                    )
-                    console.print(
-                        f'  [dim]Retry manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
-                    )
+                _print_grouped_preflight_details(
+                    followup_details,
+                    style="yellow",
+                    prefix="  ",
+                )
+                console.print(
+                    f'  [dim]Review manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
+                )
                 results = results + preflight_followup_results
-                if compatible_followup_jobs:
-                    followup_results, followup_stopped = _normalize_loop_result(
-                        _run_encode_loop(
-                            compatible_followup_jobs,
-                            ffmpeg,
-                            ffprobe,
-                            display,
-                            stall_warning_seconds=float(stall_warning_seconds),
-                            on_file_failure=on_file_failure,
-                            use_calibration=use_calibration,
+            else:
+                run_followup = auto or typer.confirm(
+                    f"Run follow-up manifest now with software diagnostic retry (libx265 {fallback_preset}, CRF {fallback_crf})?",
+                    default=True,
+                )
+                if run_followup:
+                    if followup_details:
+                        console.print(
+                            "[yellow]Follow-up preflight found remaining incompatibilities.[/yellow]"
                         )
-                    )
-                    results = results + followup_results
-                    if followup_stopped:
-                        stopped_early = True
+                        _print_grouped_preflight_details(
+                            followup_details,
+                            style="yellow",
+                            prefix="  ",
+                        )
+                        console.print(
+                            "  [dim]These failures happened before the output header could be initialized. "
+                            "This points to container or copied-stream compatibility, not just the hardware encoder.[/dim]"
+                        )
+                        console.print(
+                            f'  [dim]Retry manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
+                        )
+                    results = results + preflight_followup_results
+                    if compatible_followup_jobs:
+                        followup_results, followup_stopped = _normalize_loop_result(
+                            _run_encode_loop(
+                                compatible_followup_jobs,
+                                ffmpeg,
+                                ffprobe,
+                                display,
+                                stall_warning_seconds=float(stall_warning_seconds),
+                                on_file_failure=on_file_failure,
+                                use_calibration=use_calibration,
+                            )
+                        )
+                        results = results + followup_results
+                        if followup_stopped:
+                            stopped_early = True
 
     cleaned_paths: list[Path] = []
     if wizard_cleanup:

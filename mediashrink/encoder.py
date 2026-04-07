@@ -445,6 +445,24 @@ def output_may_require_audio_reencode(path: Path, output_path: Path, ffprobe: Pa
     return {codec for codec in codecs if codec not in _SAFE_MP4_AUDIO_CODECS}
 
 
+def describe_container_incompatibilities(
+    source: Path,
+    output_path: Path,
+    ffprobe: Path,
+) -> list[str]:
+    if output_path.suffix.lower() not in _MP4_CONTAINERS:
+        return []
+    reasons: list[str] = []
+    unsupported_audio = output_may_require_audio_reencode(source, output_path, ffprobe)
+    for codec in sorted(unsupported_audio):
+        reasons.append(f"unsupported copied audio codec: {codec}")
+    if source_has_attachment_streams(source, ffprobe):
+        reasons.append("attachment stream incompatibility")
+    if source_has_data_streams(source, ffprobe):
+        reasons.append("auxiliary data stream incompatibility")
+    return reasons
+
+
 def describe_output_container_constraints(
     source: Path,
     output_path: Path,
@@ -474,19 +492,16 @@ def describe_container_incompatibility(
     output_path: Path,
     ffprobe: Path,
 ) -> str | None:
-    if output_path.suffix.lower() not in _MP4_CONTAINERS:
-        return None
-    unsupported_audio = output_may_require_audio_reencode(source, output_path, ffprobe)
-    if unsupported_audio:
-        return (
-            "audio codec copy is not supported by the chosen output container ("
-            + ", ".join(sorted(unsupported_audio))
-            + ")"
-        )
-    if source_has_attachment_streams(source, ffprobe):
-        return "attachment streams are not supported by the chosen output container"
-    if source_has_data_streams(source, ffprobe):
-        return "auxiliary data streams are not supported by the chosen output container"
+    reasons = describe_container_incompatibilities(source, output_path, ffprobe)
+    if reasons:
+        first = reasons[0]
+        if first.startswith("unsupported copied audio codec: "):
+            codec = first.split(": ", 1)[1]
+            return f"audio codec copy is not supported by the chosen output container ({codec})"
+        if first == "attachment stream incompatibility":
+            return "attachment streams are not supported by the chosen output container"
+        if first == "auxiliary data stream incompatibility":
+            return "auxiliary data streams are not supported by the chosen output container"
     # Subtitle streams are safely dropped via -sn for MP4/M4V outputs — not an encode failure.
     return None
 

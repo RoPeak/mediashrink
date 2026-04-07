@@ -34,6 +34,7 @@ from mediashrink.calibration import bitrate_bucket, lookup_estimate, resolution_
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import (
     _HW_ENCODERS,
+    describe_container_incompatibilities,
     describe_container_incompatibility,
     encode_preview,
     estimate_output_size,
@@ -251,7 +252,7 @@ def _select_risky_probe_items(
     items: list[AnalysisItem],
     ffprobe: Path,
     *,
-    limit: int = 3,
+    limit: int = 8,
     container_incompatibility_cache: dict[Path, str | None] | None = None,
 ) -> list[AnalysisItem]:
     risky: list[AnalysisItem] = []
@@ -299,16 +300,7 @@ def _targeted_profile_probe_failures(
         ffprobe,
         container_incompatibility_cache=container_incompatibility_cache,
     )
-    probe_targets: list[tuple[str, int]] = []
-    seen_targets: set[tuple[str, int]] = set()
-    for profile in profiles:
-        if profile.is_custom or not profile.encoder_key:
-            continue
-        target = (profile.encoder_key, profile.crf)
-        if target in seen_targets:
-            continue
-        seen_targets.add(target)
-        probe_targets.append(target)
+    probe_targets = _iter_probe_targets(profiles)
     if not risky_items or not probe_targets:
         return {}
     failures: dict[tuple[str, int], dict[Path, str]] = {}
@@ -398,6 +390,93 @@ def _emit_stage_progress(
         console.print(f"[dim]{message}[/dim]")
 
 
+def _iter_probe_targets(profiles: list[EncoderProfile]) -> list[tuple[str, int]]:
+    probe_targets: list[tuple[str, int]] = []
+    seen_targets: set[tuple[str, int]] = set()
+    for profile in profiles:
+        if profile.is_custom or not profile.encoder_key:
+            continue
+        target = (profile.encoder_key, profile.crf)
+        if target in seen_targets:
+            continue
+        seen_targets.add(target)
+        probe_targets.append(target)
+    return probe_targets
+
+
+def _predict_profile_compatibility(
+    *,
+    profile: EncoderProfile,
+    items: list[AnalysisItem],
+    ffprobe: Path,
+    failure_rate: float,
+    observed_probe_failures: dict[tuple[str, int], dict[Path, str]] | None = None,
+    container_incompatibility_cache: dict[Path, str | None] | None = None,
+) -> tuple[int, int, dict[str, int]]:
+    grouped: dict[str, int] = {}
+    compatible_count = 0
+    observed_for_profile = (observed_probe_failures or {}).get(
+        (profile.encoder_key, profile.crf), {}
+    )
+    for item in items:
+        observed_reason = observed_for_profile.get(item.source)
+        if observed_reason:
+            lowered = observed_reason.lower()
+            if "audio codec copy" in lowered:
+                reason = "unsupported copied audio codec"
+            elif "subtitle" in lowered or "mov_text" in lowered:
+                reason = "unsupported copied subtitle codec"
+            elif "attachment" in lowered:
+                reason = "attachment stream incompatibility"
+            elif "data" in lowered or "bin_data" in lowered:
+                reason = "auxiliary data stream incompatibility"
+            elif "could not open encoder before eof" in lowered or "internal bug" in lowered:
+                reason = "hardware encoder startup failure"
+            else:
+                reason = "output header failure"
+        else:
+            reason = _profile_predicted_incompatibility(
+                item,
+                profile,
+                ffprobe,
+                failure_rate,
+                container_incompatibility_cache=container_incompatibility_cache,
+            )
+        if reason is None:
+            compatible_count += 1
+        else:
+            grouped[reason] = grouped.get(reason, 0) + 1
+    return compatible_count, sum(grouped.values()), grouped
+
+
+def _format_ready_size_estimate(
+    *,
+    input_bytes: int,
+    output_bytes: int,
+    size_error: float | None,
+) -> str:
+    saved_bytes = max(input_bytes - output_bytes, 0)
+    saved_pct = saved_bytes / input_bytes * 100 if input_bytes else 0.0
+    if size_error is not None and abs(size_error) >= 0.10 and input_bytes > 0:
+        offset = abs(size_error) * input_bytes
+        output_low = max(0, int(output_bytes - offset))
+        output_high = max(output_low, int(output_bytes + offset))
+        saved_low = max(input_bytes - output_high, 0)
+        saved_high = max(input_bytes - output_low, 0)
+        saved_pct_low = saved_low / input_bytes * 100 if input_bytes else 0.0
+        saved_pct_high = saved_high / input_bytes * 100 if input_bytes else 0.0
+        if (saved_pct_high - saved_pct_low) >= 30:
+            return "  Est. out: ~highly variable"
+        return (
+            f"  Est. out: ~{_fmt_size(output_low)}-{_fmt_size(output_high)}  "
+            f"(~{_fmt_size(saved_low)}-{_fmt_size(saved_high)} saved, ~{saved_pct_low:.0f}-{saved_pct_high:.0f}%)"
+        )
+    return (
+        f"  Est. out: ~{_fmt_size(output_bytes)}  "
+        f"(~{_fmt_size(saved_bytes)} saved, ~{saved_pct:.0f}%)"
+    )
+
+
 def prepare_profile_planning(
     *,
     analysis_items: list[AnalysisItem],
@@ -406,6 +485,7 @@ def prepare_profile_planning(
     policy: str = "fastest-wall-clock",
     use_calibration: bool = True,
     console: Console | None = None,
+    available_hw: list[str] | None = None,
 ) -> ProfilePlanningResult | None:
     recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
     maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
@@ -420,83 +500,155 @@ def prepare_profile_planning(
     sample_duration = sample_item.duration_seconds if sample_item.duration_seconds > 0 else 3600.0
     preview_items = select_representative_items(candidate_items or sample_pool, limit=3)
     detect_console = console if console is not None else Console(quiet=True)
-    available_hw = detect_available_encoders(
-        ffmpeg,
-        detect_console,
-        sample_file=sample_item.source,
-        ffprobe=ffprobe,
-    )
+    if available_hw is None:
+        available_hw = detect_available_encoders(
+            ffmpeg,
+            detect_console,
+            sample_file=sample_item.source,
+            ffprobe=ffprobe,
+        )
 
     candidates_to_bench = list(available_hw) + ["fast", "faster"]
     benchmark_speeds: dict[str, float | None] = {}
     stage_messages: list[str] = []
-    if candidates_to_bench:
-        _emit_stage_progress(
-            "Benchmarking profiles",
-            0,
-            len(candidates_to_bench),
-            console=console,
-            stage_messages=stage_messages,
-        )
-
-        def _benchmark_target(key: str) -> tuple[str, float | None]:
-            return (
-                key,
-                benchmark_encoder(
-                    encoder_key=key,
-                    sample_file=sample_item.source,
-                    sample_duration=sample_duration,
-                    crf=20,
-                    ffmpeg=ffmpeg,
-                ),
-            )
-
-        completed = 0
-        with ThreadPoolExecutor(max_workers=min(4, len(candidates_to_bench))) as executor:
-            future_map = {
-                executor.submit(_benchmark_target, key): key for key in candidates_to_bench
-            }
-            for future in as_completed(future_map):
-                key, speed = future.result()
-                benchmark_speeds[key] = speed
-                completed += 1
-                _emit_stage_progress(
-                    "Benchmarking profiles",
-                    completed,
-                    len(candidates_to_bench),
-                    console=console,
-                    stage_messages=stage_messages,
-                )
-        benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
 
     active_calibration = load_calibration_store() if use_calibration else None
     container_incompatibility_cache: dict[Path, str | None] = {}
-    provisional_profiles = build_profiles(
-        available_hw=available_hw,
-        benchmark_speeds=benchmark_speeds,
-        total_media_seconds=candidate_media_seconds,
-        total_input_bytes=candidate_input_bytes,
-        candidate_items=candidate_items,
-        ffprobe=ffprobe,
-        policy=policy,
-        use_calibration=use_calibration,
-        calibration_store=active_calibration,
-        container_incompatibility_cache=container_incompatibility_cache,
-    )
-    observed_probe_failures = _targeted_profile_probe_failures(
-        items=candidate_items,
-        profiles=provisional_profiles,
-        ffmpeg=ffmpeg,
-        ffprobe=ffprobe,
-        progress_callback=lambda stage, current, total: _emit_stage_progress(
-            stage,
-            current,
-            total,
+
+    def _benchmark_target(key: str) -> tuple[str, float | None]:
+        return (
+            key,
+            benchmark_encoder(
+                encoder_key=key,
+                sample_file=sample_item.source,
+                sample_duration=sample_duration,
+                crf=20,
+                ffmpeg=ffmpeg,
+            ),
+        )
+
+    if console is not None and candidates_to_bench:
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            TaskProgressColumn(),
             console=console,
-            stage_messages=stage_messages,
-        ),
-        container_incompatibility_cache=container_incompatibility_cache,
-    )
+            transient=False,
+            expand=True,
+        )
+        with progress:
+            task = progress.add_task("Benchmarking profiles...", total=len(candidates_to_bench))
+            completed = 0
+            with ThreadPoolExecutor(max_workers=min(4, len(candidates_to_bench))) as executor:
+                future_map = {
+                    executor.submit(_benchmark_target, key): key for key in candidates_to_bench
+                }
+                for future in as_completed(future_map):
+                    key, speed = future.result()
+                    benchmark_speeds[key] = speed
+                    completed += 1
+                    _emit_stage_progress(
+                        "Benchmarking profiles",
+                        completed,
+                        len(candidates_to_bench),
+                        stage_messages=stage_messages,
+                    )
+                    progress.update(
+                        task,
+                        description="Benchmarking profiles...",
+                        completed=completed,
+                        total=len(candidates_to_bench),
+                    )
+            benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
+
+            provisional_profiles = build_profiles(
+                available_hw=available_hw,
+                benchmark_speeds=benchmark_speeds,
+                total_media_seconds=candidate_media_seconds,
+                total_input_bytes=candidate_input_bytes,
+                candidate_items=candidate_items,
+                ffprobe=ffprobe,
+                policy=policy,
+                use_calibration=use_calibration,
+                calibration_store=active_calibration,
+                container_incompatibility_cache=container_incompatibility_cache,
+            )
+            probe_targets = _iter_probe_targets(provisional_profiles)
+            progress.update(
+                task,
+                description="Smoke-probing risky container/profile combinations...",
+                completed=0,
+                total=max(len(probe_targets), 1),
+            )
+
+            def _update_probe_progress(stage: str, current: int, total: int) -> None:
+                _emit_stage_progress(stage, current, total, stage_messages=stage_messages)
+                progress.update(
+                    task,
+                    description="Smoke-probing risky container/profile combinations...",
+                    completed=current,
+                    total=max(total, 1),
+                )
+
+            observed_probe_failures = _targeted_profile_probe_failures(
+                items=candidate_items,
+                profiles=provisional_profiles,
+                ffmpeg=ffmpeg,
+                ffprobe=ffprobe,
+                progress_callback=_update_probe_progress,
+                container_incompatibility_cache=container_incompatibility_cache,
+            )
+    else:
+        if candidates_to_bench:
+            _emit_stage_progress(
+                "Benchmarking profiles",
+                0,
+                len(candidates_to_bench),
+                stage_messages=stage_messages,
+            )
+            completed = 0
+            with ThreadPoolExecutor(max_workers=min(4, len(candidates_to_bench))) as executor:
+                future_map = {
+                    executor.submit(_benchmark_target, key): key for key in candidates_to_bench
+                }
+                for future in as_completed(future_map):
+                    key, speed = future.result()
+                    benchmark_speeds[key] = speed
+                    completed += 1
+                    _emit_stage_progress(
+                        "Benchmarking profiles",
+                        completed,
+                        len(candidates_to_bench),
+                        stage_messages=stage_messages,
+                    )
+            benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
+
+        provisional_profiles = build_profiles(
+            available_hw=available_hw,
+            benchmark_speeds=benchmark_speeds,
+            total_media_seconds=candidate_media_seconds,
+            total_input_bytes=candidate_input_bytes,
+            candidate_items=candidate_items,
+            ffprobe=ffprobe,
+            policy=policy,
+            use_calibration=use_calibration,
+            calibration_store=active_calibration,
+            container_incompatibility_cache=container_incompatibility_cache,
+        )
+        observed_probe_failures = _targeted_profile_probe_failures(
+            items=candidate_items,
+            profiles=provisional_profiles,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            progress_callback=lambda stage, current, total: _emit_stage_progress(
+                stage,
+                current,
+                total,
+                stage_messages=stage_messages,
+            ),
+            container_incompatibility_cache=container_incompatibility_cache,
+        )
     profiles = build_profiles(
         available_hw=available_hw,
         benchmark_speeds=benchmark_speeds,
@@ -1993,23 +2145,13 @@ def run_wizard(
         console.print("[dim]No recommended files were found for automatic compression.[/dim]")
         return [], "cancel", False, None
 
-    planning = prepare_profile_planning(
-        analysis_items=analysis_items,
-        ffmpeg=ffmpeg,
-        ffprobe=ffprobe,
-        policy=policy,
-        use_calibration=use_calibration,
-        console=console,
-    )
-    assert planning is not None
-    candidate_items = planning.candidate_items
-    candidate_input_bytes = planning.candidate_input_bytes
-    candidate_media_seconds = planning.candidate_media_seconds
-    sample_item = planning.sample_item
+    candidate_items = recommended_items + maybe_items
+    sample_pool = recommended_items or maybe_items or analysis_items
+    sample_item = max(sample_pool, key=lambda item: item.size_bytes)
     sample_file = sample_item.source
-    sample_duration = planning.sample_duration
-    preview_items = planning.preview_items
-    available_hw = planning.available_hw
+    available_hw = detect_available_encoders(
+        ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe
+    )
     device_labels = detect_device_labels()
 
     if available_hw:
@@ -2025,6 +2167,23 @@ def run_wizard(
     console.print(
         "[dim]Benchmark and profile estimates are sample-based and exclude files already expected to be skipped.[/dim]"
     )
+
+    planning = prepare_profile_planning(
+        analysis_items=analysis_items,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        policy=policy,
+        use_calibration=use_calibration,
+        console=console,
+        available_hw=available_hw,
+    )
+    assert planning is not None
+    candidate_items = planning.candidate_items
+    candidate_input_bytes = planning.candidate_input_bytes
+    candidate_media_seconds = planning.candidate_media_seconds
+    sample_item = planning.sample_item
+    sample_duration = planning.sample_duration
+    preview_items = planning.preview_items
 
     benchmark_speeds = planning.benchmark_speeds
     active_calibration = planning.active_calibration
@@ -2095,6 +2254,7 @@ def run_wizard(
     estimated_total_encode_seconds: float | None = None
     followup_manifest_path: Path | None = None
     compatibility_prediction_note: str | None = None
+    selected_profile_size_error: float | None = None
     while True:
         preset, crf, sw_preset, display_label = _select_profile_interactively(
             visible_profiles,
@@ -2202,7 +2362,17 @@ def run_wizard(
             crf=crf,
             ffmpeg=ffmpeg,
             known_speed=benchmark_speeds.get(preset),
+            calibration_store=active_calibration,
         )
+        selected_profile = next(
+            (
+                profile
+                for profile in profiles
+                if not profile.is_custom and profile.encoder_key == preset and profile.crf == crf
+            ),
+            None,
+        )
+        selected_profile_size_error = size_error_by_preset.get(preset)
 
         compatible_jobs, preflight_failures = _run_preflight_checks(
             to_encode,
@@ -2272,6 +2442,7 @@ def run_wizard(
                 shown_hints.add(hint)
 
         if compatible_jobs and len(compatible_jobs) < len(to_encode):
+            originally_selected_items = list(selected_items)
             compatible_sources = {job.source for job in compatible_jobs}
             incompatible_items = [
                 item for item in selected_items if item.source not in compatible_sources
@@ -2293,12 +2464,40 @@ def run_wizard(
                 preset=preset,
                 crf=crf,
                 ffmpeg=ffmpeg,
-                known_speed=benchmark_speeds.get(preset),
+                known_speed=benchmark_encoder(
+                    encoder_key=preset,
+                    sample_file=max(selected_items, key=lambda item: item.size_bytes).source,
+                    sample_duration=max(
+                        max(selected_items, key=lambda item: item.size_bytes).duration_seconds,
+                        600.0,
+                    ),
+                    crf=crf,
+                    ffmpeg=ffmpeg,
+                )
+                or benchmark_speeds.get(preset),
+                calibration_store=active_calibration,
             )
-            compatibility_prediction_note = (
-                f"Predicted compatibility: {len(selected_items) + followup_count} file(s); "
-                f"preflight confirmed {len(compatible_jobs)} compatible / {len(preflight_failures)} moved to follow-up."
-            )
+            if selected_profile is not None:
+                predicted_compatible, predicted_incompatible, _ = _predict_profile_compatibility(
+                    profile=selected_profile,
+                    items=originally_selected_items,
+                    ffprobe=ffprobe,
+                    failure_rate=estimate_failure_rate(
+                        active_calibration,
+                        preset=selected_profile.encoder_key,
+                        container=(
+                            selected_items[0].source.suffix.lower() if selected_items else ".mkv"
+                        ),
+                    ),
+                    observed_probe_failures=planning.observed_probe_failures,
+                )
+                compatibility_prediction_note = (
+                    f"Predicted compatibility for this selection: {predicted_compatible} compatible / "
+                    f"{predicted_incompatible} likely follow-up; preflight confirmed {len(compatible_jobs)} compatible / "
+                    f"{len(preflight_failures)} moved to follow-up."
+                )
+            else:
+                compatibility_prediction_note = f"Preflight confirmed {len(compatible_jobs)} compatible / {len(preflight_failures)} moved to follow-up."
             console.print(
                 f"[yellow]{len(compatible_jobs)} file(s) can run now with {display_label}. "
                 f"{len(preflight_failures)} incompatible file(s) were moved to follow-up planning.[/yellow]"
@@ -2357,7 +2556,9 @@ def run_wizard(
                     crf=crf,
                     ffmpeg=ffmpeg,
                     known_speed=benchmark_speeds.get(preset),
+                    calibration_store=active_calibration,
                 )
+                selected_profile_size_error = size_error_by_preset.get(preset)
                 break
             if fallback_compatible and len(fallback_compatible) < len(fallback_to_encode):
                 fallback_sources = {job.source for job in fallback_compatible}
@@ -2386,7 +2587,9 @@ def run_wizard(
                         crf=crf,
                         ffmpeg=ffmpeg,
                         known_speed=benchmark_speeds.get(preset),
+                        calibration_store=active_calibration,
                     )
+                    selected_profile_size_error = size_error_by_preset.get(preset)
                     console.print(
                         f"[yellow]Skipping {len(fallback_failures)} incompatible file(s) for this run.[/yellow]"
                     )
@@ -2457,8 +2660,11 @@ def run_wizard(
         )
     if selected_output_bytes > 0:
         console.print(
-            f"  Est. out: ~{_fmt_size(selected_output_bytes)}  "
-            f"(~{_fmt_size(selected_saved_bytes)} saved, ~{selected_saved_pct:.0f}%)"
+            _format_ready_size_estimate(
+                input_bytes=selected_input_bytes,
+                output_bytes=selected_output_bytes,
+                size_error=selected_profile_size_error,
+            )
         )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")

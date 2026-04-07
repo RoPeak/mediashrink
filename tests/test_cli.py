@@ -1959,6 +1959,79 @@ def test_wizard_followup_rerun_preflights_before_encoding(tmp_path: Path) -> Non
     assert "before the output header could be initialized" in result.stdout
 
 
+def test_wizard_followup_skips_software_retry_prompt_for_container_only_failures(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 100)
+    followup = tmp_path / "followup.json"
+    save_manifest(
+        build_manifest(
+            directory=tmp_path,
+            recursive=True,
+            preset="amf",
+            crf=22,
+            profile_name=None,
+            estimated_total_encode_seconds=None,
+            estimate_confidence=None,
+            size_confidence=None,
+            size_confidence_detail=None,
+            time_confidence=None,
+            time_confidence_detail=None,
+            duplicate_policy=None,
+            recommended_only=False,
+            items=[
+                AnalysisItem(
+                    source=source,
+                    codec="h264",
+                    size_bytes=1000,
+                    duration_seconds=120.0,
+                    bitrate_kbps=8000.0,
+                    estimated_output_bytes=500,
+                    estimated_savings_bytes=500,
+                    recommendation="recommended",
+                    reason_code="reason",
+                    reason_text="reason",
+                )
+            ],
+        ),
+        followup,
+    )
+    primary_job = _make_job(source)
+    primary_result = _make_result(primary_job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch(
+            "mediashrink.wizard.run_wizard",
+            return_value=([primary_job], "encode", False, followup),
+        ),
+        patch("mediashrink.cli._run_encode_loop", return_value=[primary_result]) as mock_loop,
+        patch(
+            "mediashrink.cli.preflight_encode_job",
+            return_value=_make_result(
+                _make_job(source),
+                success=False,
+                output_size_bytes=0,
+                error_message="Could not write header (incorrect codec parameters ?): Invalid argument",
+            ),
+        ),
+        patch(
+            "mediashrink.cli.describe_container_incompatibilities",
+            return_value=["attachment stream incompatibility"],
+        ),
+        patch("mediashrink.cli.typer.confirm") as mock_confirm,
+    ):
+        result = runner.invoke(app, ["wizard", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert mock_loop.call_count == 1
+    mock_confirm.assert_not_called()
+    assert "attachment" in result.stdout.lower()
+
+
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
