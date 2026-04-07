@@ -155,6 +155,14 @@ def estimate_output_size(
 
         combined_factor = codec_factor * crf_scale * res_factor
 
+        # Hardware encoders (AMF/NVENC/QSV) produce larger files than software libx265 at the
+        # same CRF value because their rate control is less efficient. Apply a penalty factor so
+        # the heuristic estimate reflects real-world hardware output ratios.
+        # Observed: AMF CRF 22 on mpeg2video → ~0.50 output ratio vs ~0.28 for software.
+        # Factor: 1.65 (conservative midpoint of observed 1.78; refined over time by calibration).
+        if preset in _HW_ENCODERS:
+            combined_factor *= 1.65
+
         video_kbps = get_video_bitrate_kbps(path, ffprobe)
         heuristic_estimate = 0
         if video_kbps <= 0:
@@ -479,8 +487,7 @@ def describe_container_incompatibility(
         return "attachment streams are not supported by the chosen output container"
     if source_has_data_streams(source, ffprobe):
         return "auxiliary data streams are not supported by the chosen output container"
-    if source_has_subtitle_streams(source, ffprobe):
-        return "subtitle codec is not supported by the chosen output container"
+    # Subtitle streams are safely dropped via -sn for MP4/M4V outputs — not an encode failure.
     return None
 
 

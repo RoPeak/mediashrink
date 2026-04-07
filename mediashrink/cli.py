@@ -1516,6 +1516,13 @@ def _run_encode_loop(
             if stopped_early:
                 break
 
+        progress.update(
+            file_task,
+            completed_files=len(to_encode),
+            remaining_files=0,
+            heartbeat_state="complete",
+            eta_confident=True,
+        )
         progress.remove_task(file_task)
 
     display.show_summary(
@@ -2632,7 +2639,7 @@ def wizard(
     display = EncodingDisplay(quiet_console)
     started_at = _now_iso()
 
-    jobs, action, wizard_cleanup = run_wizard(
+    jobs, action, wizard_cleanup, followup_manifest_path = run_wizard(
         directory=directory,
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
@@ -2679,6 +2686,49 @@ def wizard(
             use_calibration=use_calibration,
         )
     )
+    # Offer to immediately encode the follow-up manifest with a software fallback profile.
+    if (
+        followup_manifest_path is not None
+        and followup_manifest_path.exists()
+        and not stopped_early
+        and not json_output
+    ):
+        fallback_preset, fallback_crf = "faster", 22
+        run_followup = auto or typer.confirm(
+            f"Run follow-up manifest now with software profile (libx265 {fallback_preset}, CRF {fallback_crf})?",
+            default=False,
+        )
+        if run_followup:
+            followup_manifest_data = load_manifest(followup_manifest_path)
+            existing_followup_files = [
+                item.source for item in followup_manifest_data.items if item.source.exists()
+            ]
+            if existing_followup_files:
+                followup_jobs = build_jobs(
+                    files=existing_followup_files,
+                    output_dir=output_dir,
+                    overwrite=overwrite,
+                    crf=fallback_crf,
+                    preset=fallback_preset,
+                    dry_run=False,
+                    ffprobe=ffprobe,
+                    no_skip=False,
+                )
+                followup_results, followup_stopped = _normalize_loop_result(
+                    _run_encode_loop(
+                        followup_jobs,
+                        ffmpeg,
+                        ffprobe,
+                        display,
+                        stall_warning_seconds=float(stall_warning_seconds),
+                        on_file_failure=on_file_failure,
+                        use_calibration=use_calibration,
+                    )
+                )
+                results = results + followup_results
+                if followup_stopped:
+                    stopped_early = True
+
     cleaned_paths: list[Path] = []
     if wizard_cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)

@@ -413,6 +413,11 @@ def estimate_analysis_confidence(
     elif fallback_estimates >= max(1, total // 3):
         score -= 1
 
+    # Single-file batches offer too little evidence for "High" — cap at Medium.
+    # This prevents post-split confidence inflation when the batch shrinks to one file.
+    if total <= 1:
+        score = min(score, 3)
+
     if score >= 4:
         return "High"
     if score >= 2:
@@ -456,6 +461,11 @@ def estimate_size_confidence(
         score += 2
     elif calibration_hits >= 1:
         score += 1
+
+    # Single-file batches have too little evidence to justify "High" size confidence.
+    if len(candidates) <= 1:
+        score = min(score, 2)
+
     if score >= 3:
         return "High"
     if score >= 1:
@@ -488,6 +498,10 @@ def estimate_time_confidence(
         )
         if estimate is not None and estimate.speed is not None and estimate.speed > 0:
             speed_hits += 1
+    # Single-file batches: cap time confidence at Medium regardless of other signals.
+    if len(candidates) <= 1 and base == "High":
+        base = "Medium"
+
     if base == "High" or (base == "Medium" and speed_hits >= 2):
         return "High"
     if base == "Low" and speed_hits == 0:

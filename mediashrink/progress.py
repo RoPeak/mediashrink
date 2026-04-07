@@ -70,6 +70,8 @@ class _HeartbeatColumn(ProgressColumn):
     def render(self, task) -> Text:
         state = task.fields.get("heartbeat_state")
         if isinstance(state, str):
+            if state == "complete":
+                return Text("done", style="green bold")
             if state == "active":
                 return Text("active", style="green")
             if state == "quiet":

@@ -227,7 +227,7 @@ def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
         patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)),
         patch("mediashrink.cli.EncodingDisplay"),
         patch(
-            "mediashrink.wizard.run_wizard", return_value=([], "cancel", False)
+            "mediashrink.wizard.run_wizard", return_value=([], "cancel", False, None)
         ) as mock_run_wizard,
     ):
         result = runner.invoke(app, ["wizard", str(tmp_path)])

@@ -377,7 +377,9 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[True, True]),
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, True, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, True, None, False, False, console
+        )
 
     assert action == "encode"
     assert jobs == [fake_job]
@@ -413,7 +415,9 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
         patch("mediashrink.wizard.save_manifest") as mock_save_manifest,
         patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     assert action == "export"
     assert jobs == []
@@ -440,7 +444,9 @@ def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> 
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     assert action == "cancel"
     assert jobs == []
@@ -480,7 +486,9 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[True, True]),
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     assert action == "encode"
     assert jobs == [fake_job]
@@ -529,7 +537,9 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[False, False]) as mock_confirm,
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     output = console.export_text()
 
@@ -715,7 +725,7 @@ def test_run_wizard_auto_selects_recommended_profile(tmp_path: Path) -> None:
             return_value=_fake_encode_result(source, success=True),
         ),
     ):
-        jobs, action, _ = run_wizard(
+        jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True
         )
 
@@ -751,7 +761,7 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
         patch("mediashrink.wizard.typer.confirm") as mock_confirm,
         patch("mediashrink.wizard.typer.prompt") as mock_prompt,
     ):
-        jobs, action, _ = run_wizard(
+        jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True
         )
 
@@ -796,7 +806,9 @@ def test_run_wizard_switches_to_fallback_when_preflight_encode_fails(tmp_path: P
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[True, True, True]),
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     output = console.export_text()
     assert action == "encode"
@@ -846,7 +858,9 @@ def test_run_wizard_returns_to_profile_selection_when_fallback_declined(tmp_path
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[False, True, True]),
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     assert action == "encode"
     assert jobs == [fake_job]
@@ -900,7 +914,9 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
         ),
         patch("mediashrink.wizard.typer.confirm", side_effect=[True, True, True]),
     ):
-        jobs, action, _ = run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
 
     output = console.export_text()
     assert action == "encode"

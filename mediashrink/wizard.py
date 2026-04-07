@@ -835,6 +835,7 @@ def display_profiles_table(
     time_confidence_detail: str | None = None,
     size_confidence: str | None = None,
     size_confidence_detail: str | None = None,
+    size_error_by_preset: dict[str, float | None] | None = None,
     show_all_profiles: bool = False,
 ) -> list[EncoderProfile]:
     def dedupe_key(profile: EncoderProfile) -> tuple[object, ...]:
@@ -877,6 +878,16 @@ def display_profiles_table(
             filtered.append(profile)
         visible_profiles = filtered
 
+    # Build sequential display indices 1..N so the table never has gaps.
+    # display_index_map[display_idx] → profile (for prompt_profile_selection)
+    display_index_map: dict[int, EncoderProfile] = {
+        display_idx: profile for display_idx, profile in enumerate(visible_profiles, start=1)
+    }
+    # Reverse map: profile.index → display_idx (for the default/recommended prompt value)
+    _profile_to_display: dict[int, int] = {
+        profile.index: display_idx for display_idx, profile in display_index_map.items()
+    }
+
     compact = console.width < 150
     table = Table(
         title="Available encoding profiles",
@@ -898,10 +909,10 @@ def display_profiles_table(
     if not compact:
         table.add_column("CRF", justify="center", no_wrap=True)
 
-    for profile in visible_profiles:
+    for display_idx, profile in display_index_map.items():
         if profile.is_custom:
             row: list[str | Text] = [
-                str(profile.index),
+                str(display_idx),
                 profile.intent_label,
                 "Custom",
                 "-",
@@ -921,12 +932,24 @@ def display_profiles_table(
         encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
         saved = total_input_bytes - profile.estimated_output_bytes
         saved_pct = saved / total_input_bytes * 100 if total_input_bytes else 0
-        est_saving = f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
-        est_time = (
-            f"~{_fmt_duration(profile.estimated_encode_seconds)}"
-            if profile.estimated_encode_seconds > 0
-            else "~unknown"
-        )
+        size_error = (size_error_by_preset or {}).get(profile.encoder_key)
+        if size_error is not None and abs(size_error) >= 0.10 and total_input_bytes > 0:
+            offset = abs(size_error) * total_input_bytes
+            saving_low = max(0, saved - offset)
+            saving_high = saved + offset
+            pct_low = saving_low / total_input_bytes * 100
+            pct_high = saving_high / total_input_bytes * 100
+            est_saving = (
+                f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
+            )
+        else:
+            est_saving = f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
+        if profile.estimated_encode_seconds > 0:
+            est_time = f"~{_fmt_duration(profile.estimated_encode_seconds)}"
+        elif profile.sw_preset in {"slow", "slower", "veryslow"}:
+            est_time = "~slower than Balanced"
+        else:
+            est_time = "~unknown"
         quality_style = {
             "Visually lossless": "green bold",
             "Excellent": "green",
@@ -940,7 +963,7 @@ def display_profiles_table(
         )
 
         row = [
-            str(profile.index),
+            str(display_idx),
             profile.intent_label,
             profile_name,
             encoder_display,
@@ -1008,29 +1031,38 @@ def display_profiles_table(
             f"  [dim]Hidden {len(profiles) - len(visible_profiles)} near-duplicate profile row(s). Use --show-all-profiles to inspect every profile.[/dim]"
         )
     console.print()
-    return visible_profiles
+    return visible_profiles, display_index_map
 
 
-def prompt_profile_selection(profiles: list[EncoderProfile], console: Console) -> EncoderProfile:
+def prompt_profile_selection(
+    profiles: list[EncoderProfile],
+    display_index_map: dict[int, EncoderProfile],
+    console: Console,
+) -> EncoderProfile:
     recommended = next((profile for profile in profiles if profile.is_recommended), profiles[0])
-    max_idx = profiles[-1].index
+    # Find the sequential display index for the recommended profile
+    recommended_display_idx = next(
+        (didx for didx, p in display_index_map.items() if p.index == recommended.index),
+        1,
+    )
+    display_max = len(display_index_map)
 
     while True:
         choice = typer.prompt(
-            f"Select a profile [1-{max_idx}, Enter for {recommended.index} ({recommended.name})]",
-            default=str(recommended.index),
+            f"Select a profile [1-{display_max}, Enter for {recommended_display_idx} ({recommended.name})]",
+            default=str(recommended_display_idx),
         ).strip()
 
         try:
-            selected_index = int(choice)
+            selected_display_idx = int(choice)
         except ValueError:
-            selected_index = -1
+            selected_display_idx = -1
 
-        for profile in profiles:
-            if profile.index == selected_index:
-                return profile
+        profile = display_index_map.get(selected_display_idx)
+        if profile is not None:
+            return profile
 
-        console.print(f"[yellow]Please enter a number between 1 and {max_idx}.[/yellow]")
+        console.print(f"[yellow]Please enter a number between 1 and {display_max}.[/yellow]")
 
 
 def run_custom_wizard(available_hw: list[str], console: Console) -> tuple[str, int, str | None]:
@@ -1311,12 +1343,14 @@ def _select_profile_interactively(
     device_labels: dict[str, str],
     auto: bool,
     console: Console,
+    display_index_map: dict[int, EncoderProfile] | None = None,
 ) -> tuple[str, int, str | None, str]:
     if auto:
         selected = next((p for p in profiles if p.is_recommended), profiles[0])
         console.print(f"[dim]Auto mode: selected profile[/dim] {selected.name}")
     else:
-        selected = prompt_profile_selection(profiles, console)
+        effective_map = display_index_map or {i + 1: p for i, p in enumerate(profiles)}
+        selected = prompt_profile_selection(profiles, effective_map, console)
 
     if selected.is_custom:
         preset, crf, sw_preset = run_custom_wizard(available_hw, console)
@@ -1458,8 +1492,8 @@ def run_wizard(
     use_calibration: bool = True,
     duplicate_policy: str = "prefer-mkv",
     show_all_profiles: bool = False,
-) -> tuple[list[EncodeJob], str, bool]:
-    """Run the interactive wizard and return (jobs, action)."""
+) -> tuple[list[EncodeJob], str, bool, Path | None]:
+    """Run the interactive wizard and return (jobs, action, cleanup_after, followup_manifest_path)."""
     console.print("\n[bold cyan]mediashrink wizard[/bold cyan]")
     console.print("[dim]Discovering supported files...[/dim]\n")
 
@@ -1468,7 +1502,7 @@ def run_wizard(
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
         )
-        return [], "cancel", False
+        return [], "cancel", False, None
 
     total_input_bytes = sum(path.stat().st_size for path in files)
     console.print(
@@ -1518,7 +1552,7 @@ def run_wizard(
     maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
     if not recommended_items:
         console.print("[dim]No recommended files were found for automatic compression.[/dim]")
-        return [], "cancel", False
+        return [], "cancel", False, None
 
     candidate_items = recommended_items + maybe_items
     candidate_input_bytes = sum(item.size_bytes for item in candidate_items)
@@ -1560,6 +1594,7 @@ def run_wizard(
                 ffmpeg=ffmpeg,
             )
 
+    active_calibration = load_calibration_store() if use_calibration else None
     profiles = build_profiles(
         available_hw=available_hw,
         benchmark_speeds=benchmark_speeds,
@@ -1569,7 +1604,29 @@ def run_wizard(
         ffprobe=ffprobe,
         policy=policy,
         use_calibration=use_calibration,
+        calibration_store=active_calibration,
     )
+    # Pre-compute per-preset size error bounds from calibration for estimate range display.
+    _seen_presets: set[str] = set()
+    size_error_by_preset: dict[str, float | None] = {}
+    for _profile in profiles:
+        _key = _profile.encoder_key
+        if _key in _seen_presets or _profile.is_custom:
+            continue
+        _seen_presets.add(_key)
+        _errors: list[float] = []
+        for _item in candidate_items[:5]:
+            _est = lookup_estimate(
+                active_calibration,
+                codec=_item.codec,
+                resolution="unknown",
+                bitrate="unknown",
+                preset=_key,
+                container=_item.source.suffix.lower() or ".mkv",
+            )
+            if _est is not None and _est.average_size_error is not None:
+                _errors.append(_est.average_size_error)
+        size_error_by_preset[_key] = sum(_errors) / len(_errors) if _errors else None
     profile_estimate_confidence = estimate_analysis_confidence(candidate_items, benchmarked_files=1)
     profile_calibration_detail = describe_estimate_calibration(
         candidate_items,
@@ -1607,23 +1664,21 @@ def run_wizard(
             ),
             use_calibration=use_calibration,
         ),
-        size_confidence_detail=(
-            describe_size_confidence(
-                candidate_items,
-                preset=next(
-                    (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
-                ),
-                use_calibration=use_calibration,
-            )
-            + (
-                f"; local history: {profile_calibration_detail}"
-                if profile_calibration_detail
-                else ""
-            )
+        size_confidence_detail=describe_size_confidence(
+            candidate_items,
+            preset=next(
+                (profile.encoder_key for profile in profiles if profile.is_recommended), "fast"
+            ),
+            use_calibration=use_calibration,
         ),
+        size_error_by_preset=size_error_by_preset,
         show_all_profiles=show_all_profiles,
     )
-    visible_profiles = display_result if isinstance(display_result, list) else profiles
+    if isinstance(display_result, tuple):
+        visible_profiles, display_index_map = display_result
+    else:
+        visible_profiles = display_result if isinstance(display_result, list) else profiles
+        display_index_map = {i + 1: p for i, p in enumerate(visible_profiles)}
 
     for hw_key in available_hw:
         if hw_key in _HW_ENCODER_CAVEATS:
@@ -1635,9 +1690,15 @@ def run_wizard(
     profile_saved = False
     selected_items = list(recommended_items)
     estimated_total_encode_seconds: float | None = None
+    followup_manifest_path: Path | None = None
     while True:
         preset, crf, sw_preset, display_label = _select_profile_interactively(
-            visible_profiles, available_hw, device_labels, auto, console
+            visible_profiles,
+            available_hw,
+            device_labels,
+            auto,
+            console,
+            display_index_map=display_index_map,
         )
 
         if not auto and not profile_saved:
@@ -1645,7 +1706,7 @@ def run_wizard(
             profile_saved = True
 
         if not _maybe_run_preview(preview_items, ffmpeg, ffprobe, preset, crf, auto, console):
-            return [], "cancel", False
+            return [], "cancel", False, None
 
         if not action_taken:
             action = (
@@ -1654,7 +1715,7 @@ def run_wizard(
                 else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
             )
             if action == "cancel":
-                return [], "cancel", False
+                return [], "cancel", False, None
             if action == "export":
                 export_estimate = estimate_analysis_encode_seconds(
                     items=recommended_items,
@@ -1704,7 +1765,7 @@ def run_wizard(
                 )
                 save_manifest(manifest, manifest_path)
                 console.print(f"[green]Wrote manifest[/green] {manifest_path}")
-                return [], "export", False
+                return [], "export", False, None
 
             selected_items = list(recommended_items)
             if (
@@ -1715,6 +1776,7 @@ def run_wizard(
                 selected_items.extend(maybe_items)
             action_taken = True
 
+        followup_count = 0  # files moved to follow-up manifest due to incompatibility
         jobs = build_jobs(
             files=[item.source for item in selected_items],
             output_dir=output_dir,
@@ -1728,7 +1790,7 @@ def run_wizard(
         to_encode = [job for job in jobs if not job.skip]
         if not to_encode:
             console.print("[dim]Nothing to encode after re-checking the selected files.[/dim]")
-            return [], "cancel", False
+            return [], "cancel", False, None
 
         estimated_total_encode_seconds = estimate_analysis_encode_seconds(
             items=selected_items,
@@ -1764,10 +1826,30 @@ def run_wizard(
                 f"[yellow]{len(jobs_for_reason)} file(s):[/yellow] {reason}"
                 + (f" [dim]({examples})[/dim]" if examples else "")
             )
-        if any(job.output.suffix.lower() != ".mkv" for job, _ in preflight_failures):
-            console.print(
-                "[dim]These failures are often caused by non-video/data streams that .mp4/.m4v outputs cannot safely carry.[/dim]"
-            )
+        _PREFLIGHT_HINTS: dict[str, str] = {
+            "unsupported copied audio codec": (
+                "The audio codec cannot be copied into this output container. "
+                "Try a software profile, or use --output-dir with an .mkv destination."
+            ),
+            "MP4/M4V stream-layout incompatibility": (
+                "The source has attachment or data streams that .mp4/.m4v cannot carry. "
+                "Use --output-dir to write .mkv output instead."
+            ),
+            "output header failure": (
+                "FFmpeg could not write the output file header. "
+                "This often occurs with hardware encoders and MP4 sources — "
+                "try the Balanced (software libx265) profile."
+            ),
+            "hardware encoder startup failure": (
+                "The hardware encoder failed to initialise for this file. Try a software profile."
+            ),
+        }
+        shown_hints: set[str] = set()
+        for reason in grouped_failures:
+            hint = _PREFLIGHT_HINTS.get(reason)
+            if hint and hint not in shown_hints:
+                console.print(f"  [dim]{hint}[/dim]")
+                shown_hints.add(hint)
 
         if compatible_jobs and len(compatible_jobs) < len(to_encode):
             compatible_sources = {job.source for job in compatible_jobs}
@@ -1781,6 +1863,8 @@ def run_wizard(
                 crf,
                 incompatible_items,
             )
+            followup_manifest_path = followup_manifest
+            followup_count = len(preflight_failures)
             selected_items = [item for item in selected_items if item.source in compatible_sources]
             jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
             to_encode = compatible_jobs
@@ -1797,6 +1881,12 @@ def run_wizard(
             )
             if followup_manifest is not None:
                 console.print(f"[dim]Follow-up manifest:[/dim] {followup_manifest}")
+                console.print(
+                    f'  [dim]To encode these with a different profile: mediashrink apply "{followup_manifest}"[/dim]'
+                )
+                console.print(
+                    "  [dim]Or re-run the wizard on the same folder with a software profile.[/dim]"
+                )
             break
 
         fallback_preset, fallback_crf, fallback_label, fallback_sw_preset = (
@@ -1886,7 +1976,7 @@ def run_wizard(
                     )
 
         if on_file_failure == "stop":
-            return [], "cancel", False
+            return [], "cancel", False, None
 
         console.print(
             "[dim]Choose another profile. Software profiles are the safest fallback when hardware encoding is not compatible with the selected files.[/dim]"
@@ -1908,10 +1998,15 @@ def run_wizard(
         selected_saved_bytes / selected_input_bytes * 100 if selected_input_bytes else 0.0
     )
     console.print(f"  Input:    {_fmt_size(selected_input_bytes)}")
-    not_selected_count = len(analysis_items) - len(selected_items)
-    if not_selected_count > 0:
+    maybe_skip_out = len(analysis_items) - len(selected_items) - followup_count
+    if followup_count > 0:
         console.print(
-            f"  [yellow]Not in this run:[/yellow] {not_selected_count} file(s) left out as maybe/skip candidates."
+            f"  [yellow]Moved to follow-up:[/yellow] {followup_count} file(s) failed "
+            "compatibility check — see follow-up manifest above."
+        )
+    if maybe_skip_out > 0:
+        console.print(
+            f"  [dim]Not in this run:[/dim] {maybe_skip_out} file(s) left out as maybe/skip candidates."
         )
     if selected_output_bytes > 0:
         console.print(
@@ -1959,5 +2054,5 @@ def run_wizard(
 
     if not auto:
         if not typer.confirm("Start encoding?", default=True):
-            return [], "cancel", False
-    return jobs, "encode", cleanup_after
+            return [], "cancel", False, None
+    return jobs, "encode", cleanup_after, followup_manifest_path
