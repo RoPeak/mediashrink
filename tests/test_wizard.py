@@ -210,6 +210,63 @@ def test_build_profiles_downranks_hardware_with_observed_probe_failures(tmp_path
     assert recommended.encoder_key != "amf"
 
 
+def test_build_profiles_downranks_highly_variable_hardware_size_estimates(tmp_path: Path) -> None:
+    candidate = _analysis_item(tmp_path / "candidate.mkv", "recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "high",
+                "preset": "amf",
+                "preset_family": "hardware",
+                "crf": 22,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "duration_seconds": 100.0,
+                "wall_seconds": 5.0,
+                "effective_speed": 20.0,
+                "fallback_used": False,
+                "retry_used": False,
+                "predicted_output_ratio": 0.3,
+            },
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "high",
+                "preset": "faster",
+                "preset_family": "software",
+                "crf": 22,
+                "input_bytes": 1000,
+                "output_bytes": 500,
+                "duration_seconds": 100.0,
+                "wall_seconds": 50.0,
+                "effective_speed": 2.0,
+                "fallback_used": False,
+                "retry_used": False,
+            },
+        ],
+        "failures": [],
+    }
+
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 12.0, "fast": 1.0, "faster": 1.2},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+        candidate_items=[candidate],
+        ffprobe=FFPROBE,
+        policy="fastest-wall-clock",
+        calibration_store=calibration_store,
+    )
+
+    recommended = next(profile for profile in profiles if profile.is_recommended)
+    assert recommended.encoder_key != "amf"
+
+
 def test_build_profiles_adjusts_time_estimate_from_speed_error_history(tmp_path: Path) -> None:
     calibration_store = {
         "version": 1,
@@ -838,6 +895,51 @@ def test_run_wizard_prints_hardware_before_benchmark_progress(tmp_path: Path) ->
     assert output.index("Hardware encoders available:") < output.index("Next: benchmark")
 
 
+def test_run_wizard_prints_benchmark_and_probe_stage_summaries(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(
+        1, "GPU offload", "GPU Offload", "amf", 22, None, 0, 0.0, "Good", True
+    )
+    planning = ProfilePlanningResult(
+        candidate_items=[recommended],
+        candidate_input_bytes=recommended.size_bytes,
+        candidate_media_seconds=recommended.duration_seconds,
+        sample_item=recommended,
+        sample_duration=recommended.duration_seconds,
+        preview_items=[recommended],
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 1.0, "fast": 0.8, "faster": 1.2},
+        observed_probe_failures={},
+        profiles=[selected_profile],
+        active_calibration=None,
+        size_error_by_preset={},
+        stage_messages=[],
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=["amf"]),
+        patch("mediashrink.wizard.prepare_profile_planning", return_value=planning),
+        patch("mediashrink.wizard.detect_device_labels", return_value={"amf": "AMD Test"}),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
+    ):
+        run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True)
+
+    output = console.export_text()
+    assert "Benchmarked 3 profile candidate(s)." in output
+    assert "Smoke-probed 1 risky profile combination(s)." in output
+
+
 def test_run_wizard_switches_to_fallback_when_preflight_encode_fails(tmp_path: Path) -> None:
     console = Console(record=True, width=140)
     source = tmp_path / "ep01.mkv"
@@ -987,7 +1089,17 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
         patch(
             "mediashrink.wizard._run_preflight_checks",
             side_effect=[
-                ([mkv_job], [(mp4_job, _fake_encode_result(mp4_source, success=False, error_message="Invalid argument"))]),
+                (
+                    [mkv_job],
+                    [
+                        (
+                            mp4_job,
+                            _fake_encode_result(
+                                mp4_source, success=False, error_message="Invalid argument"
+                            ),
+                        )
+                    ],
+                ),
                 ([mp4_mkv_job], []),
             ],
         ),

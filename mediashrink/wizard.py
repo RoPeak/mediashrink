@@ -121,6 +121,7 @@ class EncoderProfile:
     compatibility_summary: str = ""
     grouped_incompatibilities: dict[str, int] | None = None
     effective_input_bytes: int = 0
+    size_uncertainty: float | None = None
 
 
 @dataclass
@@ -497,6 +498,33 @@ def _format_ready_size_estimate(
     )
 
 
+def _average_size_error_for_items(
+    *,
+    preset: str,
+    items: list[AnalysisItem],
+    ffprobe: Path | None,
+    calibration_store: dict[str, object] | None,
+) -> float | None:
+    if ffprobe is None or not items or not calibration_store:
+        return None
+    errors: list[float] = []
+    for item in items[:8]:
+        width, height = get_video_resolution(item.source, ffprobe)
+        lookup = lookup_estimate(
+            calibration_store,
+            codec=item.codec,
+            resolution=resolution_bucket(width, height) if width > 0 and height > 0 else "unknown",
+            bitrate=bitrate_bucket(item.bitrate_kbps),
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if lookup is not None and lookup.average_size_error is not None:
+            errors.append(lookup.average_size_error)
+    if not errors:
+        return None
+    return sum(errors) / len(errors)
+
+
 def _summarize_mkv_suitable_candidates(
     items: list[AnalysisItem],
     ffprobe: Path,
@@ -825,11 +853,17 @@ def _policy_sort_key(
     hardware_bias = 0.0 if profile.encoder_key in _HW_ENCODERS else 1.0
     quality_bias = float(_quality_rank(profile.quality_label) * -1)
     compatibility_penalty = float(max(profile.incompatible_count, 0))
+    size_uncertainty_penalty = (
+        1.0
+        if profile.size_uncertainty is not None and abs(profile.size_uncertainty) >= 0.25
+        else 0.0
+    )
     effective_wait = float(profile.estimated_encode_seconds or 0.0)
     effective_size = float(profile.estimated_output_bytes or 0.0)
     if policy == "best-compression":
         return (
             compatibility_penalty,
+            size_uncertainty_penalty,
             effective_size,
             quality_bias,
             effective_wait,
@@ -847,6 +881,7 @@ def _policy_sort_key(
         return (
             compatibility_penalty,
             failure_rate,
+            size_uncertainty_penalty,
             hardware_bias,
             effective_wait,
             quality_bias,
@@ -854,6 +889,7 @@ def _policy_sort_key(
         )
     return (
         compatibility_penalty,
+        size_uncertainty_penalty,
         effective_wait,
         failure_rate,
         quality_bias,
@@ -1066,6 +1102,15 @@ def _profile_why_choose(
         return "Manual override for exact settings."
     if recommended is profile:
         if (
+            profile.encoder_key in _HW_ENCODERS
+            and profile.size_uncertainty is not None
+            and abs(profile.size_uncertainty) >= 0.25
+        ):
+            return (
+                f"Fastest wall-clock option for {profile.compatible_count} file(s), "
+                "but output size is highly variable on similar files."
+            )
+        if (
             fastest is not None
             and fastest is not profile
             and fastest.estimated_encode_seconds > 0
@@ -1083,6 +1128,15 @@ def _profile_why_choose(
             + "."
         )
     if profile.incompatible_count:
+        if (
+            profile.encoder_key in _HW_ENCODERS
+            and profile.size_uncertainty is not None
+            and abs(profile.size_uncertainty) >= 0.25
+        ):
+            return (
+                f"Fastest wall-clock option, but output size is highly variable; "
+                f"{profile.incompatible_count} file(s) may still need follow-up."
+            )
         return (
             f"Likely works for {profile.compatible_count} file(s); "
             f"{profile.incompatible_count} may need a safer follow-up profile."
@@ -1398,6 +1452,12 @@ def build_profiles(
         profile.grouped_incompatibilities = grouped or None
         profile.compatibility_summary = _grouped_incompatibility_summary(grouped)
         profile.effective_input_bytes = sum(item.size_bytes for item in compatible_items)
+        profile.size_uncertainty = _average_size_error_for_items(
+            preset=profile.encoder_key,
+            items=compatible_items,
+            ffprobe=ffprobe,
+            calibration_store=active_calibration,
+        )
         if compatible_items:
             speed_key = (
                 profile.encoder_key
@@ -1555,7 +1615,9 @@ def display_profiles_table(
             pct_high = saving_high / total_input_bytes * 100
             if (pct_high - pct_low) >= 35:
                 return "~highly variable"
-            return f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
+            return (
+                f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
+            )
         return f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
 
     def _est_time_text(profile: EncoderProfile) -> str:
@@ -1573,7 +1635,9 @@ def display_profiles_table(
                 console.print(f"{display_idx}. Custom | manual override", highlight=False)
                 continue
             recommended_tag = " [recommended]" if profile.is_recommended else ""
-            encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
+            encoder_display = _encoder_display_name(
+                profile.encoder_key, device_labels, truncate=True
+            )
             fit = (
                 f"{profile.compatible_count} ok / {profile.incompatible_count} follow-up"
                 if candidate_count
@@ -1625,13 +1689,17 @@ def display_profiles_table(
                 if narrow:
                     row.append("Manual override.")
                 else:
-                    row.extend(["-", "-", "Manual override."] if not compact else ["-", "Manual override."])
+                    row.extend(
+                        ["-", "-", "Manual override."] if not compact else ["-", "Manual override."]
+                    )
                     if not compact:
                         row.append("-")
                 table.add_row(*row)
                 continue
 
-            encoder_display = _encoder_display_name(profile.encoder_key, device_labels, truncate=True)
+            encoder_display = _encoder_display_name(
+                profile.encoder_key, device_labels, truncate=True
+            )
             profile_name: str | Text = (
                 Text.assemble(profile.name, " ", ("[recommended]", "bold cyan"))
                 if profile.is_recommended
@@ -1679,7 +1747,9 @@ def display_profiles_table(
         console.print()
         console.print(table)
         if render_mode == "narrow":
-            console.print("  [dim]Narrow view keeps only the fields needed to compare profiles quickly.[/dim]")
+            console.print(
+                "  [dim]Narrow view keeps only the fields needed to compare profiles quickly.[/dim]"
+            )
             for display_idx, profile in display_index_map.items():
                 if profile.is_custom:
                     continue
@@ -1729,7 +1799,10 @@ def display_profiles_table(
             f"  [dim]Lowest estimated wait: {fastest.name} (~{_fmt_duration(fastest.estimated_encode_seconds)}), working for {fastest.compatible_count} file(s).[/dim]"
         )
     if recommended is not None:
-        if recommended.why_choose.startswith("Fastest wait:"):
+        if (
+            recommended.why_choose.startswith("Fastest wait:")
+            or "highly variable" in recommended.why_choose
+        ):
             console.print(f"  [dim]Default pick: {recommended.why_choose}[/dim]")
         else:
             console.print(
@@ -2312,11 +2385,7 @@ def run_wizard(
         )
         console.print(
             f"  [dim]{_format_grouped_reason_list(mkv_grouped_reasons)}[/dim]"
-            + (
-                f" [dim](examples: {', '.join(mkv_examples)})[/dim]"
-                if mkv_examples
-                else ""
-            )
+            + (f" [dim](examples: {', '.join(mkv_examples)})[/dim]" if mkv_examples else "")
         )
         console.print(
             "  [dim]If needed, the wizard can switch incompatible files into a MKV follow-up folder instead of leaving them only in a manifest.[/dim]"
@@ -2364,6 +2433,13 @@ def run_wizard(
     active_calibration = planning.active_calibration
     profiles = planning.profiles
     size_error_by_preset = planning.size_error_by_preset
+    if benchmark_speeds:
+        console.print(
+            f"[dim]Benchmarked {len([key for key, speed in benchmark_speeds.items() if speed is not None])} profile candidate(s).[/dim]"
+        )
+    probe_target_count = len(_iter_probe_targets(profiles))
+    if probe_target_count:
+        console.print(f"[dim]Smoke-probed {probe_target_count} risky profile combination(s).[/dim]")
     profile_estimate_confidence = estimate_analysis_confidence(candidate_items, benchmarked_files=1)
     profile_calibration_detail = describe_estimate_calibration(
         candidate_items,
@@ -2728,11 +2804,7 @@ def run_wizard(
                 compatibility_prediction_note = (
                     f"Predicted compatibility for this selection: {predicted_compatible} compatible / "
                     f"{predicted_incompatible} likely follow-up; preflight confirmed {len(compatible_jobs)} in-place compatible"
-                    + (
-                        f", {len(mkv_switched_jobs)} switched to MKV"
-                        if mkv_switched_jobs
-                        else ""
-                    )
+                    + (f", {len(mkv_switched_jobs)} switched to MKV" if mkv_switched_jobs else "")
                     + (
                         f", {len(remaining_incompatible_items)} moved to follow-up."
                         if remaining_incompatible_items
@@ -2742,11 +2814,7 @@ def run_wizard(
             else:
                 compatibility_prediction_note = (
                     f"Preflight confirmed {len(compatible_jobs)} in-place compatible"
-                    + (
-                        f", {len(mkv_switched_jobs)} switched to MKV"
-                        if mkv_switched_jobs
-                        else ""
-                    )
+                    + (f", {len(mkv_switched_jobs)} switched to MKV" if mkv_switched_jobs else "")
                     + (
                         f", {len(remaining_incompatible_items)} moved to follow-up."
                         if remaining_incompatible_items
@@ -2930,6 +2998,10 @@ def run_wizard(
                 size_error=selected_profile_size_error,
             )
         )
+        if selected_profile_size_error is not None and abs(selected_profile_size_error) >= 0.25:
+            console.print(
+                "  [dim]Local history for this encoder/profile is too inconsistent to offer a tighter output-size estimate for the surviving batch.[/dim]"
+            )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
         console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
     console.print(f"  Size confidence: {size_confidence_label}")

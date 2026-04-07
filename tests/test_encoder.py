@@ -8,6 +8,7 @@ import pytest
 from mediashrink.encoder import (
     _CODEC_BASE_FACTOR,
     build_ffmpeg_command,
+    describe_container_incompatibilities,
     describe_container_incompatibility,
     describe_output_container_constraints,
     encode_file,
@@ -100,6 +101,25 @@ def test_build_ffmpeg_command_nvenc(tmp_path: Path) -> None:
     assert "hevc_nvenc" in cmd
     assert "libx265" not in cmd
     assert "-cq" in cmd
+
+
+def test_describe_container_incompatibilities_reports_all_mp4_stream_risks(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mp4"
+    source.write_bytes(b"fake")
+
+    with patch(
+        "mediashrink.encoder._probe_streams",
+        return_value=[
+            {"codec_type": "audio", "codec_name": "dts"},
+            {"codec_type": "attachment", "codec_name": "ttf"},
+            {"codec_type": "data", "codec_name": "bin_data"},
+        ],
+    ):
+        reasons = describe_container_incompatibilities(source, source, FFPROBE)
+
+    assert "unsupported copied audio codec: dts" in reasons
+    assert "attachment stream incompatibility" in reasons
+    assert "auxiliary data stream incompatibility" in reasons
 
 
 # ---------------------------------------------------------------------------

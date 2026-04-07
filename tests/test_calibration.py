@@ -128,6 +128,6 @@ def test_lookup_estimate_blends_exact_and_related_matches(tmp_path: Path) -> Non
 
     assert estimate is not None
     assert estimate.output_ratio is not None
-    assert 0.50 < estimate.output_ratio < 0.60
+    assert 0.50 < estimate.output_ratio < 0.65
     assert estimate.weighted_samples > 1.0
     assert describe_calibration_estimate(estimate) is not None

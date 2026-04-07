@@ -540,6 +540,13 @@ def _print_incompatibility_stream_details(
     prefix: str = "  ",
 ) -> None:
     for job in jobs[:5]:
+        explicit = describe_container_incompatibilities(job.source, job.output, ffprobe)
+        if explicit:
+            console.print(
+                f"{prefix}[dim]{job.source.name}: {', '.join(explicit)}[/dim]",
+                highlight=False,
+            )
+            continue
         notes = describe_output_container_constraints(job.source, job.output, ffprobe)
         if not notes:
             continue
