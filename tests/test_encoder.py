@@ -8,6 +8,8 @@ import pytest
 from mediashrink.encoder import (
     _CODEC_BASE_FACTOR,
     build_ffmpeg_command,
+    describe_container_incompatibility,
+    describe_output_container_constraints,
     encode_file,
     encode_preview,
     estimate_output_size,
@@ -219,6 +221,46 @@ def test_build_hw_command_mp4_drops_subtitles(tmp_path: Path) -> None:
     assert "-sn" in cmd
     assert "-c:s" not in cmd
     assert ["-map", "0:v", "-map", "0:a?", "-dn"] == cmd[cmd.index("-map") : cmd.index("-c:v")]
+
+
+def test_describe_output_container_constraints_warns_for_attachment_data_and_audio(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "movie.mp4"
+    source.write_bytes(b"fake mp4 data")
+
+    with patch(
+        "mediashrink.encoder._probe_streams",
+        return_value=[
+            {"codec_type": "video", "codec_name": "h264"},
+            {"codec_type": "audio", "codec_name": "dts"},
+            {"codec_type": "subtitle", "codec_name": "ass"},
+            {"codec_type": "attachment", "codec_name": "ttf"},
+            {"codec_type": "data", "codec_name": "bin_data"},
+        ],
+    ):
+        notes = describe_output_container_constraints(source, source, FFPROBE)
+
+    assert any("subtitle streams will be dropped" in note for note in notes)
+    assert any("attachment streams will be dropped" in note for note in notes)
+    assert any("auxiliary data streams will be dropped" in note for note in notes)
+    assert any("audio copy may fail" in note and "dts" in note for note in notes)
+
+
+def test_describe_container_incompatibility_prefers_audio_reason_for_mp4(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mp4"
+    source.write_bytes(b"fake mp4 data")
+
+    with patch(
+        "mediashrink.encoder._probe_streams",
+        return_value=[
+            {"codec_type": "video", "codec_name": "h264"},
+            {"codec_type": "audio", "codec_name": "dts"},
+        ],
+    ):
+        reason = describe_container_incompatibility(source, source, FFPROBE)
+
+    assert reason == "audio codec copy is not supported by the chosen output container (dts)"
 
 
 def test_is_hardware_preset() -> None:

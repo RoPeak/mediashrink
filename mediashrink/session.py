@@ -6,8 +6,8 @@ from pathlib import Path
 
 from mediashrink.models import EncodeAttempt, EncodeJob, SessionFileEntry, SessionManifest
 
-SESSION_VERSION = 3
-_SUPPORTED_SESSION_VERSIONS = {1, 2, 3}
+SESSION_VERSION = 4
+_SUPPORTED_SESSION_VERSIONS = {1, 2, 3, 4}
 _SESSION_FILENAME = ".mediashrink-session.json"
 
 
@@ -45,6 +45,8 @@ def build_session(
     policy: str | None = None,
     on_file_failure: str | None = None,
     use_calibration: bool = True,
+    retry_mode: str | None = None,
+    queue_strategy: str | None = None,
 ) -> SessionManifest:
     timestamp = datetime.now(tz=timezone.utc).isoformat()
     entries = [
@@ -67,6 +69,8 @@ def build_session(
         policy=policy,
         on_file_failure=on_file_failure,
         use_calibration=use_calibration,
+        retry_mode=retry_mode,
+        queue_strategy=queue_strategy,
     )
 
 

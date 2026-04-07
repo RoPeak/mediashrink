@@ -1248,6 +1248,62 @@ def test_write_batch_reports_include_skip_breakdown(tmp_path: Path) -> None:
     assert "Skipped by policy: 1" in text
 
 
+def test_write_batch_reports_include_retry_and_queue_metadata(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    job = _make_job(tmp_path / "episode.mkv")
+    job.source.write_bytes(b"x" * 1000)
+    result = _make_result(job)
+
+    json_path, text_path = _write_batch_reports(
+        mode="overnight",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+        retry_mode="conservative",
+        queue_strategy="safe-first",
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["retry_mode"] == "conservative"
+    assert payload["queue_strategy"] == "safe-first"
+    assert "Retry mode: conservative" in text
+    assert "Queue strategy: safe-first" in text
+
+
+def test_safe_first_queue_prioritizes_lower_risk_jobs(tmp_path: Path) -> None:
+    from mediashrink.cli import _prioritize_jobs
+
+    safe = _make_job(tmp_path / "safe.mkv")
+    safe.source.write_bytes(b"x" * 1000)
+    mp4_job = _make_job(tmp_path / "container.mp4")
+    mp4_job.source.write_bytes(b"x" * 1000)
+    hardware_job = _make_job(tmp_path / "hardware.mkv")
+    hardware_job.source.write_bytes(b"x" * 1000)
+    mp4_job.output = mp4_job.source.with_stem(mp4_job.source.stem + "_compressed")
+    hardware_job.preset = "amf"
+
+    ordered = _prioritize_jobs([mp4_job, hardware_job, safe], "safe-first")
+
+    assert [job.source.name for job in ordered] == ["safe.mkv", "hardware.mkv", "container.mp4"]
+
+
 def test_run_encode_loop_retries_early_hardware_failure_with_software_fallback(
     tmp_path: Path,
 ) -> None:
@@ -1567,6 +1623,84 @@ def test_encode_overnight_flag_forces_skip_policy_and_verbose(tmp_path: Path) ->
     assert result.exit_code == 0
     assert mock_loop.call_args.kwargs["on_file_failure"] == "skip"
     assert mock_loop.call_args.kwargs["use_calibration"] is True
+    assert mock_loop.call_args.kwargs["retry_mode"] == "conservative"
+
+
+def test_encode_overnight_flag_uses_safe_first_queue_strategy(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    ok_result = _make_result(job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch("mediashrink.cli._prioritize_jobs", return_value=[job]) as mock_prioritize,
+        patch("mediashrink.cli._run_encode_loop", return_value=[ok_result]),
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--overnight"])
+
+    assert result.exit_code == 0
+    assert mock_prioritize.call_args.args[1] == "safe-first"
+
+
+def test_review_command_summarizes_latest_report(tmp_path: Path) -> None:
+    report = tmp_path / "mediashrink_report_20260406_120000.json"
+    report.write_text(
+        json.dumps(
+            {
+                "mode": "overnight",
+                "directory": str(tmp_path),
+                "policy": "highest-confidence",
+                "retry_mode": "conservative",
+                "queue_strategy": "safe-first",
+                "warnings": ["Subtitle warning"],
+                "totals": {
+                    "succeeded": 4,
+                    "failed": 1,
+                    "skipped_incompatible": 2,
+                    "skipped_by_policy": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["review", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Run review" in result.stdout
+    assert "retry mode: conservative" in result.stdout
+    assert "Skipped incompatible files likely need MKV outputs" in result.stdout
+
+
+def test_review_command_json_includes_guidance(tmp_path: Path) -> None:
+    report = tmp_path / "mediashrink_report_20260406_120000.json"
+    report.write_text(
+        json.dumps(
+            {
+                "mode": "encode",
+                "directory": str(tmp_path),
+                "policy": "fastest-wall-clock",
+                "totals": {
+                    "succeeded": 1,
+                    "failed": 0,
+                    "skipped_incompatible": 0,
+                    "skipped_by_policy": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["review", str(report), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["review_guidance"] == ["No manual follow-up is suggested from this report."]
 
 
 def test_encode_skip_policy_skips_incompatible_file_before_batch(tmp_path: Path) -> None:
@@ -1648,6 +1782,36 @@ def test_encode_skip_policy_reports_specific_subtitle_incompatibility(tmp_path: 
 
     assert result.exit_code == 0
     assert "subtitle codec is not supported by the chosen output container" in result.stdout
+
+
+def test_encode_warns_about_attachment_data_and_audio_container_constraints(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+    ok_result = _make_result(job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch(
+            "mediashrink.cli.describe_output_container_constraints",
+            return_value=[
+                "attachment streams will be dropped for MP4/M4V compatibility",
+                "auxiliary data streams will be dropped for MP4/M4V compatibility",
+                "audio copy may fail in this container for codec(s): dts",
+            ],
+        ),
+        patch("mediashrink.cli.encode_file", return_value=ok_result),
+    ):
+        result = runner.invoke(app, [str(tmp_path), "--yes"])
+
+    assert result.exit_code == 0
+    assert "Attachment warning:" in result.stdout
+    assert "Auxiliary data warning:" in result.stdout
+    assert "Audio compatibility warning:" in result.stdout
 
 
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:

@@ -37,6 +37,8 @@ from mediashrink.calibration import (
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import (
+    describe_container_incompatibility,
+    describe_output_container_constraints,
     encode_file,
     encode_preview,
     get_duration_seconds,
@@ -45,6 +47,8 @@ from mediashrink.encoder import (
     is_hardware_preset,
     output_drops_subtitles,
     preflight_encode_job,
+    source_has_attachment_streams,
+    source_has_data_streams,
     source_has_subtitle_streams,
 )
 from mediashrink.models import (
@@ -111,6 +115,8 @@ _POLICY_CHOICES = {
     "highest-confidence",
 }
 _FAILURE_POLICY_CHOICES = {"skip", "retry", "stop"}
+_RETRY_MODE_CHOICES = {"conservative", "balanced", "aggressive"}
+_QUEUE_STRATEGY_CHOICES = {"original", "safe-first"}
 
 
 def _now_iso() -> str:
@@ -172,6 +178,18 @@ def _validate_failure_policy(value: str) -> str:
     return value
 
 
+def _validate_retry_mode(value: str) -> str:
+    if value not in _RETRY_MODE_CHOICES:
+        raise typer.BadParameter(f"invalid retry mode '{value}'")
+    return value
+
+
+def _validate_queue_strategy(value: str) -> str:
+    if value not in _QUEUE_STRATEGY_CHOICES:
+        raise typer.BadParameter(f"invalid queue strategy '{value}'")
+    return value
+
+
 def _resolve_runtime_settings(
     *,
     overnight: bool,
@@ -181,9 +199,13 @@ def _resolve_runtime_settings(
     cleanup: bool,
     yes: bool,
     use_calibration: bool,
+    retry_mode: str,
+    queue_strategy: str,
 ) -> dict[str, object]:
     runtime_policy = _validate_policy(policy)
     runtime_failure_policy = _validate_failure_policy(on_file_failure)
+    runtime_retry_mode = _validate_retry_mode(retry_mode)
+    runtime_queue_strategy = _validate_queue_strategy(queue_strategy)
     if overnight:
         runtime_failure_policy = "skip"
         return {
@@ -193,6 +215,8 @@ def _resolve_runtime_settings(
             "cleanup": False if not cleanup else cleanup,
             "yes": True,
             "use_calibration": use_calibration,
+            "retry_mode": "conservative",
+            "queue_strategy": "safe-first",
         }
     return {
         "policy": runtime_policy,
@@ -201,6 +225,8 @@ def _resolve_runtime_settings(
         "cleanup": cleanup,
         "yes": yes,
         "use_calibration": use_calibration,
+        "retry_mode": runtime_retry_mode,
+        "queue_strategy": runtime_queue_strategy,
     }
 
 
@@ -290,13 +316,27 @@ def _maybe_warn_low_disk_space(
 def _collect_preflight_warnings(jobs: list[EncodeJob], ffprobe: Path) -> list[str]:
     subtitle_examples: list[str] = []
     subtitle_count = 0
+    attachment_examples: list[str] = []
+    attachment_count = 0
+    data_examples: list[str] = []
+    data_count = 0
+    audio_examples: list[str] = []
     for job in jobs:
-        if job.skip or not output_drops_subtitles(job.output):
+        if job.skip:
             continue
-        if source_has_subtitle_streams(job.source, ffprobe):
+        if output_drops_subtitles(job.output) and source_has_subtitle_streams(job.source, ffprobe):
             subtitle_count += 1
             if len(subtitle_examples) < 3:
                 subtitle_examples.append(job.source.name)
+        for note in describe_output_container_constraints(job.source, job.output, ffprobe):
+            if note.startswith("attachment") and len(attachment_examples) < 3:
+                attachment_count += 1
+                attachment_examples.append(job.source.name)
+            elif note.startswith("auxiliary data") and len(data_examples) < 3:
+                data_count += 1
+                data_examples.append(job.source.name)
+            elif note.startswith("audio copy may fail") and len(audio_examples) < 3:
+                audio_examples.append(f"{job.source.name}: {note}")
 
     warnings: list[str] = []
     if subtitle_count:
@@ -315,10 +355,38 @@ def _collect_preflight_warnings(jobs: list[EncodeJob], ffprobe: Path) -> list[st
         if subtitle_examples:
             warning += f" Examples: {', '.join(subtitle_examples)}."
         warnings.append(warning)
+    if attachment_count:
+        warning = (
+            f"Attachment warning: {attachment_count} file(s) contain attachment streams that will "
+            "be dropped for MP4/M4V compatibility."
+        )
+        if attachment_examples:
+            warning += f" Examples: {', '.join(attachment_examples)}."
+        warnings.append(warning)
+    if data_count:
+        warning = (
+            f"Auxiliary data warning: {data_count} file(s) contain data streams that will be "
+            "dropped for MP4/M4V compatibility."
+        )
+        if data_examples:
+            warning += f" Examples: {', '.join(data_examples)}."
+        warnings.append(warning)
+    if audio_examples:
+        warnings.append(
+            "Audio compatibility warning: some copied audio streams may fail in MP4/M4V outputs. "
+            + " Examples: "
+            + "; ".join(audio_examples)
+            + "."
+        )
     return warnings
 
 
-def _classify_incompatible_reason(message: str | None, job: EncodeJob) -> str:
+def _classify_incompatible_reason(
+    message: str | None,
+    job: EncodeJob,
+    *,
+    ffprobe: Path | None = None,
+) -> str:
     lowered = (message or "").lower()
     if "attachment" in lowered:
         return "attachment streams are not supported by the chosen output container"
@@ -329,10 +397,18 @@ def _classify_incompatible_reason(message: str | None, job: EncodeJob) -> str:
     if "audio" in lowered and "not currently supported in container" in lowered:
         return "audio codec is not supported by the chosen output container"
     if "could not write header" in lowered and "invalid argument" in lowered:
+        if ffprobe is not None:
+            classified = describe_container_incompatibility(job.source, job.output, ffprobe)
+            if classified is not None:
+                return classified
         return "unsupported container/stream combination"
     if "invalid argument" in lowered and is_hardware_preset(job.preset):
         return "encoder/container combination appears unreliable on this device"
     if job.output.suffix.lower() in {".mp4", ".m4v"}:
+        if ffprobe is not None:
+            classified = describe_container_incompatibility(job.source, job.output, ffprobe)
+            if classified is not None:
+                return classified
         return "output container cannot safely carry one or more copied streams"
     if is_hardware_preset(job.preset) and "invalid argument" in lowered:
         return "encoder/container combination appears unreliable on this device"
@@ -371,7 +447,7 @@ def _apply_batch_preflight_policy(
         )
         if result.success:
             continue
-        reason = _classify_incompatible_reason(result.error_message, job)
+        reason = _classify_incompatible_reason(result.error_message, job, ffprobe=ffprobe)
         detail = f"{job.source.name}: {reason}"
         if on_file_failure == "skip":
             job.skip = True
@@ -407,6 +483,49 @@ def _report_output_dir(base_dir: Path, output_dir: Path | None, log_path: Path |
     if log_path is not None:
         return log_path.parent
     return output_dir or base_dir
+
+
+def _find_latest_report(path: Path) -> Path | None:
+    if path.is_file():
+        return path if path.suffix.lower() == ".json" else None
+    candidates = sorted(path.glob("mediashrink_report_*.json"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+
+
+def _load_report_payload(path: Path) -> dict[str, object]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("report root must be an object")
+    return raw
+
+
+def _review_guidance(payload: dict[str, object]) -> list[str]:
+    totals = payload.get("totals")
+    if not isinstance(totals, dict):
+        return []
+    guidance: list[str] = []
+    failed = int(totals.get("failed", 0))
+    skipped_incompatible = int(totals.get("skipped_incompatible", 0))
+    mode = payload.get("mode") if isinstance(payload.get("mode"), str) else "encode"
+    directory = payload.get("directory") if isinstance(payload.get("directory"), str) else None
+    if failed:
+        if mode in {"encode", "resume", "overnight"} and directory:
+            guidance.append(
+                f'Retry unresolved files with: mediashrink resume "{directory}" --policy highest-confidence --retry-mode aggressive'
+            )
+        else:
+            guidance.append(
+                "Review the failed files and rerun them with a safer policy or software preset."
+            )
+    if skipped_incompatible and directory:
+        guidance.append(
+            f"Skipped incompatible files likely need MKV outputs or a different preset path for: {directory}"
+        )
+    if not guidance:
+        guidance.append("No manual follow-up is suggested from this report.")
+    return guidance
 
 
 def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
@@ -456,6 +575,29 @@ def _record_failure_calibration(result: EncodeResult) -> None:
     )
 
 
+def _job_risk_score(job: EncodeJob) -> tuple[int, int]:
+    container_risk = 1 if job.output.suffix.lower() in {".mp4", ".m4v"} else 0
+    encoder_risk = 1 if is_hardware_preset(job.preset) else 0
+    return container_risk, encoder_risk
+
+
+def _prioritize_jobs(jobs: list[EncodeJob], queue_strategy: str) -> list[EncodeJob]:
+    if queue_strategy != "safe-first":
+        return jobs
+    skipped = [job for job in jobs if job.skip]
+    active = [job for job in jobs if not job.skip]
+    active.sort(
+        key=lambda job: (
+            _job_risk_score(job),
+            job.estimated_output_bytes
+            if job.estimated_output_bytes > 0
+            else job.source.stat().st_size,
+            job.source.name.lower(),
+        )
+    )
+    return skipped + active
+
+
 def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
     succeeded = [result for result in results if result.success and not result.skipped]
     failed = [result for result in results if not result.success and not result.skipped]
@@ -498,6 +640,8 @@ def _write_batch_reports(
     warnings: list[str] | None = None,
     policy: str | None = None,
     on_file_failure: str | None = None,
+    retry_mode: str | None = None,
+    queue_strategy: str | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -557,6 +701,8 @@ def _write_batch_reports(
         "warnings": warnings or [],
         "policy": policy,
         "on_file_failure": on_file_failure,
+        "retry_mode": retry_mode,
+        "queue_strategy": queue_strategy,
         "files": files,
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -577,6 +723,8 @@ def _write_batch_reports(
         f"On file failure: {on_file_failure}"
         if on_file_failure is not None
         else "On file failure: -",
+        f"Retry mode: {retry_mode}" if retry_mode is not None else "Retry mode: -",
+        f"Queue strategy: {queue_strategy}" if queue_strategy is not None else "Queue strategy: -",
         f"Started: {started_at}",
         f"Finished: {finished_at}",
         "",
@@ -669,6 +817,14 @@ def _should_retry_hardware_failure(result: EncodeResult) -> bool:
     )
 
 
+def _retry_mode_allows_hardware_fallback(result: EncodeResult, retry_mode: str) -> bool:
+    if retry_mode == "conservative":
+        return False
+    if retry_mode == "aggressive":
+        return _should_retry_hardware_failure(result)
+    return _should_retry_hardware_failure(result)
+
+
 def _classify_transient_failure(result: EncodeResult) -> str | None:
     if result.success or result.skipped:
         return None
@@ -693,6 +849,19 @@ def _should_retry_transient_failure(result: EncodeResult) -> str | None:
     if retry_kind == "io_temporary":
         return retry_kind
     return None
+
+
+def _retry_mode_transient_kind(result: EncodeResult, retry_mode: str) -> str | None:
+    retry_kind = _classify_transient_failure(result)
+    if retry_kind is None or result.retry_count >= 1:
+        return None
+    if retry_mode == "conservative":
+        if retry_kind == "hardware_api_startup" and is_hardware_preset(result.job.preset):
+            return retry_kind
+        return retry_kind if retry_kind == "io_temporary" else None
+    if retry_mode == "aggressive":
+        return retry_kind
+    return _should_retry_transient_failure(result)
 
 
 def _attempts_with_retry_kind(
@@ -844,6 +1013,7 @@ def _run_encode_loop(
     previously_skipped: int = 0,
     on_file_failure: str = "retry",
     use_calibration: bool = True,
+    retry_mode: str = "balanced",
 ) -> list[EncodeResult]:
     if stall_warning_seconds is None:
         stall_warning_seconds = STALL_WARNING_SECONDS
@@ -949,7 +1119,7 @@ def _run_encode_loop(
                     log_path=log_path,
                 )
                 result = _apply_failure_diagnostics(result)
-                transient_retry_kind = _should_retry_transient_failure(result)
+                transient_retry_kind = _retry_mode_transient_kind(result, retry_mode)
                 if transient_retry_kind is not None:
                     console.print(
                         f"[yellow]Retrying {filename} after transient {transient_retry_kind.replace('_', ' ')} failure[/yellow]"
@@ -986,7 +1156,9 @@ def _run_encode_loop(
                         retry_kind=transient_retry_kind,
                         attempts=attempts,
                     )
-                if allow_hardware_fallback and _should_retry_hardware_failure(result):
+                if allow_hardware_fallback and _retry_mode_allows_hardware_fallback(
+                    result, retry_mode
+                ):
                     console.print(
                         f"[yellow]Retrying {filename} with software fallback[/yellow] [dim](libx265 faster, CRF {_FALLBACK_CRF})[/dim]"
                     )
@@ -1490,6 +1662,16 @@ def encode_cmd(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results to improve estimates and policy ranking.",
     ),
+    retry_mode: str = typer.Option(
+        "balanced",
+        "--retry-mode",
+        help="Retry strategy: conservative, balanced, or aggressive.",
+    ),
+    queue_strategy: str = typer.Option(
+        "original",
+        "--queue-strategy",
+        help="Batch order: original or safe-first.",
+    ),
     overnight: bool = typer.Option(
         False,
         "--overnight",
@@ -1510,6 +1692,8 @@ def encode_cmd(
         cleanup=cleanup,
         yes=yes,
         use_calibration=use_calibration,
+        retry_mode=retry_mode,
+        queue_strategy=queue_strategy,
     )
     verbose = bool(runtime["verbose"])
     cleanup = bool(runtime["cleanup"])
@@ -1517,6 +1701,8 @@ def encode_cmd(
     use_calibration = bool(runtime["use_calibration"])
     on_file_failure = str(runtime["on_file_failure"])
     policy = str(runtime["policy"])
+    retry_mode = str(runtime["retry_mode"])
+    queue_strategy = str(runtime["queue_strategy"])
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
@@ -1541,6 +1727,7 @@ def encode_cmd(
         ffprobe=ffprobe,
         no_skip=no_skip,
     )
+    jobs = _prioritize_jobs(jobs, queue_strategy)
 
     prior: SessionManifest | None = None
     resumed_from_session = False
@@ -1634,6 +1821,8 @@ def encode_cmd(
                 policy=policy,
                 on_file_failure=on_file_failure,
                 use_calibration=use_calibration,
+                retry_mode=retry_mode,
+                queue_strategy=queue_strategy,
             )
         save_session(active_session, session_path)
 
@@ -1664,6 +1853,7 @@ def encode_cmd(
                 previously_skipped=resume_skipped,
                 on_file_failure=on_file_failure,
                 use_calibration=use_calibration,
+                retry_mode=retry_mode,
             )
         )
     cleaned_paths: list[Path] = []
@@ -1693,6 +1883,8 @@ def encode_cmd(
             warnings=preflight_warnings,
             policy=policy,
             on_file_failure=on_file_failure,
+            retry_mode=retry_mode,
+            queue_strategy=queue_strategy,
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -1898,6 +2090,16 @@ def apply(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results to improve estimates and policy ranking.",
     ),
+    retry_mode: str = typer.Option(
+        "balanced",
+        "--retry-mode",
+        help="Retry strategy: conservative, balanced, or aggressive.",
+    ),
+    queue_strategy: str = typer.Option(
+        "original",
+        "--queue-strategy",
+        help="Batch order: original or safe-first.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -1934,6 +2136,7 @@ def apply(
         ffprobe=ffprobe,
         no_skip=False,
     )
+    jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
 
     jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
         jobs,
@@ -1992,6 +2195,7 @@ def apply(
                 stall_warning_seconds=float(stall_warning_seconds),
                 on_file_failure=_validate_failure_policy(on_file_failure),
                 use_calibration=use_calibration,
+                retry_mode=_validate_retry_mode(retry_mode),
             )
         )
     cleaned_paths: list[Path] = []
@@ -2019,6 +2223,8 @@ def apply(
         warnings=preflight_warnings,
         policy=_validate_policy(policy),
         on_file_failure=on_file_failure,
+        retry_mode=_validate_retry_mode(retry_mode),
+        queue_strategy=_validate_queue_strategy(queue_strategy),
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
@@ -2236,6 +2442,16 @@ def resume(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results during resumed runs.",
     ),
+    retry_mode: str = typer.Option(
+        "balanced",
+        "--retry-mode",
+        help="Retry strategy: conservative, balanced, or aggressive.",
+    ),
+    queue_strategy: str = typer.Option(
+        "original",
+        "--queue-strategy",
+        help="Batch order: original or safe-first.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -2264,6 +2480,7 @@ def resume(
         )
         raise typer.Exit(code=EXIT_NO_FILES)
     jobs = _build_resume_jobs(session, ffprobe=ffprobe)
+    jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
     if not jobs:
         console.print("[yellow]No resumable files remain in the saved session.[/yellow]")
         raise typer.Exit(code=EXIT_NO_FILES)
@@ -2346,6 +2563,7 @@ def resume(
                 previously_skipped=resume_skipped,
                 on_file_failure=_validate_failure_policy(on_file_failure),
                 use_calibration=use_calibration,
+                retry_mode=_validate_retry_mode(retry_mode),
             )
         )
     cleaned_paths: list[Path] = []
@@ -2374,6 +2592,8 @@ def resume(
         warnings=preflight_warnings,
         policy=_validate_policy(policy),
         on_file_failure=on_file_failure,
+        retry_mode=_validate_retry_mode(retry_mode),
+        queue_strategy=_validate_queue_strategy(queue_strategy),
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -2428,6 +2648,16 @@ def overnight(
         "--use-calibration/--no-calibration",
         help="Use local historical encode results to improve estimates and profile ranking.",
     ),
+    retry_mode: str = typer.Option(
+        "conservative",
+        "--retry-mode",
+        help="Retry strategy: conservative, balanced, or aggressive.",
+    ),
+    queue_strategy: str = typer.Option(
+        "safe-first",
+        "--queue-strategy",
+        help="Batch order: original or safe-first.",
+    ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
         "--stall-warning-seconds",
@@ -2450,6 +2680,9 @@ def overnight(
         policy=policy,
         use_calibration=use_calibration,
     )
+    queue_strategy = _validate_queue_strategy(queue_strategy)
+    retry_mode = _validate_retry_mode(retry_mode)
+    jobs = _prioritize_jobs(jobs, queue_strategy)
     if not jobs:
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
@@ -2496,6 +2729,8 @@ def overnight(
             policy=policy,
             on_file_failure="skip",
             use_calibration=use_calibration,
+            retry_mode=retry_mode,
+            queue_strategy=queue_strategy,
         )
     )
     save_session(session, session_path)
@@ -2530,6 +2765,7 @@ def overnight(
                 previously_skipped=resume_skipped,
                 on_file_failure="skip",
                 use_calibration=use_calibration,
+                retry_mode=retry_mode,
             )
         )
     else:
@@ -2556,10 +2792,60 @@ def overnight(
         warnings=preflight_warnings,
         policy=policy,
         on_file_failure="skip",
+        retry_mode=retry_mode,
+        queue_strategy=queue_strategy,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
     if stopped_early or any(not r.success and not r.skipped for r in results):
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
+
+
+@app.command()
+def review(
+    path: Path = typer.Argument(
+        ...,
+        help="Report JSON file or directory containing mediashrink_report_*.json files.",
+        exists=True,
+        readable=True,
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the loaded report plus generated guidance as JSON.",
+    ),
+) -> None:
+    report_path = _find_latest_report(path)
+    if report_path is None:
+        console.print(f"[red bold]Error:[/red bold] no mediashrink JSON report found in {path}")
+        raise typer.Exit(code=EXIT_NO_FILES)
+
+    payload = _load_report_payload(report_path)
+    totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+    guidance = _review_guidance(payload)
+
+    if json_output:
+        output = dict(payload)
+        output["review_guidance"] = guidance
+        print(json.dumps(output))
+        return
+
+    console.print(f"[bold]Run review[/bold] [dim]({report_path.name})[/dim]")
+    console.print(
+        f"Mode: {payload.get('mode', '-')}, policy: {payload.get('policy', '-')}, retry mode: {payload.get('retry_mode', '-')}, queue: {payload.get('queue_strategy', '-')}",
+        highlight=False,
+    )
+    console.print(
+        f"Succeeded: {totals.get('succeeded', 0)}, failed: {totals.get('failed', 0)}, skipped incompatible: {totals.get('skipped_incompatible', 0)}, skipped by policy: {totals.get('skipped_by_policy', 0)}",
+        highlight=False,
+    )
+    warnings = payload.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        console.print("[bold]Warnings[/bold]")
+        for warning in warnings[:5]:
+            console.print(f"  - {warning}")
+    console.print("[bold]Suggested next step[/bold]")
+    for line in guidance:
+        console.print(f"  - {line}")
 
 
 @app.command()

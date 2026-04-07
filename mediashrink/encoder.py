@@ -340,6 +340,7 @@ def _duration_flags(duration_limit_seconds: float | None) -> list[str]:
 # Attempting to copy incompatible subtitle streams causes FFmpeg to fail at header-write
 # time with "Invalid argument" before a single frame is encoded.
 _MP4_CONTAINERS = {".mp4", ".m4v"}
+_SAFE_MP4_AUDIO_CODECS = {"aac", "ac3", "eac3", "mp3", "alac"}
 
 
 def _subtitle_args(output_path: Path) -> list[str]:
@@ -369,15 +370,13 @@ def output_drops_subtitles(output_path: Path) -> bool:
     return output_path.suffix.lower() in _MP4_CONTAINERS
 
 
-def source_has_subtitle_streams(path: Path, ffprobe: Path) -> bool:
+def _probe_streams(path: Path, ffprobe: Path) -> list[dict[str, str]]:
     cmd = [
         str(ffprobe),
         "-v",
         "error",
-        "-select_streams",
-        "s",
         "-show_entries",
-        "stream=index",
+        "stream=codec_type,codec_name",
         "-of",
         "csv=p=0",
         str(path),
@@ -385,8 +384,101 @@ def source_has_subtitle_streams(path: Path, ffprobe: Path) -> bool:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, OSError):
-        return False
-    return any(line.strip() for line in result.stdout.splitlines())
+        return []
+
+    streams: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        raw = [part.strip() for part in line.split(",") if part.strip()]
+        if not raw:
+            continue
+        if len(raw) == 1:
+            streams.append({"codec_type": raw[0], "codec_name": ""})
+        else:
+            streams.append({"codec_type": raw[0], "codec_name": raw[1]})
+    return streams
+
+
+def source_has_subtitle_streams(path: Path, ffprobe: Path) -> bool:
+    for stream in _probe_streams(path, ffprobe):
+        if stream.get("codec_type") == "subtitle":
+            return True
+    return False
+
+
+def source_has_attachment_streams(path: Path, ffprobe: Path) -> bool:
+    for stream in _probe_streams(path, ffprobe):
+        if stream.get("codec_type") == "attachment":
+            return True
+    return False
+
+
+def source_has_data_streams(path: Path, ffprobe: Path) -> bool:
+    for stream in _probe_streams(path, ffprobe):
+        if stream.get("codec_type") == "data":
+            return True
+    return False
+
+
+def source_audio_codecs(path: Path, ffprobe: Path) -> set[str]:
+    codecs: set[str] = set()
+    for stream in _probe_streams(path, ffprobe):
+        if stream.get("codec_type") == "audio" and stream.get("codec_name"):
+            codecs.add(stream["codec_name"])
+    return codecs
+
+
+def output_may_require_audio_reencode(path: Path, output_path: Path, ffprobe: Path) -> set[str]:
+    if output_path.suffix.lower() not in _MP4_CONTAINERS:
+        return set()
+    codecs = source_audio_codecs(path, ffprobe)
+    return {codec for codec in codecs if codec not in _SAFE_MP4_AUDIO_CODECS}
+
+
+def describe_output_container_constraints(
+    source: Path,
+    output_path: Path,
+    ffprobe: Path,
+) -> list[str]:
+    if output_path.suffix.lower() not in _MP4_CONTAINERS:
+        return []
+
+    notes: list[str] = []
+    if source_has_subtitle_streams(source, ffprobe):
+        notes.append("subtitle streams will be dropped for MP4/M4V compatibility")
+    if source_has_attachment_streams(source, ffprobe):
+        notes.append("attachment streams will be dropped for MP4/M4V compatibility")
+    if source_has_data_streams(source, ffprobe):
+        notes.append("auxiliary data streams will be dropped for MP4/M4V compatibility")
+    unsupported_audio = output_may_require_audio_reencode(source, output_path, ffprobe)
+    if unsupported_audio:
+        notes.append(
+            "audio copy may fail in this container for codec(s): "
+            + ", ".join(sorted(unsupported_audio))
+        )
+    return notes
+
+
+def describe_container_incompatibility(
+    source: Path,
+    output_path: Path,
+    ffprobe: Path,
+) -> str | None:
+    if output_path.suffix.lower() not in _MP4_CONTAINERS:
+        return None
+    unsupported_audio = output_may_require_audio_reencode(source, output_path, ffprobe)
+    if unsupported_audio:
+        return (
+            "audio codec copy is not supported by the chosen output container ("
+            + ", ".join(sorted(unsupported_audio))
+            + ")"
+        )
+    if source_has_attachment_streams(source, ffprobe):
+        return "attachment streams are not supported by the chosen output container"
+    if source_has_data_streams(source, ffprobe):
+        return "auxiliary data streams are not supported by the chosen output container"
+    if source_has_subtitle_streams(source, ffprobe):
+        return "subtitle codec is not supported by the chosen output container"
+    return None
 
 
 def _build_sw_command(

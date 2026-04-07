@@ -265,6 +265,8 @@ class SessionManifest:
     policy: str | None = None
     on_file_failure: str | None = None
     use_calibration: bool = True
+    retry_mode: str | None = None
+    queue_strategy: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -279,6 +281,8 @@ class SessionManifest:
             "policy": self.policy,
             "on_file_failure": self.on_file_failure,
             "use_calibration": self.use_calibration,
+            "retry_mode": self.retry_mode,
+            "queue_strategy": self.queue_strategy,
         }
 
     @classmethod
@@ -310,6 +314,10 @@ class SessionManifest:
                 raw.get("on_file_failure") if isinstance(raw.get("on_file_failure"), str) else None
             ),
             use_calibration=bool(raw.get("use_calibration", True)),
+            retry_mode=raw.get("retry_mode") if isinstance(raw.get("retry_mode"), str) else None,
+            queue_strategy=(
+                raw.get("queue_strategy") if isinstance(raw.get("queue_strategy"), str) else None
+            ),
         )
 
 

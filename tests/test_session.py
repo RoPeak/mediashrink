@@ -33,7 +33,16 @@ def _make_job(tmp_path: Path, name: str = "ep01.mkv") -> EncodeJob:
 
 def test_build_and_load_session_round_trip(tmp_path: Path) -> None:
     jobs = [_make_job(tmp_path, "ep01.mkv"), _make_job(tmp_path, "ep02.mkv")]
-    manifest = build_session(tmp_path, "fast", 20, False, None, jobs)
+    manifest = build_session(
+        tmp_path,
+        "fast",
+        20,
+        False,
+        None,
+        jobs,
+        retry_mode="aggressive",
+        queue_strategy="safe-first",
+    )
     session_path = get_session_path(tmp_path, None)
     save_session(manifest, session_path)
 
@@ -42,6 +51,8 @@ def test_build_and_load_session_round_trip(tmp_path: Path) -> None:
     assert loaded.version == SESSION_VERSION
     assert loaded.preset == "fast"
     assert loaded.crf == 20
+    assert loaded.retry_mode == "aggressive"
+    assert loaded.queue_strategy == "safe-first"
     assert len(loaded.entries) == 2
     assert loaded.entries[0].status == "pending"
     assert loaded.entries[1].status == "pending"
