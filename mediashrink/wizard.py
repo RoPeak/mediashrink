@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,6 +91,41 @@ def _fmt_duration(seconds: float) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def _wizard_readline(prompt_text: str) -> str:
+    sys.stdout.write(prompt_text)
+    sys.stdout.flush()
+    try:
+        value = sys.stdin.readline()
+    except KeyboardInterrupt as exc:
+        raise typer.Abort() from exc
+    if value == "":
+        raise typer.Abort()
+    return value.rstrip("\r\n")
+
+
+def _wizard_prompt(text: str, default: str | None = None, *, show_default: bool = True) -> str:
+    prompt_text = text
+    if default is not None and show_default:
+        prompt_text += f" [{default}]"
+    prompt_text += ": "
+    value = _wizard_readline(prompt_text)
+    if not value and default is not None:
+        return default
+    return value
+
+
+def _wizard_confirm(text: str, *, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        value = _wizard_readline(f"{text} {suffix}: ").strip().lower()
+        if not value:
+            return default
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
 
 
 def _render_mode(console: Console, *, plain_output: bool = False) -> str:
@@ -1833,9 +1869,10 @@ def prompt_profile_selection(
     display_max = len(display_index_map)
 
     while True:
-        choice = typer.prompt(
+        choice = _wizard_prompt(
             f"Select a profile [1-{display_max}, Enter for {recommended_display_idx} ({recommended.name})]",
             default=str(recommended_display_idx),
+            show_default=False,
         ).strip()
 
         try:
@@ -1865,7 +1902,7 @@ def run_custom_wizard(available_hw: list[str], console: Console) -> tuple[str, i
     while True:
         try:
             enc_idx = (
-                int(typer.prompt(f"Choose encoder [1-{len(encoder_choices)}]", default="1")) - 1
+                int(_wizard_prompt(f"Choose encoder [1-{len(encoder_choices)}]", default="1")) - 1
             )
         except ValueError:
             enc_idx = -1
@@ -1878,7 +1915,7 @@ def run_custom_wizard(available_hw: list[str], console: Console) -> tuple[str, i
     while True:
         try:
             crf = int(
-                typer.prompt("CRF quality value [0-51, lower = better quality]", default="20")
+                _wizard_prompt("CRF quality value [0-51, lower = better quality]", default="20")
             )
         except ValueError:
             crf = -1
@@ -1896,7 +1933,7 @@ def run_custom_wizard(available_hw: list[str], console: Console) -> tuple[str, i
 
     while True:
         try:
-            preset_idx = int(typer.prompt("Choose preset [1-5]", default="3")) - 1
+            preset_idx = int(_wizard_prompt("Choose preset [1-5]", default="3")) - 1
         except ValueError:
             preset_idx = -1
         if 0 <= preset_idx < len(sw_presets):
@@ -1911,11 +1948,11 @@ def maybe_save_profile(
     display_label: str,
     console: Console,
 ) -> None:
-    if not typer.confirm("Save these settings as a named profile?", default=False):
+    if not _wizard_confirm("Save these settings as a named profile?", default=False):
         return
 
     while True:
-        name = typer.prompt("Profile name").strip()
+        name = _wizard_prompt("Profile name", show_default=False).strip()
         if name:
             break
         console.print("[yellow]Profile name cannot be empty.[/yellow]")
@@ -1984,7 +2021,7 @@ def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Co
     while True:
         try:
             choice = int(
-                typer.prompt(
+                _wizard_prompt(
                     f"Choose action [1-{max_choice}]",
                     default="1",
                 )
@@ -2006,7 +2043,7 @@ def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Co
 
 def review_maybe_items(maybe_items: list[AnalysisItem], console: Console) -> bool:
     display_candidate_table("Maybe files", maybe_items, console)
-    return typer.confirm("Include maybe files in this run?", default=False)
+    return _wizard_confirm("Include maybe files in this run?", default=False)
 
 
 def _subtitle_drop_warning(jobs: list[EncodeJob], ffprobe: Path) -> str | None:
@@ -2242,9 +2279,7 @@ def _maybe_run_preview(
     console: Console,
     plain_output: bool = False,
 ) -> bool:
-    if auto or not typer.confirm(
-        "Test a 2-minute preview clip before the full batch?", default=False
-    ):
+    if auto or not _wizard_confirm("Test a 2-minute preview clip before the full batch?", default=False):
         return True
 
     if not preview_items:
@@ -2293,7 +2328,7 @@ def _maybe_run_preview(
         "[dim]This is likely an encoder configuration issue, not a problem with your files. "
         "If it persists, try a software profile (e.g. 'Fast').[/dim]"
     )
-    return typer.confirm("Continue to full batch anyway?", default=False)
+    return _wizard_confirm("Continue to full batch anyway?", default=False)
 
 
 def run_wizard(
@@ -2587,7 +2622,7 @@ def run_wizard(
                 )
                 default_manifest_path = directory / "mediashrink-analysis.json"
                 manifest_path = Path(
-                    typer.prompt("Manifest path", default=str(default_manifest_path))
+                    _wizard_prompt("Manifest path", default=str(default_manifest_path))
                 )
                 save_manifest(manifest, manifest_path)
                 console.print(f"[green]Wrote manifest[/green] {manifest_path}")
@@ -2725,7 +2760,7 @@ def run_wizard(
                 and all(reason in mkv_safe_reasons for reason in grouped_failures)
             ):
                 mkv_followup_dir = _default_mkv_followup_dir(directory, output_dir)
-                should_switch_to_mkv = auto or typer.confirm(
+                should_switch_to_mkv = auto or _wizard_confirm(
                     f"Write {len(incompatible_items)} incompatible file(s) to MKV in {mkv_followup_dir} and include them in this run?",
                     default=True,
                 )
@@ -2850,7 +2885,7 @@ def run_wizard(
         )
         should_try_fallback = on_file_failure != "stop" and (
             auto
-            or typer.confirm(
+            or _wizard_confirm(
                 f"Switch to {fallback_label} (libx265, CRF {fallback_crf}) and retry?",
                 default=True,
             )
@@ -2898,7 +2933,7 @@ def run_wizard(
                 if (
                     on_file_failure == "skip"
                     or auto
-                    or typer.confirm(
+                    or _wizard_confirm(
                         f"Skip {len(fallback_failures)} incompatible file(s) and continue with {len(fallback_compatible)} compatible file(s) using {fallback_label}?",
                         default=True,
                     )
@@ -3032,13 +3067,13 @@ def run_wizard(
 
     cleanup_after = False
     if not overwrite and output_dir is None and not auto:
-        cleanup_after = typer.confirm(
+        cleanup_after = _wizard_confirm(
             "  Delete originals only after successful side-by-side encodes?",
             default=False,
         )
     console.print()
 
     if not auto:
-        if not typer.confirm("Start encoding?", default=True):
+        if not _wizard_confirm("Start encoding?", default=True):
             return [], "cancel", False, None
     return jobs, "encode", cleanup_after, followup_manifest_path

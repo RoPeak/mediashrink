@@ -404,7 +404,7 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
 def test_run_custom_wizard_returns_hardware_choice() -> None:
     console = Console()
 
-    with patch("mediashrink.wizard.typer.prompt", side_effect=["1", "21"]):
+    with patch("mediashrink.wizard._wizard_prompt", side_effect=["1", "21"]):
         preset, crf, sw_preset = run_custom_wizard(["qsv"], console)
 
     assert preset == "qsv"
@@ -415,7 +415,7 @@ def test_run_custom_wizard_returns_hardware_choice() -> None:
 def test_run_custom_wizard_returns_software_preset() -> None:
     console = Console()
 
-    with patch("mediashrink.wizard.typer.prompt", side_effect=["2", "22", "4"]):
+    with patch("mediashrink.wizard._wizard_prompt", side_effect=["2", "22", "4"]):
         preset, crf, sw_preset = run_custom_wizard(["qsv"], console)
 
     assert preset == "medium"
@@ -428,8 +428,8 @@ def test_maybe_save_profile_persists_choice(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
 
     with (
-        patch("mediashrink.wizard.typer.confirm", return_value=True),
-        patch("mediashrink.wizard.typer.prompt", return_value="tv-batch"),
+        patch("mediashrink.wizard._wizard_confirm", return_value=True),
+        patch("mediashrink.wizard._wizard_prompt", return_value="tv-batch"),
     ):
         maybe_save_profile("slow", 18, "Best Quality", console)
 
@@ -446,7 +446,7 @@ def test_review_maybe_items_defaults_to_not_include(tmp_path: Path) -> None:
     console = Console()
     item = _analysis_item(tmp_path / "maybe.mkv", "maybe")
 
-    with patch("mediashrink.wizard.typer.confirm", return_value=False):
+    with patch("mediashrink.wizard._wizard_confirm", return_value=False):
         included = review_maybe_items([item], console)
 
     assert included is False
@@ -482,7 +482,7 @@ def test_run_wizard_analyzes_and_builds_jobs_for_recommended_only(tmp_path: Path
             "mediashrink.wizard.preflight_encode_job",
             return_value=_fake_encode_result(source, success=True),
         ),
-        patch("mediashrink.wizard.typer.confirm", side_effect=[True, True]),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[True, True]),
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, True, None, False, False, console
@@ -519,7 +519,7 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
         patch("mediashrink.wizard._maybe_run_preview", return_value=True),
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.prompt_analysis_action", return_value="export"),
-        patch("mediashrink.wizard.typer.prompt", return_value=str(manifest_path)),
+        patch("mediashrink.wizard._wizard_prompt", return_value=str(manifest_path)),
         patch("mediashrink.wizard.save_manifest") as mock_save_manifest,
         patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
     ):
@@ -592,7 +592,7 @@ def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> No
             "mediashrink.wizard.preflight_encode_job",
             return_value=_fake_encode_result(recommended_path, success=True),
         ),
-        patch("mediashrink.wizard.typer.confirm", side_effect=[True, True]),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[True, True]),
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
@@ -643,7 +643,7 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
             "mediashrink.wizard.preflight_encode_job",
             return_value=_fake_encode_result(larger, success=True),
         ),
-        patch("mediashrink.wizard.typer.confirm", side_effect=[False, False]) as mock_confirm,
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[False, False]) as mock_confirm,
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
@@ -866,8 +866,8 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
             "mediashrink.wizard.preflight_encode_job",
             return_value=_fake_encode_result(source, success=True),
         ),
-        patch("mediashrink.wizard.typer.confirm") as mock_confirm,
-        patch("mediashrink.wizard.typer.prompt") as mock_prompt,
+        patch("mediashrink.wizard._wizard_confirm") as mock_confirm,
+        patch("mediashrink.wizard._wizard_prompt") as mock_prompt,
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console, auto=True
@@ -1001,7 +1001,7 @@ def test_run_wizard_switches_to_fallback_when_preflight_encode_fails(tmp_path: P
                 _fake_encode_result(source, success=True),
             ],
         ),
-        patch("mediashrink.wizard.typer.confirm", side_effect=[True, True, True]),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[True, True, True]),
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
@@ -1053,7 +1053,7 @@ def test_run_wizard_returns_to_profile_selection_when_fallback_declined(tmp_path
                 _fake_encode_result(source, success=True),
             ],
         ),
-        patch("mediashrink.wizard.typer.confirm", side_effect=[False, True, True]),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[False, True, True]),
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
@@ -1130,7 +1130,7 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
                 ([mp4_mkv_job], []),
             ],
         ),
-        patch("mediashrink.wizard.typer.confirm", side_effect=[True, True, True]),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[True, True, True]),
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
@@ -1159,7 +1159,7 @@ def test_next_step_menu_no_maybe_items() -> None:
             output_lines.append(str(msg))
 
     # Always choose option 1 to avoid looping
-    with patch("mediashrink.wizard.typer.prompt", return_value="1"):
+    with patch("mediashrink.wizard._wizard_prompt", return_value="1"):
         from mediashrink.wizard import prompt_analysis_action
 
         action = prompt_analysis_action(3, 0, CapturingConsole())  # type: ignore[arg-type]
@@ -1181,7 +1181,7 @@ def test_next_step_menu_includes_counts_when_maybe_present() -> None:
         def print(self, msg: str = "", **kwargs: object) -> None:
             output_lines.append(str(msg))
 
-    with patch("mediashrink.wizard.typer.prompt", return_value="1"):
+    with patch("mediashrink.wizard._wizard_prompt", return_value="1"):
         from mediashrink.wizard import prompt_analysis_action
 
         action = prompt_analysis_action(22, 5, CapturingConsole())  # type: ignore[arg-type]
