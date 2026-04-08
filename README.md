@@ -12,6 +12,10 @@ For Blu-ray-era H.264 or VC-1 sources, CRF 20 often lands around a 50-70% reduct
 - FFmpeg with `libx265` support
 - `ffmpeg` and `ffprobe` available on `PATH`
 
+## Platform Support
+
+`mediashrink` is intended to work on both Windows and Linux. Changes to CLI prompts, path handling, process execution, and terminal behavior should preserve cross-platform operation unless a platform-specific limitation is explicitly documented.
+
 ## Installation
 
 ```bash

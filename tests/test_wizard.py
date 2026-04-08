@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,7 @@ from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.wizard import (
     _sum_media_durations,
     _summarize_mkv_suitable_candidates,
+    _wizard_readline,
     EncoderProfile,
     ProfilePlanningResult,
     benchmark_encoder,
@@ -24,6 +26,11 @@ from mediashrink.wizard import (
 
 FFMPEG = Path("/usr/bin/ffmpeg")
 FFPROBE = Path("/usr/bin/ffprobe")
+
+
+class _NonClosingStringIO(io.StringIO):
+    def close(self) -> None:
+        pass
 
 
 def test_detect_available_encoders_returns_available_only() -> None:
@@ -93,6 +100,43 @@ def test_sum_media_durations_uses_average_fallback(tmp_path: Path) -> None:
         total = _sum_media_durations(files, FFPROBE)
 
     assert total == pytest.approx(450.0)
+
+
+def test_wizard_readline_prefers_linux_controlling_terminal() -> None:
+    tty_in = _NonClosingStringIO("2\n")
+    tty_out = _NonClosingStringIO()
+
+    def fake_open(path: str, mode: str, **_: object) -> io.StringIO:
+        if (path, mode) == ("/dev/tty", "r"):
+            return tty_in
+        if (path, mode) == ("/dev/tty", "w"):
+            return tty_out
+        raise AssertionError(f"Unexpected open call: {(path, mode)}")
+
+    with (
+        patch("mediashrink.wizard.detect_os", return_value="Linux"),
+        patch("builtins.open", side_effect=fake_open),
+    ):
+        result = _wizard_readline("Select a profile: ")
+
+    assert result == "2"
+    assert tty_out.getvalue() == "Select a profile: "
+
+
+def test_wizard_readline_falls_back_to_stdio_when_terminal_device_unavailable() -> None:
+    stdin = _NonClosingStringIO("1\n")
+    stdout = _NonClosingStringIO()
+
+    with (
+        patch("mediashrink.wizard.detect_os", return_value="Linux"),
+        patch("builtins.open", side_effect=OSError("tty unavailable")),
+        patch("sys.stdin", stdin),
+        patch("sys.stdout", stdout),
+    ):
+        result = _wizard_readline("Select a profile: ")
+
+    assert result == "1"
+    assert stdout.getvalue() == "Select a profile: "
 
 
 def test_summarize_mkv_suitable_candidates_groups_container_constraints(tmp_path: Path) -> None:

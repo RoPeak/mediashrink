@@ -49,7 +49,7 @@ from mediashrink.encoder import (
     validate_encoder,
 )
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
-from mediashrink.platform_utils import detect_device_labels
+from mediashrink.platform_utils import detect_device_labels, detect_os
 from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_profile
 from mediashrink.scanner import (
     build_jobs,
@@ -94,15 +94,58 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _wizard_readline(prompt_text: str) -> str:
-    sys.stdout.write(prompt_text)
-    sys.stdout.flush()
+    input_stream = sys.stdin
+    output_stream = sys.stdout
+    opened_streams: list[object] = []
+
+    os_name = detect_os()
+    terminal_input: str | None = None
+    terminal_output: str | None = None
+    if os_name == "Windows":
+        terminal_input = "CONIN$"
+        terminal_output = "CONOUT$"
+    elif os_name in {"Linux", "Darwin"}:
+        terminal_input = "/dev/tty"
+        terminal_output = "/dev/tty"
+
+    if terminal_input is not None and terminal_output is not None:
+        try:
+            input_stream = open(
+                terminal_input,
+                "r",
+                encoding=getattr(sys.stdin, "encoding", None) or "utf-8",
+                errors="replace",
+            )
+            opened_streams.append(input_stream)
+        except OSError:
+            input_stream = sys.stdin
+        try:
+            output_stream = open(
+                terminal_output,
+                "w",
+                encoding=getattr(sys.stdout, "encoding", None) or "utf-8",
+                errors="replace",
+            )
+            opened_streams.append(output_stream)
+        except OSError:
+            output_stream = sys.stdout
+
     try:
-        value = sys.stdin.readline()
-    except KeyboardInterrupt as exc:
-        raise typer.Abort() from exc
-    if value == "":
-        raise typer.Abort()
-    return value.rstrip("\r\n")
+        output_stream.write(prompt_text)
+        output_stream.flush()
+        try:
+            value = input_stream.readline()
+        except KeyboardInterrupt as exc:
+            raise typer.Abort() from exc
+        if value == "":
+            raise typer.Abort()
+        return value.rstrip("\r\n")
+    finally:
+        for stream in opened_streams:
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def _wizard_prompt(text: str, default: str | None = None, *, show_default: bool = True) -> str:
