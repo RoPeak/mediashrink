@@ -744,8 +744,8 @@ def encode_file(
             ],
         )
 
-    # Success: rename tmp → final output
-    job.tmp_output.rename(job.output)
+    # Success: atomically replace any stale side-by-side output with the new tmp file.
+    job.tmp_output.replace(job.output)
 
     # If overwrite mode: source == output, already replaced above
     output_size = job.output.stat().st_size

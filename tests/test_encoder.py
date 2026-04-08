@@ -325,14 +325,14 @@ def test_encode_file_success(tmp_path: Path) -> None:
     mock_process.stdout = iter(["out_time_ms=1000000\n", "progress=end\n"])
     mock_process.stderr = iter([])
 
-    def fake_rename(self: Path, dest: Path) -> Path:
+    def fake_replace(self: Path, dest: Path) -> Path:
         dest.write_bytes(b"compressed output")
         return dest
 
     with (
         patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
-        patch("pathlib.Path.rename", fake_rename),
+        patch("pathlib.Path.replace", fake_replace),
     ):
         result = encode_file(job, FFMPEG, FFPROBE)
 
@@ -356,20 +356,44 @@ def test_encode_file_reports_progress(tmp_path: Path) -> None:
     )
     mock_process.stderr = iter([])
 
-    def fake_rename(self: Path, dest: Path) -> Path:
+    def fake_replace(self: Path, dest: Path) -> Path:
         dest.write_bytes(b"x")
         return dest
 
     with (
         patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
         patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
-        patch("pathlib.Path.rename", fake_rename),
+        patch("pathlib.Path.replace", fake_replace),
     ):
         encode_file(job, FFMPEG, FFPROBE, progress_callback=reported.append)
 
     assert len(reported) == 2
     assert abs(reported[0] - 50.0) < 0.1
     assert abs(reported[1] - 100.0) < 0.1
+
+
+def test_encode_file_success_replaces_existing_output(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    job.output.write_bytes(b"stale output")
+
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.stdout = iter(["progress=end\n"])
+    mock_process.stderr = iter([])
+
+    def fake_popen(cmd, **kwargs):
+        job.tmp_output.write_bytes(b"fresh output")
+        return mock_process
+
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+    ):
+        result = encode_file(job, FFMPEG, FFPROBE)
+
+    assert result.success is True
+    assert job.output.read_bytes() == b"fresh output"
+    assert not job.tmp_output.exists()
 
 
 # ---------------------------------------------------------------------------
