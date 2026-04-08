@@ -614,6 +614,43 @@ def test_estimate_output_size_higher_crf_smaller(tmp_path: Path) -> None:
     assert result_crf28 < result_crf20
 
 
+def test_estimate_output_size_hardware_medium_confidence_prefers_heuristic_more(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "ep.mkv"
+    source.write_bytes(b"x" * 100)
+    source_size = 5 * 1024**3
+    calibration_store = {
+        "version": 1,
+        "records": [],
+        "failures": [],
+    }
+    lookup = MagicMock()
+    lookup.output_ratio = 0.20
+    lookup.average_size_error = 0.15
+    lookup.confidence = "Medium"
+
+    with (
+        patch(
+            "mediashrink.encoder.subprocess.run",
+            side_effect=_mock_ffprobe_responses(2700, 15000, 1920, 1080),
+        ),
+        patch("pathlib.Path.stat") as mock_stat,
+        patch("mediashrink.encoder.lookup_estimate", return_value=lookup),
+    ):
+        mock_stat.return_value.st_size = source_size
+        result = estimate_output_size(
+            source,
+            FFPROBE,
+            codec="h264",
+            crf=22,
+            preset="amf",
+            calibration_store=calibration_store,
+        )
+
+    assert result > int(source_size * 0.35)
+
+
 def test_get_video_resolution(tmp_path: Path) -> None:
     source = tmp_path / "ep.mkv"
     source.write_bytes(b"x")

@@ -339,6 +339,49 @@ def test_build_profiles_downranks_highly_variable_hardware_size_estimates(tmp_pa
     assert recommended.encoder_key != "amf"
 
 
+def test_build_profiles_partial_hardware_profile_mentions_high_variability(tmp_path: Path) -> None:
+    safe_candidate = _analysis_item(tmp_path / "candidate.mkv", "recommended")
+    risky_candidate = _analysis_item(tmp_path / "candidate.mp4", "recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "high",
+                "preset": "amf",
+                "preset_family": "hardware",
+                "crf": 22,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "duration_seconds": 100.0,
+                "wall_seconds": 5.0,
+                "effective_speed": 20.0,
+                "fallback_used": False,
+                "retry_used": False,
+                "predicted_output_ratio": 0.3,
+            }
+        ],
+        "failures": [],
+    }
+
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 12.0, "fast": 1.0, "faster": 1.2},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+        candidate_items=[safe_candidate, risky_candidate],
+        ffprobe=FFPROBE,
+        policy="fastest-wall-clock",
+        calibration_store=calibration_store,
+        observed_probe_failures={("amf", 22): {risky_candidate.source: "Could not write header"}},
+    )
+
+    amf_profile = next(profile for profile in profiles if profile.name == "GPU Offload")
+    assert "highly variable" in amf_profile.why_choose
+
+
 def test_build_profiles_adjusts_time_estimate_from_speed_error_history(tmp_path: Path) -> None:
     calibration_store = {
         "version": 1,

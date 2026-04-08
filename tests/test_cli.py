@@ -2035,6 +2035,7 @@ def test_wizard_followup_skips_software_retry_prompt_for_container_only_failures
     mock_confirm.assert_not_called()
     assert "attachment" in result.stdout.lower()
     assert "hardware encoder startup failure" in result.stdout.lower()
+    assert "output container cannot safely carry one or more copied streams" not in result.stdout
 
 
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:

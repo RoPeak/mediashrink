@@ -198,7 +198,21 @@ def estimate_output_size(
                 if lookup.confidence == "High":
                     return calibrated_estimate
                 if lookup.confidence == "Medium":
-                    return int((calibrated_estimate * 0.65) + (heuristic_estimate * 0.35))
+                    calibrated_weight = 0.65
+                    heuristic_weight = 0.35
+                    if preset in _HW_ENCODERS:
+                        calibrated_weight = 0.50
+                        heuristic_weight = 0.50
+                        if (
+                            lookup.average_size_error is not None
+                            and abs(lookup.average_size_error) >= 0.12
+                        ):
+                            calibrated_weight = 0.35
+                            heuristic_weight = 0.65
+                    return int(
+                        (calibrated_estimate * calibrated_weight)
+                        + (heuristic_estimate * heuristic_weight)
+                    )
                 return int((calibrated_estimate * 0.40) + (heuristic_estimate * 0.60))
 
         return heuristic_estimate

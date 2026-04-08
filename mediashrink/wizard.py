@@ -736,7 +736,7 @@ def prepare_profile_planning(
         )
 
     if console is not None and candidates_to_bench:
-        progress = Progress(
+        with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(bar_width=None),
@@ -744,8 +744,7 @@ def prepare_profile_planning(
             console=console,
             transient=False,
             expand=True,
-        )
-        with progress:
+        ) as progress:
             task = progress.add_task("Benchmarking profiles...", total=len(candidates_to_bench))
             completed = 0
             with ThreadPoolExecutor(max_workers=min(4, len(candidates_to_bench))) as executor:
@@ -762,82 +761,66 @@ def prepare_profile_planning(
                         len(candidates_to_bench),
                         stage_messages=stage_messages,
                     )
-                    progress.update(
-                        task,
-                        description="Benchmarking profiles...",
-                        completed=completed,
-                        total=len(candidates_to_bench),
-                    )
-            benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
+                    progress.update(task, completed=completed, total=len(candidates_to_bench))
+        benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
+        _emit_stage_status(
+            "Building provisional profiles...",
+            console=console,
+            stage_messages=stage_messages,
+        )
+
+        provisional_profiles = build_profiles(
+            available_hw=available_hw,
+            benchmark_speeds=benchmark_speeds,
+            total_media_seconds=candidate_media_seconds,
+            total_input_bytes=candidate_input_bytes,
+            candidate_items=candidate_items,
+            ffprobe=ffprobe,
+            policy=policy,
+            use_calibration=use_calibration,
+            calibration_store=active_calibration,
+            container_incompatibility_cache=container_incompatibility_cache,
+        )
+        probe_targets = _iter_probe_targets(provisional_profiles)
+        if probe_targets:
             _emit_stage_status(
-                "Building provisional profiles...",
+                "Preparing smoke probes...",
+                console=console,
                 stage_messages=stage_messages,
             )
-            progress.update(
-                task,
-                description="Building provisional profiles...",
-                completed=0,
-                total=None,
-            )
-
-            provisional_profiles = build_profiles(
-                available_hw=available_hw,
-                benchmark_speeds=benchmark_speeds,
-                total_media_seconds=candidate_media_seconds,
-                total_input_bytes=candidate_input_bytes,
-                candidate_items=candidate_items,
-                ffprobe=ffprobe,
-                policy=policy,
-                use_calibration=use_calibration,
-                calibration_store=active_calibration,
-                container_incompatibility_cache=container_incompatibility_cache,
-            )
-            probe_targets = _iter_probe_targets(provisional_profiles)
-            if probe_targets:
-                _emit_stage_status(
-                    "Preparing smoke probes...",
-                    stage_messages=stage_messages,
-                )
-                progress.update(
-                    task,
-                    description="Preparing smoke probes...",
-                    completed=0,
-                    total=None,
-                )
-            progress.update(
-                task,
-                description="Smoke-probing risky container/profile combinations...",
-                completed=0,
-                total=max(len(probe_targets), 1),
-            )
-
-            def _update_probe_progress(stage: str, current: int, total: int) -> None:
-                _emit_stage_progress(stage, current, total, stage_messages=stage_messages)
-                progress.update(
-                    task,
-                    description="Smoke-probing risky container/profile combinations...",
-                    completed=current,
-                    total=max(total, 1),
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=None),
+                TaskProgressColumn(),
+                console=console,
+                transient=False,
+                expand=True,
+            ) as progress:
+                task = progress.add_task(
+                    "Smoke-probing risky container/profile combinations...",
+                    total=max(len(probe_targets), 1),
                 )
 
-            observed_probe_failures = _targeted_profile_probe_failures(
-                items=candidate_items,
-                profiles=provisional_profiles,
-                ffmpeg=ffmpeg,
-                ffprobe=ffprobe,
-                progress_callback=_update_probe_progress,
-                container_incompatibility_cache=container_incompatibility_cache,
-            )
-            _emit_stage_status(
-                "Scoring recommendations...",
-                stage_messages=stage_messages,
-            )
-            progress.update(
-                task,
-                description="Scoring recommendations...",
-                completed=0,
-                total=None,
-            )
+                def _update_probe_progress(stage: str, current: int, total: int) -> None:
+                    _emit_stage_progress(stage, current, total, stage_messages=stage_messages)
+                    progress.update(task, completed=current, total=max(total, 1))
+
+                observed_probe_failures = _targeted_profile_probe_failures(
+                    items=candidate_items,
+                    profiles=provisional_profiles,
+                    ffmpeg=ffmpeg,
+                    ffprobe=ffprobe,
+                    progress_callback=_update_probe_progress,
+                    container_incompatibility_cache=container_incompatibility_cache,
+                )
+        else:
+            observed_probe_failures = {}
+        _emit_stage_status(
+            "Scoring recommendations...",
+            console=console,
+            stage_messages=stage_messages,
+        )
     else:
         if candidates_to_bench:
             _emit_stage_progress(
@@ -864,6 +847,7 @@ def prepare_profile_planning(
             benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
             _emit_stage_status(
                 "Building provisional profiles...",
+                console=console,
                 stage_messages=stage_messages,
             )
 
@@ -882,6 +866,7 @@ def prepare_profile_planning(
         if _iter_probe_targets(provisional_profiles):
             _emit_stage_status(
                 "Preparing smoke probes...",
+                console=console,
                 stage_messages=stage_messages,
             )
         observed_probe_failures = _targeted_profile_probe_failures(
@@ -899,6 +884,7 @@ def prepare_profile_planning(
         )
         _emit_stage_status(
             "Scoring recommendations...",
+            console=console,
             stage_messages=stage_messages,
         )
     profiles = build_profiles(
@@ -916,6 +902,7 @@ def prepare_profile_planning(
     )
     _emit_stage_status(
         "Preparing profile table...",
+        console=console,
         stage_messages=stage_messages,
     )
 
@@ -1250,7 +1237,7 @@ def _profile_why_choose(
             if highly_variable:
                 return (
                     f"Fastest partial-batch option: {profile.compatible_count} file(s) can run now, "
-                    f"{profile.incompatible_count} likely need follow-up, and output size is highly variable."
+                    f"{profile.incompatible_count} likely need follow-up, and output size is highly variable on similar files."
                 )
             return (
                 f"Fastest partial-batch option: {profile.compatible_count} file(s) can run now, "

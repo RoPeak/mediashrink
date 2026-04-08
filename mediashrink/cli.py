@@ -2876,11 +2876,12 @@ def wizard(
                     console.print("  [dim]Original follow-up split reasons:[/dim]")
                     for note in manifest_group_notes[:5]:
                         console.print(f"  [dim]{note}[/dim]")
-                _print_grouped_preflight_details(
-                    followup_details,
-                    style="yellow",
-                    prefix="  ",
-                )
+                else:
+                    _print_grouped_preflight_details(
+                        followup_details,
+                        style="yellow",
+                        prefix="  ",
+                    )
                 _print_incompatibility_stream_details(
                     [job for job in followup_jobs if not job.skip],
                     ffprobe=ffprobe,
@@ -2903,11 +2904,12 @@ def wizard(
                             console.print("  [dim]Original follow-up split reasons:[/dim]")
                             for note in manifest_group_notes[:5]:
                                 console.print(f"  [dim]{note}[/dim]")
-                        _print_grouped_preflight_details(
-                            followup_details,
-                            style="yellow",
-                            prefix="  ",
-                        )
+                        else:
+                            _print_grouped_preflight_details(
+                                followup_details,
+                                style="yellow",
+                                prefix="  ",
+                            )
                         _print_incompatibility_stream_details(
                             [job for job in followup_jobs if not job.skip],
                             ffprobe=ffprobe,
