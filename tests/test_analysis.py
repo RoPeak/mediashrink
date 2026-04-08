@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rich.console import Console
@@ -276,6 +277,38 @@ def test_estimate_analysis_encode_seconds_hardware_blend_stays_close_to_slower_s
 
     assert estimate is not None
     assert estimate > 60.0
+    assert estimate < 120.0
+
+
+def test_estimate_analysis_encode_seconds_software_blend_leans_toward_slower_history(
+    tmp_path: Path,
+) -> None:
+    recommended = build_analysis_item_dict_item(
+        source=tmp_path / "recommended.mkv",
+        recommendation="recommended",
+        duration_seconds=120.0,
+    )
+    recommended.width = 1920
+    recommended.height = 1080
+    recommended.bitrate_kbps = 0.0
+    with patch(
+        "mediashrink.analysis.lookup_estimate",
+        return_value=SimpleNamespace(
+            speed=1.0,
+            average_speed_error=0.0,
+        ),
+    ):
+        estimate = estimate_analysis_encode_seconds(
+            [recommended],
+            "faster",
+            22,
+            FFMPEG,
+            known_speed=4.0,
+            calibration_store={"version": 1, "records": [], "failures": []},
+        )
+
+    assert estimate is not None
+    assert estimate > 48.0
     assert estimate < 120.0
 
 

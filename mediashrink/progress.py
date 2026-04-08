@@ -13,10 +13,11 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.table import Table
+from rich.table import Column, Table
 from rich.text import Text
 
 from mediashrink.models import EncodeJob, EncodeResult
+from mediashrink.platform_utils import detect_os
 
 _GB = 1024**3
 _MB = 1024**2
@@ -131,6 +132,7 @@ class EncodingDisplay:
     def __init__(self, console: Console | None = None, *, render_mode: str = "auto") -> None:
         self.console = console or Console()
         self.render_mode = render_mode
+        self._progress_layout_width: int | None = None
 
     def _use_plain_output(self) -> bool:
         return self.render_mode == "plain"
@@ -241,11 +243,25 @@ class EncodingDisplay:
         return typer.confirm(f"Encode {count} file(s)?", default=True)
 
     def make_progress_bar(self) -> Progress:
-        width = self.console.width
-        bar_width = max(20, min(40, width // 4))
+        os_name = detect_os()
+        if self._progress_layout_width is None:
+            if os_name == "Windows":
+                self._progress_layout_width = min(max(92, self.console.width), 108)
+            else:
+                self._progress_layout_width = min(max(100, self.console.width), 120)
+        layout_width = self._progress_layout_width
+        description_width = 24 if os_name == "Windows" else 28
+        bar_width = 18 if os_name == "Windows" else 22
         return Progress(
             SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}", table_column=None),
+            TextColumn(
+                "[progress.description]{task.description}",
+                table_column=Column(
+                    width=description_width,
+                    no_wrap=True,
+                    overflow="ellipsis",
+                ),
+            ),
             BarColumn(bar_width=bar_width),
             TaskProgressColumn(),
             _FileCountsColumn(),
@@ -256,7 +272,7 @@ class EncodingDisplay:
             _EtaColumn(),
             console=self.console,
             transient=False,
-            expand=True,
+            expand=False,
             disable=not self.console.is_terminal,
         )
 
@@ -283,8 +299,12 @@ class EncodingDisplay:
             )
             self.console.print()
             self.console.print(f"[bold cyan]{title}[/bold cyan]")
-            successful_results = [result for result in results if result.success and not result.skipped]
-            failed_results = [result for result in results if not result.success and not result.skipped]
+            successful_results = [
+                result for result in results if result.success and not result.skipped
+            ]
+            failed_results = [
+                result for result in results if not result.success and not result.skipped
+            ]
             skipped_results = [result for result in results if result.skipped]
             total_input = 0
             total_output = 0
@@ -295,11 +315,7 @@ class EncodingDisplay:
                 if result.skipped:
                     self.console.print(
                         f"- SKIPPED | {result.job.source.name} | {_fmt_size(result.input_size_bytes)}"
-                        + (
-                            f" | {result.skip_reason}"
-                            if result.skip_reason
-                            else ""
-                        ),
+                        + (f" | {result.skip_reason}" if result.skip_reason else ""),
                         highlight=False,
                     )
                     continue
@@ -311,11 +327,7 @@ class EncodingDisplay:
                             if not is_dry_run and result.duration_seconds > 0
                             else ""
                         )
-                        + (
-                            f" | {result.error_message}"
-                            if result.error_message
-                            else ""
-                        ),
+                        + (f" | {result.error_message}" if result.error_message else ""),
                         highlight=False,
                     )
                     continue
@@ -433,7 +445,13 @@ class EncodingDisplay:
                         detail += f" after {_fmt_duration(result.duration_seconds)}"
                     row = [result.job.source.name, detail, Text("FAILED", style="red bold")]
                 else:
-                    row = [result.job.source.name, _fmt_size(result.input_size_bytes), "-", "-", "-"]
+                    row = [
+                        result.job.source.name,
+                        _fmt_size(result.input_size_bytes),
+                        "-",
+                        "-",
+                        "-",
+                    ]
                     if not is_dry_run:
                         row += [_fmt_duration(result.duration_seconds), "-"]
                     row.append(Text("FAILED", style="red bold"))

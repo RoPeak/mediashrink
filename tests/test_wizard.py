@@ -10,6 +10,8 @@ from rich.console import Console
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.wizard import (
     _WizardFallbackRequested,
+    _followup_manifest_notes,
+    _followup_next_step_hint,
     _sum_media_durations,
     _summarize_mkv_suitable_candidates,
     _wizard_prompt,
@@ -146,7 +148,9 @@ def test_wizard_prompt_echoes_accepted_answer() -> None:
     console = Console(record=True, width=120)
     from mediashrink import wizard as wizard_module
 
-    session = wizard_module.WizardSessionState(console=console, directory=Path("/tmp"), output_dir=None)
+    session = wizard_module.WizardSessionState(
+        console=console, directory=Path("/tmp"), output_dir=None
+    )
     prior = wizard_module._ACTIVE_WIZARD_SESSION
     wizard_module._ACTIVE_WIZARD_SESSION = session
     try:
@@ -1171,7 +1175,10 @@ def test_run_wizard_auto_falls_back_after_prompt_failure(tmp_path: Path) -> None
         patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
         patch("mediashrink.wizard.detect_device_labels", return_value={}),
         patch("mediashrink.wizard.display_profiles_table"),
-        patch("mediashrink.wizard.prompt_profile_selection", side_effect=[_WizardFallbackRequested("prompt glitch")]),
+        patch(
+            "mediashrink.wizard.prompt_profile_selection",
+            side_effect=[_WizardFallbackRequested("prompt glitch")],
+        ),
         patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]),
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
@@ -1569,6 +1576,42 @@ def test_run_wizard_can_skip_incompatible_files_and_continue(tmp_path: Path) -> 
     assert "1 file(s) can run now with Balanced." in output
     assert "switched to MKV sidecar output" in output
     assert "Predicted compatibility for this selection:" in output
+
+
+def test_followup_guidance_prefers_mkv_for_software_container_failures(tmp_path: Path) -> None:
+    mp4_source = tmp_path / "movie.mp4"
+    mp4_source.write_bytes(b"x" * 1000)
+    recommended_mp4 = _analysis_item(mp4_source, "recommended")
+    job = EncodeJob(
+        source=mp4_source,
+        output=tmp_path / "movie_compressed.mp4",
+        tmp_output=tmp_path / ".tmp_movie_compressed.mp4",
+        crf=22,
+        preset="faster",
+        dry_run=False,
+        skip=False,
+    )
+
+    with (
+        patch(
+            "mediashrink.wizard.describe_container_incompatibilities",
+            return_value=["unsupported copied audio codec: dts"],
+        ),
+        patch("mediashrink.wizard.describe_output_container_constraints", return_value=[]),
+    ):
+        notes = _followup_manifest_notes(
+            {"output header failure": [job]},
+            [recommended_mp4],
+            ffprobe=FFPROBE,
+        )
+
+    hint = _followup_next_step_hint(
+        preset="faster",
+        grouped_failures={"output header failure": [job]},
+    )
+
+    assert "same folder with MKV output or review copied streams manually" in hint
+    assert any("unsupported copied audio codec: dts" in note for note in notes)
 
 
 # ---------------------------------------------------------------------------
