@@ -190,6 +190,50 @@ def test_estimate_analysis_encode_seconds_uses_recommended_only(tmp_path: Path) 
     assert estimate == 50.0
 
 
+def test_estimate_analysis_encode_seconds_blends_known_speed_with_hardware_calibration(
+    tmp_path: Path,
+) -> None:
+    recommended = build_analysis_item_dict_item(
+        source=tmp_path / "recommended.mkv",
+        recommendation="recommended",
+        duration_seconds=120.0,
+    )
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "unknown",
+                "preset": "amf",
+                "preset_family": "hardware",
+                "crf": 22,
+                "input_bytes": 1_000_000,
+                "output_bytes": 400_000,
+                "duration_seconds": 120.0,
+                "wall_seconds": 30.0,
+                "effective_speed": 4.0,
+                "fallback_used": False,
+                "retry_used": False,
+            }
+        ],
+        "failures": [],
+    }
+
+    estimate = estimate_analysis_encode_seconds(
+        [recommended],
+        "amf",
+        22,
+        FFMPEG,
+        known_speed=1.0,
+        calibration_store=calibration_store,
+    )
+
+    assert estimate is not None
+    assert estimate < 120.0
+
+
 def test_display_analysis_summary_prints_counts(tmp_path: Path) -> None:
     console = Console(record=True, width=140)
     items = [

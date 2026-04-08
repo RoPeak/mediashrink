@@ -1980,6 +1980,10 @@ def test_wizard_followup_skips_software_retry_prompt_for_container_only_failures
             time_confidence_detail=None,
             duplicate_policy=None,
             recommended_only=False,
+            notes=[
+                "Automatically generated from files left out by preflight compatibility checks.",
+                "1 file(s): hardware encoder startup failure (movie.mp4)",
+            ],
             items=[
                 AnalysisItem(
                     source=source,
@@ -2030,6 +2034,7 @@ def test_wizard_followup_skips_software_retry_prompt_for_container_only_failures
     assert mock_loop.call_count == 1
     mock_confirm.assert_not_called()
     assert "attachment" in result.stdout.lower()
+    assert "hardware encoder startup failure" in result.stdout.lower()
 
 
 def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:

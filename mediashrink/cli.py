@@ -2828,6 +2828,7 @@ def wizard(
             use_calibration=use_calibration,
         )
     )
+    followup_report_notes: list[str] = []
     # Offer to immediately preflight and, if viable, encode the follow-up manifest with a
     # software diagnostic profile.
     if (
@@ -2842,6 +2843,13 @@ def wizard(
             item.source for item in followup_manifest_data.items if item.source.exists()
         ]
         if existing_followup_files:
+            manifest_group_notes = [
+                str(note)
+                for note in (followup_manifest_data.notes or [])
+                if isinstance(note, str) and note[:1].isdigit()
+            ]
+            if manifest_group_notes:
+                followup_report_notes.extend(manifest_group_notes)
             followup_jobs = build_jobs(
                 files=existing_followup_files,
                 output_dir=output_dir,
@@ -2864,6 +2872,10 @@ def wizard(
                 console.print(
                     "[yellow]Follow-up manifest contains container/copied-stream issues that a software retry is unlikely to fix automatically.[/yellow]"
                 )
+                if manifest_group_notes:
+                    console.print("  [dim]Original follow-up split reasons:[/dim]")
+                    for note in manifest_group_notes[:5]:
+                        console.print(f"  [dim]{note}[/dim]")
                 _print_grouped_preflight_details(
                     followup_details,
                     style="yellow",
@@ -2887,6 +2899,10 @@ def wizard(
                         console.print(
                             "[yellow]Follow-up preflight found remaining incompatibilities.[/yellow]"
                         )
+                        if manifest_group_notes:
+                            console.print("  [dim]Original follow-up split reasons:[/dim]")
+                            for note in manifest_group_notes[:5]:
+                                console.print(f"  [dim]{note}[/dim]")
                         _print_grouped_preflight_details(
                             followup_details,
                             style="yellow",

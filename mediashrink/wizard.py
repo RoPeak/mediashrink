@@ -491,6 +491,18 @@ def _emit_stage_progress(
         console.print(f"[dim]{message}[/dim]")
 
 
+def _emit_stage_status(
+    message: str,
+    *,
+    console: Console | None = None,
+    stage_messages: list[str] | None = None,
+) -> None:
+    if stage_messages is not None and (not stage_messages or stage_messages[-1] != message):
+        stage_messages.append(message)
+    if console is not None:
+        console.print(f"[dim]{message}[/dim]")
+
+
 def _iter_probe_targets(profiles: list[EncoderProfile]) -> list[tuple[str, int]]:
     probe_targets: list[tuple[str, int]] = []
     seen_targets: set[tuple[str, int]] = set()
@@ -757,6 +769,16 @@ def prepare_profile_planning(
                         total=len(candidates_to_bench),
                     )
             benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
+            _emit_stage_status(
+                "Building provisional profiles...",
+                stage_messages=stage_messages,
+            )
+            progress.update(
+                task,
+                description="Building provisional profiles...",
+                completed=0,
+                total=None,
+            )
 
             provisional_profiles = build_profiles(
                 available_hw=available_hw,
@@ -771,6 +793,17 @@ def prepare_profile_planning(
                 container_incompatibility_cache=container_incompatibility_cache,
             )
             probe_targets = _iter_probe_targets(provisional_profiles)
+            if probe_targets:
+                _emit_stage_status(
+                    "Preparing smoke probes...",
+                    stage_messages=stage_messages,
+                )
+                progress.update(
+                    task,
+                    description="Preparing smoke probes...",
+                    completed=0,
+                    total=None,
+                )
             progress.update(
                 task,
                 description="Smoke-probing risky container/profile combinations...",
@@ -794,6 +827,16 @@ def prepare_profile_planning(
                 ffprobe=ffprobe,
                 progress_callback=_update_probe_progress,
                 container_incompatibility_cache=container_incompatibility_cache,
+            )
+            _emit_stage_status(
+                "Scoring recommendations...",
+                stage_messages=stage_messages,
+            )
+            progress.update(
+                task,
+                description="Scoring recommendations...",
+                completed=0,
+                total=None,
             )
     else:
         if candidates_to_bench:
@@ -819,6 +862,10 @@ def prepare_profile_planning(
                         stage_messages=stage_messages,
                     )
             benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
+            _emit_stage_status(
+                "Building provisional profiles...",
+                stage_messages=stage_messages,
+            )
 
         provisional_profiles = build_profiles(
             available_hw=available_hw,
@@ -832,6 +879,11 @@ def prepare_profile_planning(
             calibration_store=active_calibration,
             container_incompatibility_cache=container_incompatibility_cache,
         )
+        if _iter_probe_targets(provisional_profiles):
+            _emit_stage_status(
+                "Preparing smoke probes...",
+                stage_messages=stage_messages,
+            )
         observed_probe_failures = _targeted_profile_probe_failures(
             items=candidate_items,
             profiles=provisional_profiles,
@@ -845,6 +897,10 @@ def prepare_profile_planning(
             ),
             container_incompatibility_cache=container_incompatibility_cache,
         )
+        _emit_stage_status(
+            "Scoring recommendations...",
+            stage_messages=stage_messages,
+        )
     profiles = build_profiles(
         available_hw=available_hw,
         benchmark_speeds=benchmark_speeds,
@@ -857,6 +913,10 @@ def prepare_profile_planning(
         calibration_store=active_calibration,
         observed_probe_failures=observed_probe_failures,
         container_incompatibility_cache=container_incompatibility_cache,
+    )
+    _emit_stage_status(
+        "Preparing profile table...",
+        stage_messages=stage_messages,
     )
 
     seen_presets: set[str] = set()
@@ -1178,14 +1238,25 @@ def _profile_why_choose(
     *,
     fastest: EncoderProfile | None = None,
 ) -> str:
+    highly_variable = (
+        profile.encoder_key in _HW_ENCODERS
+        and profile.size_uncertainty is not None
+        and abs(profile.size_uncertainty) >= 0.25
+    )
     if profile.is_custom:
         return "Manual override for exact settings."
     if recommended is profile:
-        if (
-            profile.encoder_key in _HW_ENCODERS
-            and profile.size_uncertainty is not None
-            and abs(profile.size_uncertainty) >= 0.25
-        ):
+        if profile.incompatible_count:
+            if highly_variable:
+                return (
+                    f"Fastest partial-batch option: {profile.compatible_count} file(s) can run now, "
+                    f"{profile.incompatible_count} likely need follow-up, and output size is highly variable."
+                )
+            return (
+                f"Fastest partial-batch option: {profile.compatible_count} file(s) can run now, "
+                f"while {profile.incompatible_count} likely need follow-up."
+            )
+        if highly_variable:
             return (
                 f"Fastest wall-clock option for {profile.compatible_count} file(s), "
                 "but output size is highly variable on similar files."
@@ -1208,11 +1279,7 @@ def _profile_why_choose(
             + "."
         )
     if profile.incompatible_count:
-        if (
-            profile.encoder_key in _HW_ENCODERS
-            and profile.size_uncertainty is not None
-            and abs(profile.size_uncertainty) >= 0.25
-        ):
+        if highly_variable:
             return (
                 f"Fastest wall-clock option, but output size is highly variable; "
                 f"{profile.incompatible_count} file(s) may still need follow-up."
@@ -1882,6 +1949,7 @@ def display_profiles_table(
         if (
             recommended.why_choose.startswith("Fastest wait:")
             or "highly variable" in recommended.why_choose
+            or "partial-batch option" in recommended.why_choose
         ):
             console.print(f"  [dim]Default pick: {recommended.why_choose}[/dim]")
         else:
@@ -2207,6 +2275,8 @@ def _write_followup_manifest(
     preset: str,
     crf: int,
     incompatible_items: list[AnalysisItem],
+    *,
+    notes: list[str] | None = None,
 ) -> Path | None:
     if not incompatible_items:
         return None
@@ -2226,10 +2296,39 @@ def _write_followup_manifest(
         time_confidence_detail=None,
         duplicate_policy=None,
         recommended_only=False,
+        notes=notes,
         items=incompatible_items,
     )
     save_manifest(manifest, manifest_path)
     return manifest_path
+
+
+def _followup_manifest_notes(
+    grouped_failures: dict[str, list[EncodeJob]],
+    incompatible_items: list[AnalysisItem],
+) -> list[str]:
+    if not grouped_failures or not incompatible_items:
+        return []
+    remaining_sources = {item.source for item in incompatible_items}
+    notes = ["Automatically generated from files left out by preflight compatibility checks."]
+    ranked = sorted(
+        grouped_failures.items(),
+        key=lambda item: (
+            -len([job for job in item[1] if job.source in remaining_sources]),
+            item[0],
+        ),
+    )
+    for reason, jobs in ranked:
+        matching_jobs = [job for job in jobs if job.source in remaining_sources]
+        if not matching_jobs:
+            continue
+        examples = ", ".join(job.source.name for job in matching_jobs[:3])
+        note = f"{len(matching_jobs)} file(s): {reason}"
+        if examples:
+            note += f" ({examples})"
+        notes.append(note)
+    notes.append("Suggested retry: prefer MKV outputs or rerun with --policy highest-confidence.")
+    return notes
 
 
 def _select_profile_interactively(
@@ -2322,7 +2421,9 @@ def _maybe_run_preview(
     console: Console,
     plain_output: bool = False,
 ) -> bool:
-    if auto or not _wizard_confirm("Test a 2-minute preview clip before the full batch?", default=False):
+    if auto or not _wizard_confirm(
+        "Test a 2-minute preview clip before the full batch?", default=False
+    ):
         return True
 
     if not preview_items:
@@ -2841,6 +2942,7 @@ def run_wizard(
                 preset,
                 crf,
                 remaining_incompatible_items,
+                notes=_followup_manifest_notes(grouped_failures, remaining_incompatible_items),
             )
             followup_manifest_path = followup_manifest
             followup_count = len(remaining_incompatible_items)

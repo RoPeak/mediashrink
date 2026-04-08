@@ -19,6 +19,7 @@ from mediashrink.wizard import (
     detect_available_encoders,
     display_profiles_table,
     maybe_save_profile,
+    prepare_profile_planning,
     review_maybe_items,
     run_wizard,
     run_custom_wizard,
@@ -1009,6 +1010,37 @@ def test_run_wizard_prints_benchmark_and_probe_stage_summaries(tmp_path: Path) -
     output = console.export_text()
     assert "Benchmarked 3 profile candidate(s)." in output
     assert "Smoke-probed 1 risky profile combination(s)." in output
+
+
+def test_prepare_profile_planning_tracks_post_100_stage_messages(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    provisional = [
+        EncoderProfile(1, "GPU offload", "GPU Offload", "amf", 22, None, 0, 10.0, "Good", False)
+    ]
+    final = [
+        EncoderProfile(1, "GPU offload", "GPU Offload", "amf", 22, None, 0, 10.0, "Good", True)
+    ]
+
+    with (
+        patch("mediashrink.wizard.benchmark_encoder", side_effect=[1.0, 0.8, 1.2]),
+        patch("mediashrink.wizard.build_profiles", side_effect=[provisional, final]),
+        patch("mediashrink.wizard._targeted_profile_probe_failures", return_value={}),
+    ):
+        planning = prepare_profile_planning(
+            analysis_items=[recommended],
+            ffmpeg=FFMPEG,
+            ffprobe=FFPROBE,
+            console=None,
+            available_hw=["amf"],
+        )
+
+    assert planning is not None
+    assert "Building provisional profiles..." in planning.stage_messages
+    assert "Preparing smoke probes..." in planning.stage_messages
+    assert "Scoring recommendations..." in planning.stage_messages
+    assert "Preparing profile table..." in planning.stage_messages
 
 
 def test_run_wizard_switches_to_fallback_when_preflight_encode_fails(tmp_path: Path) -> None:

@@ -261,52 +261,68 @@ def estimate_analysis_encode_seconds(
     if not recommended:
         return 0.0
 
-    speed: float | None
-    if known_speed is not None and known_speed > 0:
-        speed = known_speed
-    else:
-        if use_calibration and recommended:
-            active_store = (
-                calibration_store if calibration_store is not None else load_calibration_store()
+    speed: float | None = known_speed if known_speed is not None and known_speed > 0 else None
+    if use_calibration and recommended:
+        active_store = (
+            calibration_store if calibration_store is not None else load_calibration_store()
+        )
+        weighted_speeds: list[tuple[float, float]] = []
+        adjustment_factors: list[tuple[float, float]] = []
+        for item in recommended:
+            resolution = (
+                resolution_bucket(item.width, item.height)
+                if getattr(item, "width", 0) and getattr(item, "height", 0)
+                else "unknown"
             )
-            weighted_speeds: list[tuple[float, float]] = []
-            for item in recommended:
-                resolution = (
-                    resolution_bucket(item.width, item.height)
-                    if getattr(item, "width", 0) and getattr(item, "height", 0)
-                    else "unknown"
-                )
-                bitrate = (
-                    bitrate_bucket(item.bitrate_kbps)
-                    if item.bitrate_kbps and item.bitrate_kbps > 0
-                    else "unknown"
-                )
-                lookup = lookup_estimate(
-                    active_store,
-                    codec=item.codec,
-                    resolution=resolution,
-                    bitrate=bitrate,
-                    preset=preset,
-                    container=item.source.suffix.lower() or ".mkv",
-                )
-                if lookup is None or lookup.speed is None or lookup.speed <= 0:
-                    continue
+            bitrate = (
+                bitrate_bucket(item.bitrate_kbps)
+                if item.bitrate_kbps and item.bitrate_kbps > 0
+                else "unknown"
+            )
+            lookup = lookup_estimate(
+                active_store,
+                codec=item.codec,
+                resolution=resolution,
+                bitrate=bitrate,
+                preset=preset,
+                container=item.source.suffix.lower() or ".mkv",
+            )
+            if lookup is None:
+                continue
+            weight = max(item.duration_seconds, 1.0)
+            if preset not in _HW_ENCODERS and resolution != "unknown":
+                weight *= 1.25
+            if lookup.speed is not None and lookup.speed > 0:
                 calibrated_speed = lookup.speed
                 if lookup.average_speed_error is not None:
                     calibrated_speed = max(
                         0.05, calibrated_speed * (1.0 + lookup.average_speed_error)
                     )
-                weight = max(item.duration_seconds, 1.0)
-                if preset not in _HW_ENCODERS and resolution != "unknown":
-                    weight *= 1.25
                 weighted_speeds.append((calibrated_speed, weight))
-            if weighted_speeds:
-                total_weight = sum(weight for _, weight in weighted_speeds)
-                speed = sum(value * weight for value, weight in weighted_speeds) / total_weight
-            else:
-                speed = None
+            if lookup.average_speed_error is not None:
+                adjustment_factors.append((max(0.2, 1.0 + lookup.average_speed_error), weight))
+
+        related_speed: float | None = None
+        if weighted_speeds:
+            total_weight = sum(weight for _, weight in weighted_speeds)
+            related_speed = sum(value * weight for value, weight in weighted_speeds) / total_weight
+
+        if speed is not None:
+            if adjustment_factors:
+                total_factor_weight = sum(weight for _, weight in adjustment_factors)
+                average_factor = (
+                    sum(value * weight for value, weight in adjustment_factors)
+                    / total_factor_weight
+                )
+                speed = max(0.05, speed * average_factor)
+            if related_speed is not None:
+                speed = (
+                    max(speed, related_speed)
+                    if preset in _HW_ENCODERS
+                    else (speed + related_speed) / 2
+                )
         else:
-            speed = None
+            speed = related_speed
     if speed is None:
         from mediashrink.wizard import benchmark_encoder
 
@@ -748,7 +764,9 @@ def display_analysis_summary(
             highlight=False,
         )
     if narrow and not plain_output:
-        console.print("[dim]Compact analysis view hides the longer reason column on narrow terminals.[/dim]")
+        console.print(
+            "[dim]Compact analysis view hides the longer reason column on narrow terminals.[/dim]"
+        )
     console.print(
         f"[bold]{len(items)}[/bold] file(s) scanned - "
         f"[green bold]{len(recommended)}[/green bold] recommended, "
