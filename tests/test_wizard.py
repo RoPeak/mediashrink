@@ -487,6 +487,10 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
     assert "Intent" in output
     assert "Lowest estimated wait: Fast" in output
     assert "Default pick: Fast" in output
+    assert (
+        "Compatibility counts in this table reflect that broader likely encode candidate set"
+        in output
+    )
 
 
 def test_run_custom_wizard_returns_hardware_choice() -> None:
@@ -711,7 +715,17 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
     )
     fake_job = _job_for(larger)
     selected_profile = EncoderProfile(
-        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+        1,
+        "Balanced",
+        "Balanced",
+        "fast",
+        20,
+        "fast",
+        0,
+        0.0,
+        "Excellent",
+        True,
+        why_choose="Best default from the current time, size, quality, and compatibility estimates. Covers 1 file(s).",
     )
     preview_result = _fake_preview_result(larger)
     preview_result.job.output.write_bytes(b"preview")
@@ -742,9 +756,81 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
     assert action == "cancel"
     assert jobs == []
     assert "Selected profile:" in output
+    assert "Why choose this for likely encode candidates:" in output
     assert "exclude files already expected to be skipped" in output
     confirm_prompts = [call.args[0] for call in mock_confirm.call_args_list]
     assert "  Delete originals only after successful side-by-side encodes?" in confirm_prompts
+
+
+def test_run_wizard_ready_summary_reframes_profile_for_selected_subset(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
+    recommended_path = tmp_path / "recommended.mkv"
+    maybe_path = tmp_path / "maybe.mp4"
+    recommended_path.write_bytes(b"x" * 1000)
+    maybe_path.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(recommended_path, "recommended")
+    maybe = _analysis_item(maybe_path, "maybe")
+    fake_job = _job_for(recommended_path)
+    selected_profile = EncoderProfile(
+        1,
+        "GPU offload",
+        "GPU Offload",
+        "amf",
+        22,
+        None,
+        0,
+        300.0,
+        "Good",
+        True,
+        why_choose="Fastest partial-batch option: 1 file(s) can run now, while 1 likely need follow-up.",
+        compatible_count=1,
+        incompatible_count=1,
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[recommended_path, maybe_path]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended, maybe]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=["amf"]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={"amf": "AMD Test"}),
+        patch("mediashrink.wizard.prepare_profile_planning") as mock_planning,
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.wizard._run_preflight_checks", return_value=([fake_job], [])),
+        patch("mediashrink.wizard.estimate_analysis_encode_seconds", return_value=180.0),
+        patch("mediashrink.wizard._estimate_selected_output_bytes", return_value=500),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[False, False]),
+    ):
+        mock_planning.return_value = ProfilePlanningResult(
+            candidate_items=[recommended, maybe],
+            candidate_input_bytes=recommended.size_bytes + maybe.size_bytes,
+            candidate_media_seconds=recommended.duration_seconds + maybe.duration_seconds,
+            sample_item=recommended,
+            sample_duration=recommended.duration_seconds,
+            preview_items=[recommended],
+            available_hw=["amf"],
+            benchmark_speeds={"amf": 3.0},
+            observed_probe_failures={},
+            profiles=[selected_profile],
+            active_calibration={"version": 1, "records": [], "failures": []},
+            size_error_by_preset={"amf": None},
+            stage_messages=[],
+        )
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    output = console.export_text()
+    assert action == "cancel"
+    assert jobs == []
+    assert "Why choose this for likely encode candidates:" in output
+    assert (
+        "Selected run scope: recommended files only; this profile currently looks compatible for all 1 selected file(s)."
+        in output
+    )
+    assert "Not in this run: 1 maybe file(s) were left out by choice." in output
 
 
 # ---------------------------------------------------------------------------

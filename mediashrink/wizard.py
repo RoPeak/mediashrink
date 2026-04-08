@@ -306,6 +306,12 @@ def _estimate_selected_output_bytes(
     calibration_store: dict[str, object] | None,
 ) -> int:
     total = 0
+    selected_size_error = _average_size_error_for_items(
+        preset=preset,
+        items=items,
+        ffprobe=ffprobe,
+        calibration_store=calibration_store,
+    )
     for item in items:
         estimated = estimate_output_size(
             item.source,
@@ -316,6 +322,23 @@ def _estimate_selected_output_bytes(
             use_calibration=use_calibration,
             calibration_store=calibration_store,
         )
+        if (
+            preset in _HW_ENCODERS
+            and use_calibration
+            and selected_size_error is not None
+            and abs(selected_size_error) >= 0.18
+        ):
+            heuristic_estimated = estimate_output_size(
+                item.source,
+                ffprobe,
+                codec=item.codec,
+                crf=crf,
+                preset=preset,
+                use_calibration=False,
+                calibration_store=calibration_store,
+            )
+            if heuristic_estimated > 0 and estimated > 0:
+                estimated = int((estimated * 0.30) + (heuristic_estimated * 0.70))
         total += estimated if estimated > 0 else item.estimated_output_bytes
     return total
 
@@ -347,6 +370,23 @@ def _post_split_confidence_labels(
         if size_codecs != original_codecs or len(items) <= max(1, len(original_items) // 2):
             return _downgrade_confidence(size_conf), _downgrade_confidence(time_conf)
     return size_conf, time_conf
+
+
+def _describe_selected_scope(
+    selected_items: list[AnalysisItem],
+    *,
+    recommended_items: list[AnalysisItem],
+    maybe_items: list[AnalysisItem],
+) -> str:
+    selected_sources = {item.source for item in selected_items}
+    recommended_sources = {item.source for item in recommended_items}
+    maybe_sources = {item.source for item in maybe_items}
+    selected_maybe = len(selected_sources & maybe_sources)
+    if selected_sources and selected_sources <= recommended_sources:
+        return "recommended files only"
+    if selected_maybe:
+        return f"recommended files plus {selected_maybe} chosen maybe file(s)"
+    return "selected files"
 
 
 def _select_risky_probe_items(
@@ -1914,6 +1954,9 @@ def display_profiles_table(
         "  [dim]Time and size numbers are approximate estimates for likely encode candidates, not already-skipped files.[/dim]"
     )
     console.print(
+        "  [dim]Compatibility counts in this table reflect that broader likely encode candidate set before you choose recommended-only or include maybe files.[/dim]"
+    )
+    console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
     if time_confidence is not None:
@@ -2348,7 +2391,9 @@ def _select_profile_interactively(
         f"[dim]CRF:[/dim] {crf})"
     )
     if not selected.is_custom and selected.why_choose:
-        console.print(f"  [dim]Why choose this:[/dim] {selected.why_choose}")
+        console.print(
+            f"  [dim]Why choose this for likely encode candidates:[/dim] {selected.why_choose}"
+        )
     return preset, crf, sw_preset, display_label
 
 
@@ -2674,6 +2719,11 @@ def run_wizard(
     followup_manifest_path: Path | None = None
     compatibility_prediction_note: str | None = None
     selected_profile_size_error: float | None = None
+    selected_scope_label = _describe_selected_scope(
+        selected_items,
+        recommended_items=recommended_items,
+        maybe_items=maybe_items,
+    )
     while True:
         preset, crf, sw_preset, display_label = _select_profile_interactively(
             visible_profiles,
@@ -2766,6 +2816,11 @@ def run_wizard(
                 and review_maybe_items(maybe_items, console)
             ):
                 selected_items.extend(maybe_items)
+            selected_scope_label = _describe_selected_scope(
+                selected_items,
+                recommended_items=recommended_items,
+                maybe_items=maybe_items,
+            )
             action_taken = True
 
         followup_count = 0  # files moved to follow-up manifest due to incompatibility
@@ -2800,7 +2855,35 @@ def run_wizard(
             ),
             None,
         )
-        selected_profile_size_error = size_error_by_preset.get(preset)
+        selected_profile_size_error = _average_size_error_for_items(
+            preset=preset,
+            items=selected_items,
+            ffprobe=ffprobe,
+            calibration_store=active_calibration,
+        )
+        compatibility_prediction_note = None
+        if selected_profile is not None:
+            predicted_compatible, predicted_incompatible, _ = _predict_profile_compatibility(
+                profile=selected_profile,
+                items=selected_items,
+                ffprobe=ffprobe,
+                failure_rate=estimate_failure_rate(
+                    active_calibration,
+                    preset=selected_profile.encoder_key,
+                    container=selected_items[0].source.suffix.lower() if selected_items else ".mkv",
+                ),
+                observed_probe_failures=planning.observed_probe_failures,
+            )
+            if predicted_incompatible > 0:
+                compatibility_prediction_note = (
+                    f"Selected run scope: {selected_scope_label}; this profile is estimated to work for "
+                    f"{predicted_compatible} selected file(s), with {predicted_incompatible} likely follow-up."
+                )
+            else:
+                compatibility_prediction_note = (
+                    f"Selected run scope: {selected_scope_label}; this profile currently looks compatible "
+                    f"for all {predicted_compatible} selected file(s)."
+                )
 
         compatible_jobs, preflight_failures = _run_preflight_checks(
             to_encode,
@@ -3058,7 +3141,12 @@ def run_wizard(
                     known_speed=benchmark_speeds.get(preset),
                     calibration_store=active_calibration,
                 )
-                selected_profile_size_error = size_error_by_preset.get(preset)
+                selected_profile_size_error = _average_size_error_for_items(
+                    preset=preset,
+                    items=selected_items,
+                    ffprobe=ffprobe,
+                    calibration_store=active_calibration,
+                )
                 break
             if fallback_compatible and len(fallback_compatible) < len(fallback_to_encode):
                 fallback_sources = {job.source for job in fallback_compatible}
@@ -3089,7 +3177,12 @@ def run_wizard(
                         known_speed=benchmark_speeds.get(preset),
                         calibration_store=active_calibration,
                     )
-                    selected_profile_size_error = size_error_by_preset.get(preset)
+                    selected_profile_size_error = _average_size_error_for_items(
+                        preset=preset,
+                        items=selected_items,
+                        ffprobe=ffprobe,
+                        calibration_store=active_calibration,
+                    )
                     console.print(
                         f"[yellow]Skipping {len(fallback_failures)} incompatible file(s) for this run.[/yellow]"
                     )
@@ -3150,6 +3243,10 @@ def run_wizard(
         )
     if compatibility_prediction_note:
         console.print(f"  [dim]{compatibility_prediction_note}[/dim]")
+    elif followup_count == 0:
+        console.print(
+            f"  [dim]Selected run scope:[/dim] {selected_scope_label}; no compatibility split is currently expected for this run."
+        )
     if maybe_left_out > 0:
         console.print(
             f"  [dim]Not in this run:[/dim] {maybe_left_out} maybe file(s) were left out by choice."

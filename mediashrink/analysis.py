@@ -317,7 +317,7 @@ def estimate_analysis_encode_seconds(
                 speed = max(0.05, speed * average_factor)
             if related_speed is not None:
                 speed = (
-                    max(speed, related_speed)
+                    ((min(speed, related_speed) * 0.75) + (max(speed, related_speed) * 0.25))
                     if preset in _HW_ENCODERS
                     else (speed + related_speed) / 2
                 )
