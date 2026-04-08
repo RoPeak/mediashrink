@@ -763,6 +763,21 @@ def display_analysis_summary(
             f"{hidden} more not shown — use --manifest-out to export the full list.[/dim]",
             highlight=False,
         )
+    candidate_groups: dict[tuple[str, str], int] = {}
+    for item in recommended + maybe:
+        key = (item.source.suffix.lower() or "?", item.codec or "?")
+        candidate_groups[key] = candidate_groups.get(key, 0) + 1
+    if candidate_groups:
+        top_groups = []
+        for (container, codec), count in sorted(
+            candidate_groups.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:3]:
+            top_groups.append(f"{count} {container} {codec}")
+        console.print(
+            f"[dim]Candidate mix: {', '.join(top_groups)}.[/dim]",
+            highlight=False,
+        )
     if narrow and not plain_output:
         console.print(
             "[dim]Compact analysis view hides the longer reason column on narrow terminals.[/dim]"
