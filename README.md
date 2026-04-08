@@ -85,6 +85,8 @@ The wizard is the main guided workflow. It detects usable encoders with FFmpeg p
 
 ```bash
 mediashrink wizard /path/to/mkvs
+mediashrink wizard --non-interactive-wizard /path/to/mkvs
+mediashrink wizard --plain-output --debug-session-log /path/to/mkvs
 ```
 
 The wizard scans subdirectories by default, so it works out of the box for libraries organized into per-movie or per-show folders.
@@ -101,6 +103,14 @@ The wizard:
 7. Analyzes the library with those settings and classifies files as `recommended`, `maybe`, or `skip`.
 8. Defaults to compressing the recommended files only.
 9. Can optionally review `maybe` files or export a manifest instead of encoding immediately.
+
+Wizard reliability notes:
+
+- `--non-interactive-wizard` takes the safer guided path: recommended profile, recommended files only, no wizard prompts.
+- `--auto` remains the broad "accept sensible defaults" mode.
+- `--plain-output` forces a text-first layout for narrow or troublesome terminals.
+- `--debug-session-log` writes a human-readable wizard transcript for diagnosing prompt/input issues.
+- Linux and Windows are both supported targets. If the wizard detects unreliable interactive input, it may announce an automatic fallback to a safer plain non-interactive flow.
 
 Important: wizard time and size numbers are approximate estimates, not guarantees.
 

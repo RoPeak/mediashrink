@@ -236,6 +236,29 @@ def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
     assert mock_run_wizard.call_args.kwargs["recursive"] is True
 
 
+def test_wizard_passes_new_reliability_flags(tmp_path: Path) -> None:
+    with (
+        patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.cli.EncodingDisplay"),
+        patch(
+            "mediashrink.wizard.run_wizard", return_value=([], "cancel", False, None)
+        ) as mock_run_wizard,
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "wizard",
+                str(tmp_path),
+                "--non-interactive-wizard",
+                "--debug-session-log",
+            ],
+        )
+
+    assert result.exit_code == 3
+    assert mock_run_wizard.call_args.kwargs["non_interactive_wizard"] is True
+    assert mock_run_wizard.call_args.kwargs["debug_session_log"] is True
+
+
 def test_analyze_writes_manifest(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)

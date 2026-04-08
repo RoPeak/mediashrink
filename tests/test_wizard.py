@@ -9,8 +9,10 @@ from rich.console import Console
 
 from mediashrink.models import AnalysisItem, EncodeJob, EncodeResult
 from mediashrink.wizard import (
+    _WizardFallbackRequested,
     _sum_media_durations,
     _summarize_mkv_suitable_candidates,
+    _wizard_prompt,
     _wizard_readline,
     EncoderProfile,
     ProfilePlanningResult,
@@ -138,6 +140,27 @@ def test_wizard_readline_falls_back_to_stdio_when_terminal_device_unavailable() 
 
     assert result == "1"
     assert stdout.getvalue() == "Select a profile: "
+
+
+def test_wizard_prompt_echoes_accepted_answer() -> None:
+    console = Console(record=True, width=120)
+    from mediashrink import wizard as wizard_module
+
+    session = wizard_module.WizardSessionState(console=console, directory=Path("/tmp"), output_dir=None)
+    prior = wizard_module._ACTIVE_WIZARD_SESSION
+    wizard_module._ACTIVE_WIZARD_SESSION = session
+    try:
+        with patch("mediashrink.wizard._wizard_readline", return_value="2"):
+            result = _wizard_prompt(
+                "Choose action [1-3]",
+                prompt_id="next-step",
+                acceptance_label="Next-step selection",
+            )
+    finally:
+        wizard_module._ACTIVE_WIZARD_SESSION = prior
+
+    assert result == "2"
+    assert "Next-step selection:" in console.export_text()
 
 
 def test_summarize_mkv_suitable_candidates_groups_container_constraints(tmp_path: Path) -> None:
@@ -1050,6 +1073,167 @@ def test_run_wizard_auto_returns_without_prompts(tmp_path: Path) -> None:
     assert action == "encode"
     mock_confirm.assert_not_called()
     mock_prompt.assert_not_called()
+
+
+def test_run_wizard_non_interactive_wizard_returns_without_prompts(tmp_path: Path) -> None:
+    console = Console()
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
+        patch("mediashrink.wizard._wizard_confirm") as mock_confirm,
+        patch("mediashrink.wizard._wizard_prompt") as mock_prompt,
+    ):
+        jobs, action, _, _fm = run_wizard(
+            tmp_path,
+            FFMPEG,
+            FFPROBE,
+            False,
+            None,
+            False,
+            False,
+            console,
+            non_interactive_wizard=True,
+        )
+
+    assert action == "encode"
+    assert jobs == [fake_job]
+    mock_confirm.assert_not_called()
+    mock_prompt.assert_not_called()
+
+
+def test_run_wizard_auto_falls_back_after_prompt_failure(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", side_effect=[_WizardFallbackRequested("prompt glitch")]),
+        patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
+    ):
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    output = console.export_text()
+    assert action == "encode"
+    assert jobs == [fake_job]
+    assert "Detected unreliable terminal input." in output
+    assert "Non-interactive mode:" in output
+
+
+def test_run_wizard_writes_debug_session_log(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.build_profiles", return_value=[selected_profile]),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
+    ):
+        run_wizard(
+            tmp_path,
+            FFMPEG,
+            FFPROBE,
+            False,
+            None,
+            False,
+            False,
+            console,
+            non_interactive_wizard=True,
+            debug_session_log=True,
+        )
+
+    output = console.export_text()
+    assert "Wizard debug log:" in output
+    debug_logs = sorted(tmp_path.glob("mediashrink_wizard_debug_*.log"))
+    assert debug_logs
+    content = debug_logs[-1].read_text(encoding="utf-8")
+    assert "mode=non-interactive" in content
+    assert "events:" in content
+
+
+def test_display_profiles_table_uses_block_layout_on_narrow_terminal() -> None:
+    console = Console(record=True, width=90)
+    profiles = [
+        EncoderProfile(
+            1,
+            "Fast",
+            "Fast",
+            "faster",
+            22,
+            "faster",
+            2 * 1024**3,
+            3600.0,
+            "Very good",
+            True,
+            why_choose="Best default.",
+            compatible_count=9,
+            incompatible_count=3,
+            grouped_incompatibilities={"output header failure": 3},
+        )
+    ]
+
+    display_profiles_table(
+        profiles,
+        total_input_bytes=4 * 1024**3,
+        candidate_count=12,
+        device_labels={},
+        console=console,
+    )
+
+    output = console.export_text()
+    assert "1. Fast" in output
+    assert "Fit:" in output
+    assert "Why:" in output
 
 
 def test_run_wizard_prints_hardware_before_benchmark_progress(tmp_path: Path) -> None:

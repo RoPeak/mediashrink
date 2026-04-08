@@ -2735,6 +2735,11 @@ def wizard(
         "--auto",
         help="Non-interactive mode: auto-select the recommended profile, skip all prompts.",
     ),
+    non_interactive_wizard: bool = typer.Option(
+        False,
+        "--non-interactive-wizard",
+        help="Use the safer wizard path: recommended profile, recommended files only, and no wizard prompts.",
+    ),
     policy: str = typer.Option(
         "fastest-wall-clock",
         "--policy",
@@ -2764,6 +2769,11 @@ def wizard(
         False,
         "--plain-output",
         help="Use a slimmer text-first layout for narrow terminals.",
+    ),
+    debug_session_log: bool = typer.Option(
+        False,
+        "--debug-session-log",
+        help="Write a wizard prompt/session transcript for debugging terminal interaction problems.",
     ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
@@ -2796,6 +2806,8 @@ def wizard(
         duplicate_policy=_validate_duplicate_policy(duplicate_policy),
         show_all_profiles=show_all_profiles,
         plain_output=plain_output,
+        non_interactive_wizard=non_interactive_wizard,
+        debug_session_log=debug_session_log,
     )
 
     if action == "cancel":
