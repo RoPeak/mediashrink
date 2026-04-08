@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from rich.console import Console
 
@@ -103,6 +104,18 @@ def test_make_progress_bar_uses_stable_columns() -> None:
     assert "_FileCountsColumn" in column_names
     assert "_HeartbeatColumn" in column_names
     assert "_LastUpdateColumn" in column_names
+    assert progress.expand is False
+
+
+def test_make_progress_bar_uses_resize_safe_windows_layout() -> None:
+    console = Console(record=True, width=160)
+    display = EncodingDisplay(console)
+
+    with patch("mediashrink.progress.detect_os", return_value="Windows"):
+        progress = display.make_progress_bar()
+
+    assert display._progress_layout_width == 108
+    assert progress.expand is False
 
 
 def test_show_summary_mentions_resumed_context(tmp_path: Path) -> None:

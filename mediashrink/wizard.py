@@ -169,7 +169,10 @@ def _track_prompt_anomaly(note: str) -> None:
         return
     session.degraded_prompt_score += 1
     session.add_event(f"Prompt anomaly: {note}")
-    if session.degraded_prompt_score >= _DEGRADED_PROMPT_THRESHOLD and not session.fallback_triggered:
+    if (
+        session.degraded_prompt_score >= _DEGRADED_PROMPT_THRESHOLD
+        and not session.fallback_triggered
+    ):
         session.fallback_triggered = True
         raise _WizardFallbackRequested(note)
 
@@ -2600,6 +2603,8 @@ def _write_followup_manifest(
 def _followup_manifest_notes(
     grouped_failures: dict[str, list[EncodeJob]],
     incompatible_items: list[AnalysisItem],
+    *,
+    ffprobe: Path,
 ) -> list[str]:
     if not grouped_failures or not incompatible_items:
         return []
@@ -2621,6 +2626,12 @@ def _followup_manifest_notes(
         if examples:
             note += f" ({examples})"
         notes.append(note)
+    for detail in _per_file_followup_details(
+        grouped_failures,
+        incompatible_items,
+        ffprobe=ffprobe,
+    ):
+        notes.append(detail)
     notes.append("Suggested retry: prefer MKV outputs or rerun with --policy highest-confidence.")
     return notes
 
@@ -2640,6 +2651,8 @@ def _followup_remediation(reason: str) -> str:
 def _per_file_followup_details(
     grouped_failures: dict[str, list[EncodeJob]],
     incompatible_items: list[AnalysisItem],
+    *,
+    ffprobe: Path,
 ) -> list[str]:
     if not grouped_failures or not incompatible_items:
         return []
@@ -2649,9 +2662,43 @@ def _per_file_followup_details(
             reason_by_source[job.source] = reason
     details: list[str] = []
     for item in incompatible_items:
+        explicit = describe_container_incompatibilities(item.source, item.source, ffprobe)
+        if explicit:
+            details.append(
+                f"{item.source.name}: {', '.join(explicit)} -> Use MKV output or re-check copied stream compatibility."
+            )
+            continue
+        notes = describe_output_container_constraints(item.source, item.source, ffprobe)
+        if notes:
+            details.append(
+                f"{item.source.name}: {', '.join(notes)} -> Use MKV output or review copied streams manually."
+            )
+            continue
         reason = reason_by_source.get(item.source, "unknown compatibility failure")
         details.append(f"{item.source.name}: {reason} -> {_followup_remediation(reason)}")
     return details
+
+
+def _followup_next_step_hint(
+    *,
+    preset: str,
+    grouped_failures: dict[str, list[EncodeJob]],
+) -> str:
+    reasons = set(grouped_failures)
+    container_blocking = {
+        "unsupported copied audio codec",
+        "unsupported copied subtitle codec",
+        "attachment stream incompatibility",
+        "auxiliary data stream incompatibility",
+        "output header failure",
+    }
+    if reasons and reasons <= container_blocking:
+        return "Or re-run the wizard on the same folder with MKV output or review copied streams manually."
+    if preset in _HW_ENCODERS:
+        return "Or re-run the wizard on the same folder with a software profile."
+    return (
+        "Or re-run the wizard on the same folder with MKV output or review copied streams manually."
+    )
 
 
 def _select_profile_interactively(
@@ -2906,7 +2953,9 @@ def run_wizard(
             plain_output=plain_output or requested_non_interactive,
         )
 
-        recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
+        recommended_items = [
+            item for item in analysis_items if item.recommendation == "recommended"
+        ]
         maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
         if not recommended_items:
             console.print("[dim]No recommended files were found for automatic compression.[/dim]")
@@ -2980,7 +3029,9 @@ def run_wizard(
             )
         probe_target_count = len(_iter_probe_targets(profiles))
         if probe_target_count:
-            console.print(f"[dim]Smoke-probed {probe_target_count} risky profile combination(s).[/dim]")
+            console.print(
+                f"[dim]Smoke-probed {probe_target_count} risky profile combination(s).[/dim]"
+            )
         display_result = display_profiles_table(
             profiles,
             candidate_input_bytes,
@@ -3208,7 +3259,9 @@ def run_wizard(
                 (
                     profile
                     for profile in profiles
-                    if not profile.is_custom and profile.encoder_key == preset and profile.crf == crf
+                    if not profile.is_custom
+                    and profile.encoder_key == preset
+                    and profile.crf == crf
                 ),
                 None,
             )
@@ -3227,7 +3280,9 @@ def run_wizard(
                     failure_rate=estimate_failure_rate(
                         active_calibration,
                         preset=selected_profile.encoder_key,
-                        container=selected_items[0].source.suffix.lower() if selected_items else ".mkv",
+                        container=selected_items[0].source.suffix.lower()
+                        if selected_items
+                        else ".mkv",
                     ),
                     observed_probe_failures=planning.observed_probe_failures,
                 )
@@ -3316,7 +3371,9 @@ def run_wizard(
                     item for item in selected_items if item.source not in compatible_sources
                 ]
                 remaining_incompatible_items = list(incompatible_items)
-                retained_jobs = [job for job in jobs if job.skip or job.source in compatible_sources]
+                retained_jobs = [
+                    job for job in jobs if job.skip or job.source in compatible_sources
+                ]
                 mkv_switched_jobs: list[EncodeJob] = []
                 mkv_safe_reasons = {
                     "unsupported copied audio codec",
@@ -3360,7 +3417,9 @@ def run_wizard(
                             mkv_switched_jobs = mkv_compatible_jobs
                             retained_jobs.extend(mkv_compatible_jobs)
                             remaining_incompatible_items = [
-                                item for item in incompatible_items if item.source not in mkv_sources
+                                item
+                                for item in incompatible_items
+                                if item.source not in mkv_sources
                             ]
                             console.print(
                                 f"[green]Switched {len(mkv_compatible_jobs)} file(s) to MKV sidecar output in[/green] {mkv_followup_dir}"
@@ -3374,12 +3433,18 @@ def run_wizard(
                     preset,
                     crf,
                     remaining_incompatible_items,
-                    notes=_followup_manifest_notes(grouped_failures, remaining_incompatible_items),
+                    notes=_followup_manifest_notes(
+                        grouped_failures,
+                        remaining_incompatible_items,
+                        ffprobe=ffprobe,
+                    ),
                 )
                 followup_manifest_path = followup_manifest
                 followup_count = len(remaining_incompatible_items)
                 included_sources = compatible_sources | {job.source for job in mkv_switched_jobs}
-                selected_items = [item for item in selected_items if item.source in included_sources]
+                selected_items = [
+                    item for item in selected_items if item.source in included_sources
+                ]
                 jobs = retained_jobs
                 to_encode = compatible_jobs + mkv_switched_jobs
                 estimated_total_encode_seconds = estimate_analysis_encode_seconds(
@@ -3401,23 +3466,31 @@ def run_wizard(
                     calibration_store=active_calibration,
                 )
                 if selected_profile is not None:
-                    predicted_compatible, predicted_incompatible, _ = _predict_profile_compatibility(
-                        profile=selected_profile,
-                        items=originally_selected_items,
-                        ffprobe=ffprobe,
-                        failure_rate=estimate_failure_rate(
-                            active_calibration,
-                            preset=selected_profile.encoder_key,
-                            container=(
-                                selected_items[0].source.suffix.lower() if selected_items else ".mkv"
+                    predicted_compatible, predicted_incompatible, _ = (
+                        _predict_profile_compatibility(
+                            profile=selected_profile,
+                            items=originally_selected_items,
+                            ffprobe=ffprobe,
+                            failure_rate=estimate_failure_rate(
+                                active_calibration,
+                                preset=selected_profile.encoder_key,
+                                container=(
+                                    selected_items[0].source.suffix.lower()
+                                    if selected_items
+                                    else ".mkv"
+                                ),
                             ),
-                        ),
-                        observed_probe_failures=planning.observed_probe_failures,
+                            observed_probe_failures=planning.observed_probe_failures,
+                        )
                     )
                     compatibility_prediction_note = (
                         f"Predicted compatibility for this selection: {predicted_compatible} compatible / "
                         f"{predicted_incompatible} likely follow-up; preflight confirmed {len(compatible_jobs)} in-place compatible"
-                        + (f", {len(mkv_switched_jobs)} switched to MKV" if mkv_switched_jobs else "")
+                        + (
+                            f", {len(mkv_switched_jobs)} switched to MKV"
+                            if mkv_switched_jobs
+                            else ""
+                        )
                         + (
                             f", {len(remaining_incompatible_items)} moved to follow-up."
                             if remaining_incompatible_items
@@ -3427,7 +3500,11 @@ def run_wizard(
                 else:
                     compatibility_prediction_note = (
                         f"Preflight confirmed {len(compatible_jobs)} in-place compatible"
-                        + (f", {len(mkv_switched_jobs)} switched to MKV" if mkv_switched_jobs else "")
+                        + (
+                            f", {len(mkv_switched_jobs)} switched to MKV"
+                            if mkv_switched_jobs
+                            else ""
+                        )
                         + (
                             f", {len(remaining_incompatible_items)} moved to follow-up."
                             if remaining_incompatible_items
@@ -3453,11 +3530,12 @@ def run_wizard(
                         f'  [dim]To encode these with a different profile: mediashrink apply "{followup_manifest}"[/dim]'
                     )
                     console.print(
-                        "  [dim]Or re-run the wizard on the same folder with a software profile.[/dim]"
+                        f"  [dim]{_followup_next_step_hint(preset=preset, grouped_failures=grouped_failures)}[/dim]"
                     )
                     for detail in _per_file_followup_details(
                         grouped_failures,
                         remaining_incompatible_items,
+                        ffprobe=ffprobe,
                     )[:5]:
                         console.print(f"  [dim]- {detail}[/dim]")
                 break
@@ -3533,7 +3611,9 @@ def run_wizard(
                             item for item in selected_items if item.source in fallback_sources
                         ]
                         jobs = [
-                            job for job in fallback_jobs if job.skip or job.source in fallback_sources
+                            job
+                            for job in fallback_jobs
+                            if job.skip or job.source in fallback_sources
                         ]
                         to_encode = fallback_compatible
                         preset = fallback_preset
