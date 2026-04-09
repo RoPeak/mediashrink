@@ -486,7 +486,9 @@ def test_display_profiles_table_uses_device_label() -> None:
         total_input_bytes=10 * 1024**3,
     )
 
-    display_profiles_table(profiles, 10 * 1024**3, 3, {"qsv": "Intel Arc Test"}, console)
+    display_profiles_table(
+        profiles, 10 * 1024**3, 3, 3, {"qsv": "Intel Arc Test"}, console
+    )
 
     output = console.export_text()
     assert "Intel Quick" in output
@@ -507,17 +509,16 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
         total_input_bytes=10 * 1024**3,
     )
 
-    display_profiles_table(profiles, 10 * 1024**3, 3, {"amf": "AMD Test"}, console)
+    display_profiles_table(
+        profiles, 10 * 1024**3, 3, 3, {"amf": "AMD Test"}, console
+    )
 
     output = console.export_text()
     assert "Why choose" in output
     assert "Intent" in output
     assert "Lowest estimated wait: Fast" in output
     assert "Default pick: Fast" in output
-    assert (
-        "Compatibility counts in this table reflect that broader likely encode candidate set"
-        in output
-    )
+    assert "Recommended-only default scope:" in output
 
 
 def test_run_custom_wizard_returns_hardware_choice() -> None:
@@ -785,8 +786,43 @@ def test_run_wizard_prints_sample_profile_and_cleanup_guidance(tmp_path: Path) -
     assert "Selected profile:" in output
     assert "Why choose this for likely encode candidates:" in output
     assert "exclude files already expected to be skipped" in output
-    confirm_prompts = [call.args[0] for call in mock_confirm.call_args_list]
-    assert "  Delete originals only after successful side-by-side encodes?" in confirm_prompts
+
+
+def test_run_wizard_cleanup_prompt_has_no_leading_indent(tmp_path: Path) -> None:
+    console = Console()
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    recommended = _analysis_item(source, "recommended")
+    fake_job = _job_for(source)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    def fake_confirm(text: str, **kwargs: object) -> bool:
+        if kwargs.get("prompt_id") == "cleanup-after":
+            assert not text.startswith(" ")
+        return False
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[source]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[recommended]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=fake_confirm),
+    ):
+        run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
 
 
 def test_run_wizard_ready_summary_reframes_profile_for_selected_subset(tmp_path: Path) -> None:
@@ -1233,6 +1269,7 @@ def test_display_profiles_table_uses_block_layout_on_narrow_terminal() -> None:
         profiles,
         total_input_bytes=4 * 1024**3,
         candidate_count=12,
+        recommended_count=10,
         device_labels={},
         console=console,
     )
@@ -1240,6 +1277,7 @@ def test_display_profiles_table_uses_block_layout_on_narrow_terminal() -> None:
     output = console.export_text()
     assert "1. Fast" in output
     assert "Fit:" in output
+    assert "Recommended-only:" in output
     assert "Why:" in output
 
 

@@ -395,9 +395,9 @@ def _wizard_confirm(
 def _render_mode(console: Console, *, plain_output: bool = False) -> str:
     if plain_output:
         return "plain"
-    if console.width < 110:
+    if console.width < 125:
         return "narrow"
-    if console.width < 150:
+    if console.width < 165:
         return "compact"
     return "wide"
 
@@ -423,6 +423,8 @@ class EncoderProfile:
     grouped_incompatibilities: dict[str, int] | None = None
     effective_input_bytes: int = 0
     size_uncertainty: float | None = None
+    recommended_compatible_count: int = 0
+    recommended_incompatible_count: int = 0
 
 
 @dataclass
@@ -473,6 +475,21 @@ def _format_grouped_reason_list(grouped: dict[str, int] | None) -> str:
         for reason, count in sorted(grouped.items(), key=lambda item: (-item[1], item[0]))
     ]
     return "; ".join(parts[:2])
+
+
+def _summarize_candidate_mix(items: list[AnalysisItem], limit: int = 3) -> str:
+    grouped: dict[tuple[str, str], int] = {}
+    for item in items:
+        key = (item.source.suffix.lower() or "?", item.codec or "?")
+        grouped[key] = grouped.get(key, 0) + 1
+    if not grouped:
+        return ""
+    parts = []
+    for (container, codec), count in sorted(grouped.items(), key=lambda item: (-item[1], item[0])):
+        parts.append(f"{count} {container} {codec}")
+        if len(parts) >= limit:
+            break
+    return ", ".join(parts)
 
 
 def _profile_predicted_incompatibility(
@@ -1910,6 +1927,17 @@ def build_profiles(
         elif candidate_items:
             profile.estimated_output_bytes = 0
             profile.estimated_encode_seconds = 0.0
+        recommended_scope_items = candidate_items or []
+        if recommended_scope_items and ffprobe is not None:
+            rec_ok, rec_followup = _predict_compatibility_counts_for_items(
+                profile,
+                recommended_scope_items,
+                ffprobe=ffprobe,
+                calibration_store=active_calibration,
+                observed_probe_failures=observed_probe_failures,
+            )
+            profile.recommended_compatible_count = rec_ok
+            profile.recommended_incompatible_count = rec_followup
     for profile in profiles:
         profile.is_recommended = False
     if candidate_items:
@@ -1952,6 +1980,7 @@ def display_profiles_table(
     profiles: list[EncoderProfile],
     total_input_bytes: int,
     candidate_count: int,
+    recommended_count: int,
     device_labels: dict[str, str],
     console: Console,
     time_confidence: str | None = None,
@@ -2057,7 +2086,7 @@ def display_profiles_table(
                 profile.encoder_key, device_labels, truncate=True
             )
             fit = (
-                f"{profile.compatible_count} ok / {profile.incompatible_count} follow-up"
+                f"{profile.compatible_count} likely ok / {profile.incompatible_count} follow-up"
                 if candidate_count
                 else "-"
             )
@@ -2066,6 +2095,11 @@ def display_profiles_table(
                 highlight=False,
             )
             console.print(f"   {profile.why_choose}", highlight=False)
+            if recommended_count:
+                console.print(
+                    f"   Recommended-only: {profile.recommended_compatible_count} now / {profile.recommended_incompatible_count} follow-up",
+                    highlight=False,
+                )
             if profile.grouped_incompatibilities:
                 console.print(
                     f"   Follow-up risk: {_format_grouped_reason_list(profile.grouped_incompatibilities)}",
@@ -2087,7 +2121,7 @@ def display_profiles_table(
                     profile.encoder_key, device_labels, truncate=True
                 )
                 fit = (
-                    f"{profile.compatible_count} ok / {profile.incompatible_count} follow-up"
+                    f"{profile.compatible_count} likely ok / {profile.incompatible_count} follow-up"
                     if candidate_count
                     else "-"
                 )
@@ -2096,6 +2130,10 @@ def display_profiles_table(
                     f"   {encoder_display} | {_est_saving_text(profile)} | {_est_time_text(profile)} | {profile.quality_label}"
                 )
                 console.print(f"   Fit: {fit}")
+                if recommended_count:
+                    console.print(
+                        f"   Recommended-only: {profile.recommended_compatible_count} now / {profile.recommended_incompatible_count} follow-up"
+                    )
                 console.print(f"   Why: {profile.why_choose}")
                 if profile.grouped_incompatibilities:
                     console.print(
@@ -2185,11 +2223,12 @@ def display_profiles_table(
     console.print(
         f"  [dim]Likely encode candidates: {candidate_count} file(s) / {_fmt_size(total_input_bytes)}[/dim]"
     )
+    if recommended_count:
+        console.print(
+            f"  [dim]Recommended-only default scope: {recommended_count} file(s). Each profile also shows a recommended-only compatibility line.[/dim]"
+        )
     console.print(
         "  [dim]Time and size numbers are approximate estimates for likely encode candidates, not already-skipped files.[/dim]"
-    )
-    console.print(
-        "  [dim]Compatibility counts in this table reflect that broader likely encode candidate set before you choose recommended-only or include maybe files.[/dim]"
     )
     console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
@@ -2222,7 +2261,7 @@ def display_profiles_table(
                 f"  [dim]Default pick: {recommended.name} because it is estimated to work for {recommended.compatible_count} file(s) with {recommended.incompatible_count} likely left for follow-up.[/dim]"
             )
     if render_mode in {"compact", "narrow"}:
-        console.print("  [dim]Compact view hides lower-priority columns on narrow terminals.[/dim]")
+        console.print("  [dim]Compact view switches to denser profile summaries on smaller terminals.[/dim]")
     if not show_all_profiles and len(visible_profiles) < len(profiles):
         console.print(
             f"  [dim]Hidden {len(profiles) - len(visible_profiles)} near-duplicate profile row(s). Use --show-all-profiles to inspect every profile.[/dim]"
@@ -2760,6 +2799,30 @@ def _select_profile_interactively(
     return preset, crf, sw_preset, display_label
 
 
+def _predict_compatibility_counts_for_items(
+    profile: EncoderProfile,
+    items: list[AnalysisItem],
+    *,
+    ffprobe: Path,
+    calibration_store: dict[str, object] | None,
+    observed_probe_failures: dict[tuple[str, int], dict[Path, str]] | None = None,
+) -> tuple[int, int]:
+    if not items:
+        return 0, 0
+    compatible, incompatible, _ = _predict_profile_compatibility(
+        profile=profile,
+        items=items,
+        ffprobe=ffprobe,
+        failure_rate=estimate_failure_rate(
+            calibration_store,
+            preset=profile.encoder_key,
+            container=items[0].source.suffix.lower() if items else ".mkv",
+        ),
+        observed_probe_failures=observed_probe_failures,
+    )
+    return compatible, incompatible
+
+
 def _run_analysis_with_progress(
     files: list[Path],
     ffprobe: Path,
@@ -2991,7 +3054,7 @@ def run_wizard(
         )
         if mkv_candidate_count and output_dir is None:
             console.print(
-                f"[yellow]Early warning:[/yellow] {mkv_candidate_count} likely encode candidate(s) contain streams better suited to MKV sidecar output."
+                f"[bold yellow]MKV follow-up warning:[/bold yellow] {mkv_candidate_count} likely encode candidate(s) contain streams better suited to MKV sidecar output."
             )
             console.print(
                 f"  [dim]{_format_grouped_reason_list(mkv_grouped_reasons)}[/dim]"
@@ -3046,6 +3109,18 @@ def run_wizard(
         active_calibration = planning.active_calibration
         profiles = planning.profiles
         size_error_by_preset = planning.size_error_by_preset
+        for profile in profiles:
+            if profile.is_custom:
+                continue
+            rec_ok, rec_followup = _predict_compatibility_counts_for_items(
+                profile,
+                recommended_items,
+                ffprobe=ffprobe,
+                calibration_store=active_calibration,
+                observed_probe_failures=planning.observed_probe_failures,
+            )
+            profile.recommended_compatible_count = rec_ok
+            profile.recommended_incompatible_count = rec_followup
         if benchmark_speeds:
             console.print(
                 f"[dim]Benchmarked {len([key for key, speed in benchmark_speeds.items() if speed is not None])} profile candidate(s).[/dim]"
@@ -3056,11 +3131,12 @@ def run_wizard(
                 f"[dim]Smoke-probed {probe_target_count} risky profile combination(s).[/dim]"
             )
         display_result = display_profiles_table(
-            profiles,
-            candidate_input_bytes,
-            len(candidate_items),
-            device_labels,
-            console,
+        profiles,
+        candidate_input_bytes,
+        len(candidate_items),
+        len(recommended_items),
+        device_labels,
+        console,
             time_confidence=estimate_time_confidence(
                 candidate_items,
                 benchmarked_files=1,
@@ -3154,7 +3230,7 @@ def run_wizard(
 
             if mkv_candidate_count and output_dir is None:
                 console.print(
-                    f"[dim]Selected profile expectation:[/dim] {mkv_candidate_count} file(s) may still need MKV sidecar output after preflight."
+                    f"[yellow]Selected profile expectation:[/yellow] {mkv_candidate_count} file(s) may still need MKV sidecar output after preflight."
                 )
 
             if not active_auto and not profile_saved:
@@ -3767,7 +3843,7 @@ def run_wizard(
         cleanup_after = False
         if not overwrite and output_dir is None and not active_auto:
             cleanup_after = _wizard_confirm(
-                "  Delete originals only after successful side-by-side encodes?",
+                "Delete originals only after successful side-by-side encodes?",
                 default=False,
                 prompt_id="cleanup-after",
                 acceptance_label="Cleanup decision",

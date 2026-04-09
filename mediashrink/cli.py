@@ -2899,7 +2899,7 @@ def wizard(
                     ffprobe=ffprobe,
                 )
                 console.print(
-                    f'  [dim]Review manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
+                    f'  [dim]Best next step: use MKV output or adjust copied streams, then retry with: mediashrink apply "{followup_manifest_path}"[/dim]'
                 )
                 results = results + preflight_followup_results
             else:
