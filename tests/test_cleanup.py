@@ -17,7 +17,7 @@ def _make_result(
 ) -> EncodeResult:
     source = tmp_path / source_name
     output = tmp_path / output_name
-    source.write_bytes(b"original")
+    source.write_bytes(b"original" * 10)
     if success and not dry_run and source != output:
         output.write_bytes(b"compressed")
 
@@ -42,10 +42,16 @@ def _make_result(
     )
 
 
-def test_eligible_cleanup_results_filters_to_successful_side_by_side_outputs(tmp_path: Path) -> None:
+def test_eligible_cleanup_results_filters_to_successful_side_by_side_outputs(
+    tmp_path: Path,
+) -> None:
     good = _make_result(tmp_path, source_name="good.mkv", output_name="good_compressed.mkv")
-    skipped = _make_result(tmp_path, source_name="skip.mkv", output_name="skip_compressed.mkv", skipped=True)
-    failed = _make_result(tmp_path, source_name="fail.mkv", output_name="fail_compressed.mkv", success=False)
+    skipped = _make_result(
+        tmp_path, source_name="skip.mkv", output_name="skip_compressed.mkv", skipped=True
+    )
+    failed = _make_result(
+        tmp_path, source_name="fail.mkv", output_name="fail_compressed.mkv", success=False
+    )
     overwrite = _make_result(tmp_path, source_name="overwrite.mkv", output_name="overwrite.mkv")
 
     eligible = eligible_cleanup_results([good, skipped, failed, overwrite])
@@ -53,7 +59,9 @@ def test_eligible_cleanup_results_filters_to_successful_side_by_side_outputs(tmp
     assert eligible == [good]
 
 
-def test_cleanup_successful_results_restores_original_name_and_removes_source(tmp_path: Path) -> None:
+def test_cleanup_successful_results_restores_original_name_and_removes_source(
+    tmp_path: Path,
+) -> None:
     result = _make_result(tmp_path, source_name="ep01.mp4", output_name="ep01_compressed.mp4")
 
     cleaned = cleanup_successful_results([result])
@@ -62,3 +70,12 @@ def test_cleanup_successful_results_restores_original_name_and_removes_source(tm
     assert (tmp_path / "ep01.mp4").read_bytes() == b"compressed"
     assert not (tmp_path / "ep01_compressed.mp4").exists()
     assert not (tmp_path / ".cleanup_backup_ep01.mp4").exists()
+
+
+def test_eligible_cleanup_results_skips_oversized_outputs(tmp_path: Path) -> None:
+    oversized = _make_result(tmp_path, source_name="movie.mkv", output_name="movie_compressed.mkv")
+    oversized.output_size_bytes = oversized.input_size_bytes + 100
+
+    eligible = eligible_cleanup_results([oversized])
+
+    assert eligible == []

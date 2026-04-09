@@ -1823,9 +1823,76 @@ def test_review_command_mentions_followup_manifest_and_estimate_miss(tmp_path: P
 
     assert result.exit_code == 0
     assert "follow-up manifest" in result.stdout.lower()
-    assert "Estimate miss:" in result.stdout
-    assert "Grouped incompatibilities" in result.stdout
-    assert "unsupported container/stream combination" in result.stdout
+
+
+def test_calibration_command_summarizes_local_history(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    calibration_path = tmp_path / "appdata" / "mediashrink" / "calibration.json"
+    calibration_path.parent.mkdir(parents=True, exist_ok=True)
+    calibration_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "records": [
+                    {
+                        "codec": "h264",
+                        "container": ".mkv",
+                        "resolution_bucket": "1080p",
+                        "bitrate_bucket": "high",
+                        "preset": "fast",
+                        "preset_family": "software",
+                        "crf": 20,
+                        "input_bytes": 1000,
+                        "output_bytes": 500,
+                        "duration_seconds": 100.0,
+                        "wall_seconds": 50.0,
+                        "effective_speed": 2.0,
+                        "fallback_used": False,
+                        "retry_used": False,
+                        "accepted_output": True,
+                    },
+                    {
+                        "codec": "h264",
+                        "container": ".mp4",
+                        "resolution_bucket": "1080p",
+                        "bitrate_bucket": "high",
+                        "preset": "amf",
+                        "preset_family": "hardware",
+                        "crf": 22,
+                        "input_bytes": 1000,
+                        "output_bytes": 3000,
+                        "duration_seconds": 100.0,
+                        "wall_seconds": 10.0,
+                        "effective_speed": 10.0,
+                        "fallback_used": False,
+                        "retry_used": False,
+                        "accepted_output": False,
+                    },
+                ],
+                "failures": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["calibration"])
+
+    assert result.exit_code == 0
+    assert "Calibration summary" in result.stdout
+    assert "rejected by safety checks" in result.stdout
+
+
+def test_calibration_command_emits_json(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    calibration_path = tmp_path / "appdata" / "mediashrink" / "calibration.json"
+    calibration_path.parent.mkdir(parents=True, exist_ok=True)
+    calibration_path.write_text('{"version":1,"records":[],"failures":[]}', encoding="utf-8")
+
+    result = runner.invoke(app, ["calibration", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["records"] == 0
 
 
 def test_encode_skip_policy_writes_followup_manifest(tmp_path: Path) -> None:

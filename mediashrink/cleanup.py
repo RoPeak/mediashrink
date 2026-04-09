@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from mediashrink.encoder import output_passes_safety_check
 from mediashrink.models import EncodeResult
 
 
@@ -11,6 +12,8 @@ def eligible_cleanup_results(results: list[EncodeResult]) -> list[EncodeResult]:
     eligible: list[EncodeResult] = []
     for result in results:
         if not result.success or result.skipped or result.job.dry_run:
+            continue
+        if not output_passes_safety_check(result.input_size_bytes, result.output_size_bytes):
             continue
         source = result.job.source
         output = result.job.output

@@ -228,6 +228,8 @@ _HW_ENCODERS: dict[str, tuple[str, str, list[str]]] = {
     "nvenc": ("hevc_nvenc", "-cq", ["-rc", "vbr", "-preset", "p4", "-tune", "hq", "-bf", "3"]),
     "amf": ("hevc_amf", "-qp_i", ["-quality", "balanced"]),
 }
+_MAX_OUTPUT_GROWTH_RATIO = 1.02
+_MAX_OUTPUT_GROWTH_BYTES = 16 * 1024**2
 
 
 def _hw_quality_args(encoder_key: str, crf: int) -> list[str]:
@@ -652,6 +654,30 @@ def _summarize_stderr_lines(stderr_lines: list[str], returncode: int) -> str:
     return "\n".join(cleaned[-5:])
 
 
+def output_passes_safety_check(input_size_bytes: int, output_size_bytes: int) -> bool:
+    allowed_output = min(
+        int(input_size_bytes * _MAX_OUTPUT_GROWTH_RATIO),
+        input_size_bytes + _MAX_OUTPUT_GROWTH_BYTES,
+    )
+    return output_size_bytes <= allowed_output
+
+
+def oversized_output_message(
+    *,
+    source_name: str,
+    input_size_bytes: int,
+    output_size_bytes: int,
+) -> str:
+    growth_pct = 0.0
+    if input_size_bytes > 0:
+        growth_pct = ((output_size_bytes - input_size_bytes) / input_size_bytes) * 100.0
+    return (
+        "Output safety check: encoded file was larger than the source and was rejected "
+        f"for {source_name} ({input_size_bytes / (1024**2):.1f} MB -> "
+        f"{output_size_bytes / (1024**2):.1f} MB, {growth_pct:.1f}% growth)."
+    )
+
+
 def encode_file(
     job: EncodeJob,
     ffmpeg: Path,
@@ -780,6 +806,38 @@ def encode_file(
                     duration_seconds=duration,
                     progress_pct=last_progress_pct,
                     error_message=_summarize_stderr_lines(list(stderr_tail), process.returncode),
+                )
+            ],
+        )
+
+    output_size = job.tmp_output.stat().st_size if job.tmp_output.exists() else 0
+    if output_size > 0 and not output_passes_safety_check(input_size, output_size):
+        if job.tmp_output.exists():
+            job.tmp_output.unlink()
+        message = oversized_output_message(
+            source_name=job.source.name,
+            input_size_bytes=input_size,
+            output_size_bytes=output_size,
+        )
+        return EncodeResult(
+            job=job,
+            skipped=False,
+            skip_reason=None,
+            success=False,
+            input_size_bytes=input_size,
+            output_size_bytes=output_size,
+            duration_seconds=duration,
+            error_message=message,
+            raw_error_message=message,
+            media_duration_seconds=media_duration,
+            attempts=[
+                EncodeAttempt(
+                    preset=job.preset,
+                    crf=job.crf,
+                    success=False,
+                    duration_seconds=duration,
+                    progress_pct=max(last_progress_pct, 100.0 if media_duration > 0 else 0.0),
+                    error_message=message,
                 )
             ],
         )

@@ -17,6 +17,7 @@ from mediashrink.encoder import (
     get_duration_seconds,
     get_video_resolution,
     is_hardware_preset,
+    output_passes_safety_check,
     parse_progress_line,
     validate_encoder,
 )
@@ -401,6 +402,36 @@ def test_encode_file_reports_progress_from_out_time_us(tmp_path: Path) -> None:
     assert len(reported) == 2
     assert abs(reported[0] - 50.0) < 0.1
     assert abs(reported[1] - 100.0) < 0.1
+
+
+def test_output_safety_check_rejects_large_growth() -> None:
+    assert output_passes_safety_check(1000, 1010) is True
+    assert output_passes_safety_check(1000, 5000) is False
+
+
+def test_encode_file_rejects_oversized_output(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    job.source.write_bytes(b"x" * 1000)
+
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.stdout = iter(["out_time_us=10000000\n", "progress=end\n"])
+    mock_process.stderr = iter([])
+
+    def fake_popen(cmd, **kwargs):
+        job.tmp_output.write_bytes(b"x" * 6000)
+        return mock_process
+
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", side_effect=fake_popen),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+    ):
+        result = encode_file(job, FFMPEG, FFPROBE)
+
+    assert result.success is False
+    assert result.output_failed_safety_check is True
+    assert "Output safety check:" in (result.error_message or "")
+    assert not job.tmp_output.exists()
 
 
 def test_encode_file_success_replaces_existing_output(tmp_path: Path) -> None:

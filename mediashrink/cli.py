@@ -37,9 +37,11 @@ from mediashrink.calibration import (
     append_success_record,
     bitrate_bucket,
     estimate_failure_rate,
+    get_calibration_path,
     load_calibration_store,
     lookup_estimate,
     resolution_bucket,
+    summarize_calibration_store,
 )
 from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
 from mediashrink.encoder import (
@@ -52,6 +54,7 @@ from mediashrink.encoder import (
     get_video_bitrate_kbps,
     get_video_resolution,
     is_hardware_preset,
+    output_passes_safety_check,
     output_drops_subtitles,
     preflight_encode_job,
     source_has_attachment_streams,
@@ -699,6 +702,16 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
         guidance.append(
             f"Skipped incompatible files likely need MKV outputs or a different preset path for: {directory}"
         )
+    estimate_miss = payload.get("estimate_miss_summary")
+    if isinstance(estimate_miss, str) and "larger" in estimate_miss:
+        guidance.append("Review the estimate miss summary before reusing the same preset.")
+    if (
+        isinstance(estimate_miss, str)
+        and "rejected because encoded output grew larger" in estimate_miss
+    ):
+        guidance.append(
+            "At least one encode was blocked by the output safety check; prefer a software preset or higher CRF for those files."
+        )
     followup_manifest = payload.get("split_followup_manifest")
     if isinstance(followup_manifest, str) and followup_manifest:
         guidance.append(f"Review the follow-up manifest for left-out files: {followup_manifest}")
@@ -708,7 +721,12 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
 
 
 def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
-    if not result.success or result.skipped or result.job.dry_run:
+    if result.skipped or result.job.dry_run:
+        return
+    accepted_output = result.success and output_passes_safety_check(
+        result.input_size_bytes, result.output_size_bytes
+    )
+    if not result.success and not result.output_failed_safety_check:
         return
     width, height = get_video_resolution(result.job.source, ffprobe)
     bitrate_kbps = get_video_bitrate_kbps(result.job.source, ffprobe)
@@ -754,6 +772,8 @@ def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
             retry_used=result.retry_count > 0,
             predicted_output_ratio=predicted_output_ratio,
             predicted_speed=lookup.speed if lookup is not None else None,
+            accepted_output=accepted_output,
+            safety_rejection_reason=result.error_message if not accepted_output else None,
         )
     )
 
@@ -818,6 +838,14 @@ def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
 
 def _estimate_miss_summary(results: list[EncodeResult]) -> str | None:
     successful = [result for result in results if result.success and not result.skipped]
+    oversized_rejections = [result for result in results if result.output_failed_safety_check]
+    if oversized_rejections:
+        names = ", ".join(result.job.source.name for result in oversized_rejections[:3])
+        suffix = "..." if len(oversized_rejections) > 3 else ""
+        return (
+            f"{len(oversized_rejections)} file(s) were rejected because encoded output grew larger "
+            f"than the source ({names}{suffix})."
+        )
     estimated_inputs = [
         result.job.estimated_output_bytes
         for result in successful
@@ -1265,6 +1293,18 @@ app.add_typer(profiles_app, name="profiles")
 console = Console()
 
 
+def _fmt_ratio(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value * 100:.1f}%"
+
+
+def _fmt_speed(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}x"
+
+
 class EncodeLoopResults(list):
     def __init__(self, results: list[EncodeResult], *, stopped_early: bool = False) -> None:
         super().__init__(results)
@@ -1607,6 +1647,8 @@ def _run_encode_loop(
                 if result.success and not result.skipped:
                     _record_success_calibration(result, ffprobe)
                 elif not result.success and not result.skipped:
+                    if result.output_failed_safety_check:
+                        _record_success_calibration(result, ffprobe)
                     _record_failure_calibration(result)
 
             if not result.success and not result.skipped:
@@ -3533,6 +3575,63 @@ def review(
     console.print("[bold]Suggested next step[/bold]")
     for line in guidance:
         console.print(f"  - {line}")
+
+
+@app.command("calibration")
+def calibration_summary(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the calibration summary as JSON.",
+    ),
+) -> None:
+    path = get_calibration_path()
+    store = load_calibration_store(path)
+    summary = summarize_calibration_store(store)
+    payload = {"path": str(path), **summary}
+
+    if json_output:
+        print(json.dumps(payload))
+        return
+
+    console.print(f"[bold]Calibration summary[/bold] [dim]({path})[/dim]")
+    console.print(
+        "Records: "
+        f"{summary['records']} total, "
+        f"{summary['accepted_records']} accepted, "
+        f"{summary['rejected_records']} rejected by safety checks, "
+        f"{summary['failures']} encode failures",
+        highlight=False,
+    )
+
+    preset_summaries = payload.get("preset_summaries")
+    if isinstance(preset_summaries, list) and preset_summaries:
+        console.print("[bold]By preset[/bold]")
+        for entry in preset_summaries[:8]:
+            if not isinstance(entry, dict):
+                continue
+            console.print(
+                f"  - {entry['preset']} {entry['container']}: "
+                f"{entry['samples']} sample(s), "
+                f"{entry['accepted_samples']} accepted, "
+                f"{entry['rejected_samples']} rejected, "
+                f"avg output {_fmt_ratio(entry.get('avg_output_ratio'))}, "
+                f"avg speed {_fmt_speed(entry.get('avg_speed'))}",
+                highlight=False,
+            )
+
+    recent_records = payload.get("recent_records")
+    if isinstance(recent_records, list) and recent_records:
+        console.print("[bold]Recent samples[/bold]")
+        for entry in recent_records:
+            if not isinstance(entry, dict):
+                continue
+            console.print(
+                f"  - {entry['preset']} {entry['container']}: "
+                f"{entry['input_bytes']} -> {entry['output_bytes']} bytes "
+                f"({'accepted' if entry['accepted_output'] else 'rejected'})",
+                highlight=False,
+            )
 
 
 @app.command()

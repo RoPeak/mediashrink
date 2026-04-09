@@ -9,6 +9,7 @@ from mediashrink.calibration import (
     describe_calibration_estimate,
     load_calibration_store,
     lookup_estimate,
+    summarize_calibration_store,
 )
 
 
@@ -131,3 +132,34 @@ def test_lookup_estimate_blends_exact_and_related_matches(tmp_path: Path) -> Non
     assert 0.50 < estimate.output_ratio < 0.65
     assert estimate.weighted_samples > 1.0
     assert describe_calibration_estimate(estimate) is not None
+
+
+def test_calibration_summary_counts_rejected_outputs(tmp_path: Path) -> None:
+    store_path = tmp_path / "calibration.json"
+    append_success_record(
+        CalibrationRecord(
+            codec="h264",
+            container=".mp4",
+            resolution_bucket="1080p",
+            bitrate_bucket="high",
+            preset="amf",
+            preset_family="hardware",
+            crf=22,
+            input_bytes=1_000_000,
+            output_bytes=3_000_000,
+            duration_seconds=100.0,
+            wall_seconds=10.0,
+            effective_speed=10.0,
+            fallback_used=False,
+            retry_used=False,
+            accepted_output=False,
+            safety_rejection_reason="oversized output",
+        ),
+        path=store_path,
+    )
+
+    summary = summarize_calibration_store(load_calibration_store(store_path))
+
+    assert summary["records"] == 1
+    assert summary["accepted_records"] == 0
+    assert summary["rejected_records"] == 1

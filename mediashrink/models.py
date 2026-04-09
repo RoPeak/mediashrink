@@ -106,6 +106,11 @@ class EncodeResult:
                 return attempt.error_message
         return self.error_message
 
+    @property
+    def output_failed_safety_check(self) -> bool:
+        message = self.error_message or ""
+        return message.startswith("Output safety check:")
+
 
 @dataclass
 class AnalysisItem:

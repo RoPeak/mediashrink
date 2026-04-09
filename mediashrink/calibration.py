@@ -29,6 +29,8 @@ class CalibrationRecord:
     retry_used: bool
     predicted_output_ratio: float | None = None
     predicted_speed: float | None = None
+    accepted_output: bool = True
+    safety_rejection_reason: str | None = None
 
 
 @dataclass
@@ -330,7 +332,10 @@ def estimate_failure_rate(
             if raw.get("container") == container and (
                 raw.get("preset") == preset or raw.get("preset_family") == preset_family(preset)
             ):
-                successes += 1
+                if raw.get("accepted_output", True):
+                    successes += 1
+                else:
+                    failures += 1
     if isinstance(raw_failures, list):
         for raw in raw_failures:
             if not isinstance(raw, dict):
@@ -408,3 +413,109 @@ def _average_speed_error(records: list[dict[str, object]]) -> float | None:
     if not errors:
         return None
     return sum(errors) / len(errors)
+
+
+def summarize_calibration_store(store: dict[str, object] | None) -> dict[str, object]:
+    records = store.get("records", []) if isinstance(store, dict) else []
+    failures = store.get("failures", []) if isinstance(store, dict) else []
+    if not isinstance(records, list):
+        records = []
+    if not isinstance(failures, list):
+        failures = []
+
+    accepted_records = [
+        raw for raw in records if isinstance(raw, dict) and raw.get("accepted_output", True)
+    ]
+    rejected_records = [
+        raw for raw in records if isinstance(raw, dict) and not raw.get("accepted_output", True)
+    ]
+
+    by_preset: dict[tuple[str, str], dict[str, object]] = {}
+    for raw in records:
+        if not isinstance(raw, dict):
+            continue
+        preset = str(raw.get("preset") or "unknown")
+        container = str(raw.get("container") or "unknown")
+        entry = by_preset.setdefault(
+            (preset, container),
+            {
+                "preset": preset,
+                "container": container,
+                "samples": 0,
+                "accepted_samples": 0,
+                "rejected_samples": 0,
+                "output_ratio_total": 0.0,
+                "output_ratio_samples": 0,
+                "speed_total": 0.0,
+                "speed_samples": 0,
+            },
+        )
+        entry["samples"] = int(entry["samples"]) + 1
+        if raw.get("accepted_output", True):
+            entry["accepted_samples"] = int(entry["accepted_samples"]) + 1
+        else:
+            entry["rejected_samples"] = int(entry["rejected_samples"]) + 1
+
+        input_bytes = raw.get("input_bytes")
+        output_bytes = raw.get("output_bytes")
+        if (
+            isinstance(input_bytes, (int, float))
+            and input_bytes > 0
+            and isinstance(output_bytes, (int, float))
+            and output_bytes >= 0
+        ):
+            entry["output_ratio_total"] = float(entry["output_ratio_total"]) + (
+                float(output_bytes) / float(input_bytes)
+            )
+            entry["output_ratio_samples"] = int(entry["output_ratio_samples"]) + 1
+
+        speed = raw.get("effective_speed")
+        if isinstance(speed, (int, float)) and speed > 0:
+            entry["speed_total"] = float(entry["speed_total"]) + float(speed)
+            entry["speed_samples"] = int(entry["speed_samples"]) + 1
+
+    preset_summaries: list[dict[str, object]] = []
+    for entry in by_preset.values():
+        ratio_samples = int(entry["output_ratio_samples"])
+        speed_samples = int(entry["speed_samples"])
+        preset_summaries.append(
+            {
+                "preset": entry["preset"],
+                "container": entry["container"],
+                "samples": int(entry["samples"]),
+                "accepted_samples": int(entry["accepted_samples"]),
+                "rejected_samples": int(entry["rejected_samples"]),
+                "avg_output_ratio": (
+                    float(entry["output_ratio_total"]) / ratio_samples
+                    if ratio_samples > 0
+                    else None
+                ),
+                "avg_speed": (
+                    float(entry["speed_total"]) / speed_samples if speed_samples > 0 else None
+                ),
+            }
+        )
+    preset_summaries.sort(key=lambda item: (-int(item["samples"]), str(item["preset"])))
+
+    recent_records = []
+    for raw in records[-5:]:
+        if not isinstance(raw, dict):
+            continue
+        recent_records.append(
+            {
+                "preset": str(raw.get("preset") or "unknown"),
+                "container": str(raw.get("container") or "unknown"),
+                "accepted_output": bool(raw.get("accepted_output", True)),
+                "input_bytes": int(raw.get("input_bytes", 0) or 0),
+                "output_bytes": int(raw.get("output_bytes", 0) or 0),
+            }
+        )
+
+    return {
+        "records": len(records),
+        "accepted_records": len(accepted_records),
+        "rejected_records": len(rejected_records),
+        "failures": len([raw for raw in failures if isinstance(raw, dict)]),
+        "preset_summaries": preset_summaries,
+        "recent_records": recent_records,
+    }
