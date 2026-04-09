@@ -1282,8 +1282,8 @@ def _policy_sort_key(
     quality_bias = float(_quality_rank(profile.quality_label) * -1)
     compatibility_penalty = float(max(profile.incompatible_count, 0))
     size_uncertainty_penalty = (
-        1.0
-        if profile.size_uncertainty is not None and abs(profile.size_uncertainty) >= 0.25
+        abs(profile.size_uncertainty)
+        if profile.size_uncertainty is not None and abs(profile.size_uncertainty) >= 0.18
         else 0.0
     )
     effective_wait = float(profile.estimated_encode_seconds or 0.0)
@@ -1325,6 +1325,52 @@ def _policy_sort_key(
     )
 
 
+def _is_highly_variable_profile(profile: EncoderProfile) -> bool:
+    return (
+        profile.encoder_key in _HW_ENCODERS
+        and profile.size_uncertainty is not None
+        and abs(profile.size_uncertainty) >= 0.25
+    )
+
+
+def _prefer_stable_software_alternative(
+    recommended: EncoderProfile,
+    candidates: list[EncoderProfile],
+) -> EncoderProfile:
+    if not _is_highly_variable_profile(recommended):
+        return recommended
+
+    stable_software_candidates = [
+        profile
+        for profile in candidates
+        if profile.encoder_key not in _HW_ENCODERS
+        and profile.compatible_count >= recommended.compatible_count
+        and profile.incompatible_count <= recommended.incompatible_count
+        and profile.size_uncertainty is not None
+        and abs(profile.size_uncertainty) < 0.18
+    ]
+    if not stable_software_candidates:
+        stable_software_candidates = [
+            profile
+            for profile in candidates
+            if profile.encoder_key not in _HW_ENCODERS
+            and profile.compatible_count >= recommended.compatible_count
+            and profile.incompatible_count <= recommended.incompatible_count
+            and (profile.size_uncertainty is None or abs(profile.size_uncertainty) < 0.25)
+        ]
+    if not stable_software_candidates:
+        return recommended
+
+    return min(
+        stable_software_candidates,
+        key=lambda profile: (
+            profile.estimated_encode_seconds,
+            -_quality_rank(profile.quality_label),
+            profile.estimated_output_bytes,
+        ),
+    )
+
+
 def _select_recommended_profile(
     profiles: list[EncoderProfile],
     *,
@@ -1340,7 +1386,7 @@ def _select_recommended_profile(
     ]
     if not candidates:
         return None
-    return min(
+    recommended = min(
         candidates,
         key=lambda profile: _policy_sort_key(
             profile,
@@ -1348,6 +1394,9 @@ def _select_recommended_profile(
             failure_rate=(failure_rates or {}).get(profile.encoder_key, 0.0),
         ),
     )
+    if policy == "fastest-wall-clock":
+        return _prefer_stable_software_alternative(recommended, candidates)
+    return recommended
 
 
 def detect_available_encoders(
@@ -2008,9 +2057,9 @@ def display_profiles_table(
             else -1
         )
         return (
-            profile.intent_label,
             encoder_family,
-            profile.crf // 2,
+            profile.quality_label,
+            profile.crf // 4,
             profile.compatible_count,
             time_bucket,
             output_bucket,
@@ -2260,8 +2309,14 @@ def display_profiles_table(
             console.print(
                 f"  [dim]Default pick: {recommended.name} because it is estimated to work for {recommended.compatible_count} file(s) with {recommended.incompatible_count} likely left for follow-up.[/dim]"
             )
+            if fastest is not None and fastest is not recommended:
+                console.print(
+                    f"  [dim]Fastest wait is still {fastest.name}, but {recommended.name} is the steadier default for size/compatibility on similar files.[/dim]"
+                )
     if render_mode in {"compact", "narrow"}:
-        console.print("  [dim]Compact view switches to denser profile summaries on smaller terminals.[/dim]")
+        console.print(
+            "  [dim]Compact view switches to denser profile summaries on smaller terminals.[/dim]"
+        )
     if not show_all_profiles and len(visible_profiles) < len(profiles):
         console.print(
             f"  [dim]Hidden {len(profiles) - len(visible_profiles)} near-duplicate profile row(s). Use --show-all-profiles to inspect every profile.[/dim]"
@@ -3131,12 +3186,12 @@ def run_wizard(
                 f"[dim]Smoke-probed {probe_target_count} risky profile combination(s).[/dim]"
             )
         display_result = display_profiles_table(
-        profiles,
-        candidate_input_bytes,
-        len(candidate_items),
-        len(recommended_items),
-        device_labels,
-        console,
+            profiles,
+            candidate_input_bytes,
+            len(candidate_items),
+            len(recommended_items),
+            device_labels,
+            console,
             time_confidence=estimate_time_confidence(
                 candidate_items,
                 benchmarked_files=1,
@@ -3815,6 +3870,15 @@ def run_wizard(
                 )
         if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
             console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
+            if (
+                selected_profile is not None
+                and selected_profile.estimated_encode_seconds > 0
+                and abs(selected_profile.estimated_encode_seconds - estimated_total_encode_seconds)
+                >= max(60.0, selected_profile.estimated_encode_seconds * 0.10)
+            ):
+                console.print(
+                    "  [dim]Time estimate was refined after selection using the exact run scope and current calibration data.[/dim]"
+                )
         console.print(f"  Size confidence: {size_confidence_label}")
         console.print(f"  Time confidence: {time_confidence_label}")
         if preset in _HW_ENCODERS:

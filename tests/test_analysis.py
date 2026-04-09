@@ -478,6 +478,47 @@ def test_size_and_time_confidence_can_diverge(tmp_path: Path) -> None:
     assert "benchmark sample" in time_detail
 
 
+def test_size_confidence_drops_when_local_history_is_highly_volatile(tmp_path: Path) -> None:
+    item = build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "unknown",
+                "preset": "amf",
+                "preset_family": "hardware",
+                "crf": 20,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "duration_seconds": 100.0,
+                "wall_seconds": 40.0,
+                "effective_speed": 2.5,
+                "fallback_used": False,
+                "retry_used": False,
+                "predicted_output_ratio": 0.4,
+                "predicted_speed": 2.0,
+            }
+        ],
+        "failures": [],
+    }
+
+    with patch(
+        "mediashrink.analysis.lookup_estimate",
+        return_value=SimpleNamespace(
+            output_ratio=0.5,
+            average_size_error=0.28,
+        ),
+    ):
+        size_conf = estimate_size_confidence(
+            [item], preset="amf", calibration_store=calibration_store
+        )
+
+    assert size_conf == "Medium"
+
+
 def test_manifest_round_trip_keeps_duplicate_policy_and_notes(tmp_path: Path) -> None:
     recommended = build_analysis_item_dict_item(
         source=tmp_path / "recommended.mkv",

@@ -38,6 +38,8 @@ _MIN_SKIP_SAVINGS_BYTES = 250 * _MB
 _MIN_SKIP_SAVINGS_PCT = 10.0
 _MIN_RECOMMENDED_SAVINGS_BYTES = 1 * _GB
 _MIN_RECOMMENDED_SAVINGS_PCT = 25.0
+_HIGH_SIZE_ERROR_THRESHOLD = 0.18
+_VERY_HIGH_SIZE_ERROR_THRESHOLD = 0.25
 
 
 def _fmt_size(size_bytes: int) -> str:
@@ -54,6 +56,36 @@ def _fmt_duration(seconds: float) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def _average_size_error_for_items(
+    items: list[AnalysisItem],
+    *,
+    preset: str,
+    use_calibration: bool,
+    calibration_store: dict[str, object] | None = None,
+) -> float | None:
+    if not use_calibration:
+        return None
+    candidates = [item for item in items if item.recommendation != "skip"]
+    if not candidates:
+        return None
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    errors: list[float] = []
+    for item in candidates[:5]:
+        estimate = lookup_estimate(
+            active_store,
+            codec=item.codec,
+            resolution="unknown",
+            bitrate="unknown",
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if estimate is not None and estimate.average_size_error is not None:
+            errors.append(estimate.average_size_error)
+    if not errors:
+        return None
+    return sum(errors) / len(errors)
 
 
 def build_analysis_item(
@@ -506,8 +538,27 @@ def estimate_size_confidence(
     elif calibration_hits >= 1:
         score += 1
 
+    average_size_error = _average_size_error_for_items(
+        candidates,
+        preset=preset,
+        use_calibration=use_calibration,
+        calibration_store=active_store,
+    )
+    if average_size_error is not None:
+        if abs(average_size_error) >= _VERY_HIGH_SIZE_ERROR_THRESHOLD:
+            score -= 2
+        elif abs(average_size_error) >= _HIGH_SIZE_ERROR_THRESHOLD:
+            score -= 1
+
     # Single-file batches have too little evidence to justify "High" size confidence.
     if len(candidates) <= 1:
+        score = min(score, 2)
+    if (
+        average_size_error is not None
+        and abs(average_size_error) >= _VERY_HIGH_SIZE_ERROR_THRESHOLD
+    ):
+        score = min(score, 1)
+    elif average_size_error is not None and abs(average_size_error) >= _HIGH_SIZE_ERROR_THRESHOLD:
         score = min(score, 2)
 
     if score >= 3:

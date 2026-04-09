@@ -486,9 +486,7 @@ def test_display_profiles_table_uses_device_label() -> None:
         total_input_bytes=10 * 1024**3,
     )
 
-    display_profiles_table(
-        profiles, 10 * 1024**3, 3, 3, {"qsv": "Intel Arc Test"}, console
-    )
+    display_profiles_table(profiles, 10 * 1024**3, 3, 3, {"qsv": "Intel Arc Test"}, console)
 
     output = console.export_text()
     assert "Intel Quick" in output
@@ -509,9 +507,7 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
         total_input_bytes=10 * 1024**3,
     )
 
-    display_profiles_table(
-        profiles, 10 * 1024**3, 3, 3, {"amf": "AMD Test"}, console
-    )
+    display_profiles_table(profiles, 10 * 1024**3, 3, 3, {"amf": "AMD Test"}, console)
 
     output = console.export_text()
     assert "Why choose" in output
@@ -519,6 +515,83 @@ def test_display_profiles_table_shows_fastest_and_default_guidance() -> None:
     assert "Lowest estimated wait: Fast" in output
     assert "Default pick: Fast" in output
     assert "Recommended-only default scope:" in output
+
+
+def test_display_profiles_table_mentions_faster_profile_when_default_is_steadier(
+    tmp_path: Path,
+) -> None:
+    console = Console(record=True, width=160)
+    candidate = _analysis_item(tmp_path / "candidate.mkv", "recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "high",
+                "preset": "amf",
+                "preset_family": "hardware",
+                "crf": 22,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "duration_seconds": 100.0,
+                "wall_seconds": 5.0,
+                "effective_speed": 20.0,
+                "fallback_used": False,
+                "retry_used": False,
+                "predicted_output_ratio": 0.3,
+            },
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "high",
+                "preset": "faster",
+                "preset_family": "software",
+                "crf": 22,
+                "input_bytes": 1000,
+                "output_bytes": 500,
+                "duration_seconds": 100.0,
+                "wall_seconds": 50.0,
+                "effective_speed": 2.0,
+                "fallback_used": False,
+                "retry_used": False,
+            },
+        ],
+        "failures": [],
+    }
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 12.0, "fast": 1.0, "faster": 1.2},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+        candidate_items=[candidate],
+        ffprobe=FFPROBE,
+        policy="fastest-wall-clock",
+        calibration_store=calibration_store,
+    )
+
+    display_profiles_table(profiles, 10 * 1024**3, 1, 1, {"amf": "AMD Test"}, console)
+
+    output = console.export_text()
+    assert "Fastest wait is still" in output
+    assert "steadier default" in output
+
+
+def test_display_profiles_table_hides_more_duplicate_builtin_rows() -> None:
+    console = Console(record=True, width=160)
+    profiles = build_profiles(
+        available_hw=["amf"],
+        benchmark_speeds={"amf": 4.0, "fast": 1.0, "faster": 1.3},
+        total_media_seconds=3600.0,
+        total_input_bytes=10 * 1024**3,
+    )
+
+    display_profiles_table(profiles, 10 * 1024**3, 3, 3, {"amf": "AMD Test"}, console)
+
+    output = console.export_text()
+    assert "Hidden 3 near-duplicate profile row(s)." in output
 
 
 def test_run_custom_wizard_returns_hardware_choice() -> None:
