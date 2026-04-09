@@ -7,6 +7,7 @@ from unittest.mock import patch
 from rich.console import Console
 
 from mediashrink.analysis import (
+    adjust_time_confidence_for_scope,
     apply_duplicate_policy_to_items,
     analyze_files,
     build_analysis_item,
@@ -547,6 +548,28 @@ def test_manifest_round_trip_keeps_duplicate_policy_and_notes(tmp_path: Path) ->
 
     assert loaded.duplicate_policy == "prefer-mkv"
     assert loaded.notes == ["Preferred MKV copy over duplicate MP4"]
+
+
+def test_time_confidence_downgrades_for_mixed_sidecar_scope(tmp_path: Path) -> None:
+    mkv_item = build_analysis_item_dict_item(
+        source=tmp_path / "movie.mkv",
+        recommendation="recommended",
+    )
+    mp4_item = build_analysis_item_dict_item(
+        source=tmp_path / "movie.mp4",
+        recommendation="recommended",
+    )
+    mp4_item.codec = "mpeg2video"
+
+    adjusted = adjust_time_confidence_for_scope(
+        "High",
+        [mkv_item, mp4_item],
+        original_items=[mkv_item, mp4_item],
+        sidecar_count=1,
+        followup_count=1,
+    )
+
+    assert adjusted == "Medium"
 
 
 def build_analysis_item_dict_item(

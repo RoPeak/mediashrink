@@ -15,6 +15,7 @@ from rich.table import Table
 from rich.text import Text
 
 from mediashrink.analysis import (
+    adjust_time_confidence_for_scope,
     apply_duplicate_policy_to_items,
     analyze_files,
     build_manifest,
@@ -29,9 +30,18 @@ from mediashrink.analysis import (
     estimate_time_confidence,
     save_manifest,
     select_representative_items,
+    summarize_container_risks,
+    describe_time_confidence_scope_adjustment,
 )
-from mediashrink.calibration import estimate_failure_rate, load_calibration_store
-from mediashrink.calibration import bitrate_bucket, lookup_estimate, resolution_bucket
+from mediashrink.calibration import (
+    bitrate_bucket,
+    estimate_failure_rate,
+    format_family_container_summary,
+    load_calibration_store,
+    lookup_estimate,
+    resolution_bucket,
+    summarize_calibration_store,
+)
 from mediashrink.constants import CRF_COMPRESSION_FACTOR
 from mediashrink.encoder import (
     _HW_ENCODERS,
@@ -76,6 +86,7 @@ _HW_ENCODER_CAVEATS: dict[str, str] = {
 _DEFAULT_FALLBACK_PROFILE = ("faster", 22, "Fast", "faster")
 _CONFIDENCE_LEVELS = ("Low", "Medium", "High")
 _DEGRADED_PROMPT_THRESHOLD = 3
+_LAST_WIZARD_REPORT_CONTEXT: dict[str, object] | None = None
 
 
 class _WizardFallbackRequested(Exception):
@@ -117,6 +128,13 @@ class WizardSessionState:
 
     def add_event(self, message: str) -> None:
         self.event_log.append(message)
+
+
+def consume_last_wizard_report_context() -> dict[str, object] | None:
+    global _LAST_WIZARD_REPORT_CONTEXT
+    context = _LAST_WIZARD_REPORT_CONTEXT
+    _LAST_WIZARD_REPORT_CONTEXT = None
+    return context
 
 
 _ACTIVE_WIZARD_SESSION: WizardSessionState | None = None
@@ -492,6 +510,102 @@ def _summarize_candidate_mix(items: list[AnalysisItem], limit: int = 3) -> str:
     return ", ".join(parts)
 
 
+def _compact_split_summary(
+    selected_count: int,
+    compatible_count: int,
+    mkv_count: int,
+    followup_count: int,
+) -> str:
+    parts = [f"{selected_count} selected -> {compatible_count} normal"]
+    if mkv_count:
+        parts.append(f"{mkv_count} MKV sidecar")
+    if followup_count:
+        parts.append(f"{followup_count} follow-up")
+    return ", ".join(parts)
+
+
+def _cleanup_expectation_lines(
+    jobs: list[EncodeJob],
+    *,
+    cleanup_after: bool,
+) -> list[str]:
+    if not jobs:
+        return []
+    mkv_sidecars = [job for job in jobs if job.output.suffix.lower() == ".mkv"]
+    inplace_outputs = [job for job in jobs if job.output.suffix.lower() != ".mkv"]
+    lines: list[str] = []
+    if cleanup_after:
+        if inplace_outputs:
+            lines.append(
+                f"Cleanup will restore {len(inplace_outputs)} successful in-place output"
+                + ("s" if len(inplace_outputs) != 1 else "")
+                + " to the original filename."
+            )
+        if mkv_sidecars:
+            lines.append(
+                f"{len(mkv_sidecars)} successful MKV sidecar output"
+                + ("s" if len(mkv_sidecars) != 1 else "")
+                + " will stay as .mkv file(s)."
+            )
+    else:
+        lines.append("Cleanup is off, so successful outputs will stay side-by-side.")
+        if mkv_sidecars:
+            lines.append(f"{len(mkv_sidecars)} file(s) are already planned as MKV sidecars.")
+    return lines
+
+
+def _queue_strategy_recommendation(items: list[AnalysisItem]) -> str | None:
+    if len(items) < 2:
+        return None
+    total = sum(max(item.duration_seconds, 0.0) for item in items)
+    if total <= 0:
+        total = float(sum(item.size_bytes for item in items))
+        dominant = max(items, key=lambda item: item.size_bytes)
+        share = dominant.size_bytes / max(int(total), 1)
+    else:
+        dominant = max(items, key=lambda item: item.duration_seconds)
+        share = dominant.duration_seconds / total
+    if share < 0.45:
+        return None
+    return f"Largest-first queueing would front-load {dominant.source.name}, which looks like the longest runtime contributor."
+
+
+def _calibration_trust_line(calibration_store: dict[str, object] | None) -> str | None:
+    summary = summarize_calibration_store(calibration_store)
+    if not isinstance(summary, dict) or int(summary.get("records", 0) or 0) <= 0:
+        return None
+    line = (
+        f"This machine has {summary['accepted_records']} accepted sample(s) and "
+        f"{summary['rejected_records']} rejected safety-check sample(s)."
+    )
+    family_mix = format_family_container_summary(summary.get("family_container_summaries"))
+    if family_mix:
+        line += f" History mix: {family_mix}."
+    bias_summary = summary.get("bias_summary")
+    if isinstance(bias_summary, dict) and isinstance(bias_summary.get("summary"), str):
+        line += f" Recent bias: {bias_summary['summary']}."
+    return line
+
+
+def _mkv_first_guidance(profile: EncoderProfile, *, recommended_count: int) -> str | None:
+    grouped = profile.grouped_incompatibilities or {}
+    if not grouped:
+        return None
+    mkv_reasons = {
+        "unsupported copied audio codec",
+        "unsupported copied subtitle codec",
+        "attachment stream incompatibility",
+        "auxiliary data stream incompatibility",
+        "output header failure",
+    }
+    blocked = sum(count for reason, count in grouped.items() if reason in mkv_reasons)
+    if blocked <= 0:
+        return None
+    if recommended_count > 0 and profile.compatible_count > (recommended_count // 2):
+        return None
+    return "MKV output first is the clearer default here because container/copied-stream issues, not encoder speed, are blocking most of this batch."
+
+
 def _profile_predicted_incompatibility(
     item: AnalysisItem,
     profile: EncoderProfile,
@@ -588,6 +702,8 @@ def _post_split_confidence_labels(
     preset: str,
     use_calibration: bool,
     benchmarked_files: int,
+    sidecar_count: int = 0,
+    followup_count: int = 0,
 ) -> tuple[str, str]:
     size_conf = estimate_size_confidence(
         items,
@@ -599,6 +715,13 @@ def _post_split_confidence_labels(
         benchmarked_files=benchmarked_files,
         preset=preset,
         use_calibration=use_calibration,
+    )
+    time_conf = adjust_time_confidence_for_scope(
+        time_conf,
+        items,
+        original_items=original_items,
+        sidecar_count=sidecar_count,
+        followup_count=followup_count,
     )
     if len(items) <= 1 < len(original_items):
         return _downgrade_confidence(size_conf), _downgrade_confidence(time_conf)
@@ -989,7 +1112,14 @@ def prepare_profile_planning(
     candidate_input_bytes = sum(item.size_bytes for item in candidate_items)
     candidate_media_seconds = _sum_item_durations(candidate_items)
     sample_pool = recommended_items or maybe_items or analysis_items
-    sample_item = max(sample_pool, key=lambda item: item.size_bytes)
+    representative_pool = select_representative_items(sample_pool, limit=3) or sample_pool
+    sample_item = max(
+        representative_pool,
+        key=lambda item: (
+            item.duration_seconds if item.duration_seconds > 0 else 0.0,
+            item.size_bytes,
+        ),
+    )
     sample_duration = sample_item.duration_seconds if sample_item.duration_seconds > 0 else 3600.0
     preview_items = select_representative_items(candidate_items or sample_pool, limit=3)
     detect_console = console if console is not None else Console(quiet=True)
@@ -1281,6 +1411,13 @@ def _policy_sort_key(
     hardware_bias = 0.0 if profile.encoder_key in _HW_ENCODERS else 1.0
     quality_bias = float(_quality_rank(profile.quality_label) * -1)
     compatibility_penalty = float(max(profile.incompatible_count, 0))
+    if profile.compatible_count > 0 and profile.incompatible_count >= profile.compatible_count:
+        compatibility_penalty += 2.0
+    if (
+        profile.recommended_compatible_count > 0
+        and profile.recommended_incompatible_count >= profile.recommended_compatible_count
+    ):
+        compatibility_penalty += 2.0
     size_uncertainty_penalty = (
         abs(profile.size_uncertainty)
         if profile.size_uncertainty is not None and abs(profile.size_uncertainty) >= 0.18
@@ -1584,13 +1721,23 @@ def _profile_why_choose(
         return "Manual override for exact settings."
     if recommended is profile:
         if profile.incompatible_count:
+            mkv_first = _mkv_first_guidance(
+                profile,
+                recommended_count=profile.recommended_compatible_count
+                + profile.recommended_incompatible_count,
+            )
             if highly_variable:
                 return (
-                    f"Fastest partial-batch option: {profile.compatible_count} file(s) can run now, "
+                    f"Partial-batch default only: {profile.compatible_count} file(s) can run now, "
                     f"{profile.incompatible_count} likely need follow-up, and output size is highly variable on similar files."
                 )
+            if mkv_first:
+                return (
+                    f"Partial-batch default only: {profile.compatible_count} file(s) can run now, "
+                    f"{profile.incompatible_count} likely need follow-up. {mkv_first}"
+                )
             return (
-                f"Fastest partial-batch option: {profile.compatible_count} file(s) can run now, "
+                f"Partial-batch default only: {profile.compatible_count} file(s) can run now, "
                 f"while {profile.incompatible_count} likely need follow-up."
             )
         if highly_variable:
@@ -2078,6 +2225,7 @@ def display_profiles_table(
     if not show_all_profiles:
         seen: set[tuple[object, ...]] = set()
         filtered: list[EncoderProfile] = []
+        dedupe_threshold = 1 if len(visible_profiles) <= 7 else 0
         for profile in visible_profiles:
             if profile.is_custom:
                 filtered.append(profile)
@@ -2087,7 +2235,8 @@ def display_profiles_table(
                 continue
             seen.add(key)
             filtered.append(profile)
-        visible_profiles = filtered
+        if len(visible_profiles) - len(filtered) > dedupe_threshold:
+            visible_profiles = filtered
 
     # Build sequential display indices 1..N so the table never has gaps.
     # display_index_map[display_idx] → profile (for prompt_profile_selection)
@@ -2276,6 +2425,12 @@ def display_profiles_table(
         console.print(
             f"  [dim]Recommended-only default scope: {recommended_count} file(s). Each profile also shows a recommended-only compatibility line.[/dim]"
         )
+        if recommended is not None and recommended.compatible_count * 2 <= max(
+            recommended_count, 1
+        ):
+            console.print(
+                "  [dim yellow]This default only covers half the recommended set or less, so treat it as a partial-batch starting point rather than a fully compatible batch plan.[/dim yellow]"
+            )
     console.print(
         "  [dim]Time and size numbers are approximate estimates for likely encode candidates, not already-skipped files.[/dim]"
     )
@@ -2299,12 +2454,15 @@ def display_profiles_table(
             f"  [dim]Lowest estimated wait: {fastest.name} (~{_fmt_duration(fastest.estimated_encode_seconds)}), working for {fastest.compatible_count} file(s).[/dim]"
         )
     if recommended is not None:
+        mkv_first = _mkv_first_guidance(recommended, recommended_count=recommended_count)
         if (
             recommended.why_choose.startswith("Fastest wait:")
             or "highly variable" in recommended.why_choose
-            or "partial-batch option" in recommended.why_choose
+            or "partial-batch" in recommended.why_choose
         ):
             console.print(f"  [dim]Default pick: {recommended.why_choose}[/dim]")
+            if mkv_first:
+                console.print(f"  [dim]Default workflow hint: {mkv_first}[/dim]")
         else:
             console.print(
                 f"  [dim]Default pick: {recommended.name} because it is estimated to work for {recommended.compatible_count} file(s) with {recommended.incompatible_count} likely left for follow-up.[/dim]"
@@ -2317,9 +2475,10 @@ def display_profiles_table(
         console.print(
             "  [dim]Compact view switches to denser profile summaries on smaller terminals.[/dim]"
         )
-    if not show_all_profiles and len(visible_profiles) < len(profiles):
+    hidden_rows = len(profiles) - len(visible_profiles)
+    if not show_all_profiles and hidden_rows >= 2:
         console.print(
-            f"  [dim]Hidden {len(profiles) - len(visible_profiles)} near-duplicate profile row(s). Use --show-all-profiles to inspect every profile.[/dim]"
+            f"  [dim]Hidden {hidden_rows} near-duplicate profile row(s). Use --show-all-profiles to inspect every profile.[/dim]"
         )
     console.print()
     return visible_profiles, display_index_map
@@ -3026,7 +3185,8 @@ def run_wizard(
     debug_session_log: bool = False,
 ) -> tuple[list[EncodeJob], str, bool, Path | None]:
     """Run the interactive wizard and return (jobs, action, cleanup_after, followup_manifest_path)."""
-    global _ACTIVE_WIZARD_SESSION
+    global _ACTIVE_WIZARD_SESSION, _LAST_WIZARD_REPORT_CONTEXT
+    _LAST_WIZARD_REPORT_CONTEXT = None
     requested_non_interactive = auto or non_interactive_wizard
     session = WizardSessionState(
         console=console,
@@ -3065,6 +3225,19 @@ def run_wizard(
             analysis_items,
             policy=duplicate_policy,
         )
+        early_notes = list(duplicate_notes)
+        container_risk_count, container_risk_reasons, container_risk_examples = (
+            summarize_container_risks(
+                analysis_items,
+                ffprobe,
+            )
+        )
+        if container_risk_count:
+            early_notes.append(
+                "Early compatibility warning: "
+                f"{container_risk_count} likely encode candidate(s) may need MKV output because of copied-stream or container constraints"
+                + (f" ({', '.join(container_risk_examples)})" if container_risk_examples else "")
+            )
         initial_confidence = estimate_analysis_confidence(analysis_items)
         display_analysis_summary(
             analysis_items,
@@ -3090,7 +3263,7 @@ def run_wizard(
                 benchmarked_files=0,
                 use_calibration=use_calibration,
             ),
-            notes=duplicate_notes,
+            notes=early_notes,
             plain_output=plain_output or requested_non_interactive,
         )
 
@@ -3109,20 +3282,30 @@ def run_wizard(
         )
         if mkv_candidate_count and output_dir is None:
             console.print(
-                f"[bold yellow]MKV follow-up warning:[/bold yellow] {mkv_candidate_count} likely encode candidate(s) contain streams better suited to MKV sidecar output."
+                f"[bold yellow]MKV-first warning:[/bold yellow] {mkv_candidate_count} likely encode candidate(s) contain streams better suited to MKV sidecar output."
             )
             console.print(
                 f"  [dim]{_format_grouped_reason_list(mkv_grouped_reasons)}[/dim]"
                 + (f" [dim](examples: {', '.join(mkv_examples)})[/dim]" if mkv_examples else "")
             )
             console.print(
-                "  [dim]If needed, the wizard can switch incompatible files into a MKV follow-up folder instead of leaving them only in a manifest.[/dim]"
+                "  [dim]Container/copied-stream issues look like the main blocker here. The wizard can switch incompatible files into MKV sidecar output instead of leaving them only in a manifest.[/dim]"
             )
             session.add_event(
                 f"Early MKV warning: {mkv_candidate_count} candidate(s) likely need MKV sidecar output"
             )
+        trust_line = _calibration_trust_line(load_calibration_store() if use_calibration else None)
+        if trust_line:
+            console.print(f"[dim]{trust_line}[/dim]")
         sample_pool = recommended_items or maybe_items or analysis_items
-        sample_item = max(sample_pool, key=lambda item: item.size_bytes)
+        representative_pool = select_representative_items(sample_pool, limit=3) or sample_pool
+        sample_item = max(
+            representative_pool,
+            key=lambda item: (
+                item.duration_seconds if item.duration_seconds > 0 else 0.0,
+                item.size_bytes,
+            ),
+        )
         sample_file = sample_item.source
         available_hw = detect_available_encoders(
             ffmpeg, console, sample_file=sample_file, ffprobe=ffprobe
@@ -3386,6 +3569,7 @@ def run_wizard(
                 session.add_event(f"Selected run scope: {selected_scope_label}")
 
             followup_count = 0  # files moved to follow-up manifest due to incompatibility
+            mkv_sidecar_count = 0
             jobs = build_jobs(
                 files=[item.source for item in selected_items],
                 output_dir=output_dir,
@@ -3569,6 +3753,7 @@ def run_wizard(
                         mkv_sources = {job.source for job in mkv_compatible_jobs}
                         if mkv_compatible_jobs:
                             mkv_switched_jobs = mkv_compatible_jobs
+                            mkv_sidecar_count = len(mkv_switched_jobs)
                             retained_jobs.extend(mkv_compatible_jobs)
                             remaining_incompatible_items = [
                                 item
@@ -3638,32 +3823,26 @@ def run_wizard(
                         )
                     )
                     compatibility_prediction_note = (
-                        f"Predicted compatibility for this selection: {predicted_compatible} compatible / "
-                        f"{predicted_incompatible} likely follow-up; preflight confirmed {len(compatible_jobs)} in-place compatible"
-                        + (
-                            f", {len(mkv_switched_jobs)} switched to MKV"
-                            if mkv_switched_jobs
-                            else ""
+                        "Predicted compatibility for this selection: "
+                        f"{predicted_compatible} compatible / {predicted_incompatible} likely follow-up; "
+                        + _compact_split_summary(
+                            len(originally_selected_items),
+                            len(compatible_jobs),
+                            len(mkv_switched_jobs),
+                            len(remaining_incompatible_items),
                         )
-                        + (
-                            f", {len(remaining_incompatible_items)} moved to follow-up."
-                            if remaining_incompatible_items
-                            else "."
-                        )
+                        + "."
                     )
                 else:
                     compatibility_prediction_note = (
-                        f"Preflight confirmed {len(compatible_jobs)} in-place compatible"
-                        + (
-                            f", {len(mkv_switched_jobs)} switched to MKV"
-                            if mkv_switched_jobs
-                            else ""
+                        "Preflight confirmed "
+                        + _compact_split_summary(
+                            len(originally_selected_items),
+                            len(compatible_jobs),
+                            len(mkv_switched_jobs),
+                            len(remaining_incompatible_items),
                         )
-                        + (
-                            f", {len(remaining_incompatible_items)} moved to follow-up."
-                            if remaining_incompatible_items
-                            else "."
-                        )
+                        + "."
                     )
                 console.print(
                     f"[yellow]{len(compatible_jobs)} file(s) can run now with {display_label}. "
@@ -3829,6 +4008,14 @@ def run_wizard(
             preset=preset,
             use_calibration=use_calibration,
             benchmarked_files=1,
+            sidecar_count=mkv_sidecar_count,
+            followup_count=followup_count,
+        )
+        time_confidence_scope_note = describe_time_confidence_scope_adjustment(
+            selected_items,
+            original_items=candidate_items,
+            sidecar_count=mkv_sidecar_count,
+            followup_count=followup_count,
         )
         console.print(f"  Input:    {_fmt_size(selected_input_bytes)}")
         maybe_left_out = max(
@@ -3881,6 +4068,8 @@ def run_wizard(
                 )
         console.print(f"  Size confidence: {size_confidence_label}")
         console.print(f"  Time confidence: {time_confidence_label}")
+        if time_confidence_scope_note:
+            console.print(f"  [dim]Time confidence note: {time_confidence_scope_note}.[/dim]")
         if preset in _HW_ENCODERS:
             console.print(
                 "  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]"
@@ -3899,6 +4088,9 @@ def run_wizard(
         subtitle_warning = _subtitle_drop_warning(to_encode, ffprobe)
         if subtitle_warning:
             console.print(f"  [yellow]{subtitle_warning}[/yellow]")
+        queue_hint = _queue_strategy_recommendation(selected_items)
+        if queue_hint:
+            console.print(f"  [dim]Queue hint: {queue_hint}[/dim]")
         console.print("  [dim]Estimates are approximate.[/dim]")
         console.print(
             "  [dim]Safe to stop with Ctrl+C: completed files stay done, the current temp output is discarded, and you can resume unfinished files later.[/dim]"
@@ -3915,6 +4107,8 @@ def run_wizard(
             console.print(
                 f"[dim]Cleanup decision:[/dim] {'Delete originals after success' if cleanup_after else 'Keep originals'}"
             )
+        for cleanup_line in _cleanup_expectation_lines(to_encode, cleanup_after=cleanup_after):
+            console.print(f"  [dim]{cleanup_line}[/dim]")
         console.print()
 
         if not active_auto:
@@ -3932,6 +4126,23 @@ def run_wizard(
             if followup_manifest_path
             else "No follow-up manifest written"
         )
+        _LAST_WIZARD_REPORT_CONTEXT = {
+            "estimate_context": {
+                "initial_scope": "recommended default scope",
+                "initial_estimated_seconds": selected_profile.estimated_encode_seconds
+                if selected_profile is not None and selected_profile.estimated_encode_seconds > 0
+                else None,
+                "selected_scope_label": selected_scope_label,
+                "selected_estimated_seconds": estimated_total_encode_seconds,
+            },
+            "container_fallback_actions": {
+                "mkv_sidecar_outputs": mkv_sidecar_count,
+                "followup_manifest": str(followup_manifest_path)
+                if followup_manifest_path is not None
+                else None,
+                "followup_count": followup_count,
+            },
+        }
         return jobs, "encode", cleanup_after, followup_manifest_path
     finally:
         debug_path = _write_debug_session_log()

@@ -163,3 +163,36 @@ def test_calibration_summary_counts_rejected_outputs(tmp_path: Path) -> None:
     assert summary["records"] == 1
     assert summary["accepted_records"] == 0
     assert summary["rejected_records"] == 1
+
+
+def test_calibration_summary_exposes_family_mix_and_bias(tmp_path: Path) -> None:
+    store_path = tmp_path / "calibration.json"
+    append_success_record(
+        CalibrationRecord(
+            codec="h264",
+            container=".mkv",
+            resolution_bucket="1080p",
+            bitrate_bucket="high",
+            preset="fast",
+            preset_family="software",
+            crf=20,
+            input_bytes=1_000_000,
+            output_bytes=300_000,
+            duration_seconds=100.0,
+            wall_seconds=140.0,
+            effective_speed=0.7,
+            fallback_used=False,
+            retry_used=False,
+            predicted_output_ratio=0.5,
+            predicted_speed=1.0,
+        ),
+        path=store_path,
+    )
+
+    summary = summarize_calibration_store(load_calibration_store(store_path))
+
+    assert summary["family_container_summary_text"] is not None
+    bias_summary = summary["bias_summary"]
+    assert isinstance(bias_summary, dict)
+    assert "smaller than estimated" in str(bias_summary.get("summary"))
+    assert "slower than estimated" in str(bias_summary.get("summary"))

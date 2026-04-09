@@ -10,12 +10,15 @@ from rich.table import Table
 from mediashrink.calibration import (
     bitrate_bucket,
     describe_calibration_estimate,
+    format_family_container_summary,
     load_calibration_store,
     lookup_estimate,
     resolution_bucket,
+    summarize_calibration_store,
 )
 from mediashrink.encoder import (
     _HW_ENCODERS,
+    describe_output_container_constraints,
     estimate_output_size,
     get_duration_seconds,
     get_video_bitrate_kbps,
@@ -86,6 +89,83 @@ def _average_size_error_for_items(
     if not errors:
         return None
     return sum(errors) / len(errors)
+
+
+def _candidate_items(items: list[AnalysisItem]) -> list[AnalysisItem]:
+    return [item for item in items if item.recommendation != "skip"]
+
+
+def _selected_batch_complexity_notes(
+    items: list[AnalysisItem],
+    *,
+    original_items: list[AnalysisItem] | None = None,
+    sidecar_count: int = 0,
+    followup_count: int = 0,
+) -> list[str]:
+    candidates = _candidate_items(items)
+    if not candidates:
+        return []
+    notes: list[str] = []
+    codec_count = len({item.codec or "unknown" for item in candidates})
+    container_count = len({item.source.suffix.lower() or ".mkv" for item in candidates})
+    if codec_count >= 2:
+        notes.append(f"{codec_count} codec groups")
+    if container_count >= 2:
+        notes.append(f"{container_count} containers")
+    if sidecar_count > 0:
+        notes.append(f"{sidecar_count} MKV sidecar output{'s' if sidecar_count != 1 else ''}")
+    if followup_count > 0:
+        notes.append(f"{followup_count} follow-up split{'s' if followup_count != 1 else ''}")
+    if original_items is not None and len(candidates) < len(_candidate_items(original_items)):
+        notes.append("selected scope differs from the original recommendation set")
+    return notes
+
+
+def adjust_time_confidence_for_scope(
+    label: str,
+    items: list[AnalysisItem],
+    *,
+    original_items: list[AnalysisItem] | None = None,
+    sidecar_count: int = 0,
+    followup_count: int = 0,
+) -> str:
+    notes = _selected_batch_complexity_notes(
+        items,
+        original_items=original_items,
+        sidecar_count=sidecar_count,
+        followup_count=followup_count,
+    )
+    if not notes:
+        return label
+    lowered = set(notes)
+    downgrade = False
+    if any("codec groups" in note for note in lowered):
+        downgrade = True
+    if any("containers" in note for note in lowered):
+        downgrade = True
+    if sidecar_count > 0 or followup_count > 0:
+        downgrade = True
+    if downgrade and label == "High":
+        return "Medium"
+    return label
+
+
+def describe_time_confidence_scope_adjustment(
+    items: list[AnalysisItem],
+    *,
+    original_items: list[AnalysisItem] | None = None,
+    sidecar_count: int = 0,
+    followup_count: int = 0,
+) -> str | None:
+    notes = _selected_batch_complexity_notes(
+        items,
+        original_items=original_items,
+        sidecar_count=sidecar_count,
+        followup_count=followup_count,
+    )
+    if not notes:
+        return None
+    return "reduced by " + ", ".join(notes)
 
 
 def build_analysis_item(
@@ -508,7 +588,7 @@ def estimate_size_confidence(
     use_calibration: bool = True,
     calibration_store: dict[str, object] | None = None,
 ) -> str:
-    candidates = [item for item in items if item.recommendation != "skip"]
+    candidates = _candidate_items(items)
     if not candidates:
         return "Low"
     known_estimates = sum(1 for item in candidates if item.estimated_output_bytes > 0)
@@ -577,7 +657,7 @@ def estimate_time_confidence(
     calibration_store: dict[str, object] | None = None,
 ) -> str:
     base = estimate_analysis_confidence(items, benchmarked_files=benchmarked_files)
-    candidates = [item for item in items if item.recommendation != "skip"]
+    candidates = _candidate_items(items)
     if not candidates:
         return "Low"
     active_store = calibration_store if calibration_store is not None else load_calibration_store()
@@ -641,7 +721,7 @@ def describe_size_confidence(
     use_calibration: bool = True,
     calibration_store: dict[str, object] | None = None,
 ) -> str:
-    candidates = [item for item in items if item.recommendation != "skip"]
+    candidates = _candidate_items(items)
     if not candidates:
         return "no encodable files"
     known_estimates = sum(1 for item in candidates if item.estimated_output_bytes > 0)
@@ -655,6 +735,12 @@ def describe_size_confidence(
     detail = f"{known_estimates}/{len(candidates)} output size estimates available"
     if calibration_note:
         detail += f"; local history: {calibration_note}"
+    summary = summarize_calibration_store(active_store if use_calibration else None)
+    family_summary = format_family_container_summary(
+        summary.get("family_container_summaries") if isinstance(summary, dict) else None
+    )
+    if family_summary:
+        detail += f"; history mix: {family_summary}"
     return detail
 
 
@@ -668,7 +754,7 @@ def describe_time_confidence(
 ) -> str:
     detail = describe_estimate_confidence(items, benchmarked_files=benchmarked_files)
     active_store = calibration_store if calibration_store is not None else load_calibration_store()
-    candidates = [item for item in items if item.recommendation != "skip"]
+    candidates = _candidate_items(items)
     speed_notes = 0
     for item in candidates[:5]:
         estimate = lookup_estimate(
@@ -685,33 +771,97 @@ def describe_time_confidence(
         detail += (
             f"; local speed matches for {speed_notes}/{min(len(candidates), 5)} sample file(s)"
         )
+    summary = summarize_calibration_store(active_store if use_calibration else None)
+    if isinstance(summary, dict):
+        family_summary = format_family_container_summary(summary.get("family_container_summaries"))
+        if family_summary:
+            detail += f"; history mix: {family_summary}"
+        bias_summary = summary.get("bias_summary")
+        if isinstance(bias_summary, dict) and isinstance(bias_summary.get("summary"), str):
+            detail += f"; {bias_summary['summary']}"
     return detail
 
 
 def select_representative_items(items: list[AnalysisItem], limit: int = 3) -> list[AnalysisItem]:
     if limit <= 0 or not items:
         return []
-
-    remaining = sorted(items, key=lambda item: item.size_bytes, reverse=True)
+    remaining = sorted(
+        items,
+        key=lambda item: (
+            item.duration_seconds if item.duration_seconds > 0 else item.size_bytes / max(_GB, 1),
+            item.size_bytes,
+        ),
+        reverse=True,
+    )
     selected: list[AnalysisItem] = []
+    seen_clusters: set[tuple[str, str, str]] = set()
 
-    def take_first(predicate: Callable[[AnalysisItem], bool]) -> None:
+    def cluster_key(item: AnalysisItem) -> tuple[str, str, str]:
+        container = item.source.suffix.lower() or ".mkv"
+        risk = "mkv-risk" if container in {".mp4", ".m4v"} else "normal"
+        if (item.codec or "") in {"vc1", "mpeg2video"}:
+            risk = "legacy"
+        return (item.codec or "unknown", container, risk)
+
+    priority_selectors = (
+        lambda item: (item.codec or "") in {"vc1", "mpeg2video"},
+        lambda item: (item.codec or "") == "h264",
+        lambda item: item.recommendation == "maybe",
+    )
+    for selector in priority_selectors:
         for item in remaining:
-            if predicate(item) and item not in selected:
+            if selector(item) and item not in selected:
                 selected.append(item)
-                return
+                seen_clusters.add(cluster_key(item))
+                break
+        if len(selected) >= limit:
+            return selected[:limit]
 
-    take_first(lambda item: (item.codec or "") in {"vc1", "mpeg2video"})
-    take_first(lambda item: (item.codec or "") == "h264")
-    take_first(lambda item: item.recommendation == "maybe")
+    for item in remaining:
+        key = cluster_key(item)
+        if key in seen_clusters:
+            continue
+        seen_clusters.add(key)
+        selected.append(item)
+        if len(selected) >= limit:
+            return selected
 
     for item in remaining:
         if item not in selected:
             selected.append(item)
         if len(selected) >= limit:
             break
-
     return selected[:limit]
+
+
+def summarize_container_risks(
+    items: list[AnalysisItem],
+    ffprobe: Path,
+    *,
+    limit: int = 4,
+) -> tuple[int, dict[str, int], list[str]]:
+    risky: list[tuple[AnalysisItem, list[str]]] = []
+    for item in _candidate_items(items):
+        constraints = describe_output_container_constraints(item.source, item.source, ffprobe)
+        relevant = [
+            constraint
+            for constraint in constraints
+            if "mp4" in constraint.lower()
+            or "subtitle" in constraint.lower()
+            or "audio codec" in constraint.lower()
+            or "attachment" in constraint.lower()
+            or "data stream" in constraint.lower()
+        ]
+        if relevant:
+            risky.append((item, relevant))
+    grouped: dict[str, int] = {}
+    examples: list[str] = []
+    for item, reasons in risky[:limit]:
+        if len(examples) < 3:
+            examples.append(item.source.name)
+        for reason in reasons:
+            grouped[reason] = grouped.get(reason, 0) + 1
+    return len(risky), grouped, examples
 
 
 def save_manifest(manifest: AnalysisManifest, path: Path) -> None:

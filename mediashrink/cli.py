@@ -37,6 +37,7 @@ from mediashrink.calibration import (
     append_success_record,
     bitrate_bucket,
     estimate_failure_rate,
+    format_family_container_summary,
     get_calibration_path,
     load_calibration_store,
     lookup_estimate,
@@ -131,7 +132,7 @@ _POLICY_CHOICES = {
 }
 _FAILURE_POLICY_CHOICES = {"skip", "retry", "stop"}
 _RETRY_MODE_CHOICES = {"conservative", "balanced", "aggressive"}
-_QUEUE_STRATEGY_CHOICES = {"original", "safe-first"}
+_QUEUE_STRATEGY_CHOICES = {"original", "safe-first", "largest-first"}
 _DUPLICATE_POLICY_CHOICES = set(duplicate_policy_choices())
 
 
@@ -210,6 +211,14 @@ def _validate_duplicate_policy(value: str) -> str:
     if value not in _DUPLICATE_POLICY_CHOICES:
         raise typer.BadParameter(f"invalid duplicate policy '{value}'")
     return value
+
+
+def _validate_require_net_savings(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if value < 0 or value >= 100:
+        raise typer.BadParameter("--require-net-savings must be between 0 and less than 100")
+    return float(value)
 
 
 def _resolve_runtime_settings(
@@ -712,6 +721,13 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
         guidance.append(
             "At least one encode was blocked by the output safety check; prefer a software preset or higher CRF for those files."
         )
+    if (
+        isinstance(estimate_miss, str)
+        and "rejected because net savings stayed below" in estimate_miss
+    ):
+        guidance.append(
+            "At least one encode missed the required net-savings threshold; raise CRF or use a slower software preset for those files."
+        )
     followup_manifest = payload.get("split_followup_manifest")
     if isinstance(followup_manifest, str) and followup_manifest:
         guidance.append(f"Review the follow-up manifest for left-out files: {followup_manifest}")
@@ -726,7 +742,10 @@ def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
     accepted_output = result.success and output_passes_safety_check(
         result.input_size_bytes, result.output_size_bytes
     )
-    if not result.success and not result.output_failed_safety_check:
+    accepted_output = accepted_output and not result.output_failed_acceptance_check
+    if not result.success and not (
+        result.output_failed_safety_check or result.output_failed_acceptance_check
+    ):
         return
     width, height = get_video_resolution(result.job.source, ffprobe)
     bitrate_kbps = get_video_bitrate_kbps(result.job.source, ffprobe)
@@ -791,6 +810,41 @@ def _record_failure_calibration(result: EncodeResult) -> None:
     )
 
 
+def _apply_net_savings_policy(
+    result: EncodeResult,
+    *,
+    require_net_savings_pct: float | None,
+) -> EncodeResult:
+    if (
+        require_net_savings_pct is None
+        or result.skipped
+        or not result.success
+        or result.input_size_bytes <= 0
+    ):
+        return result
+    if result.size_reduction_pct + 1e-9 >= require_net_savings_pct:
+        return result
+    return EncodeResult(
+        job=result.job,
+        skipped=False,
+        skip_reason=None,
+        success=False,
+        input_size_bytes=result.input_size_bytes,
+        output_size_bytes=result.output_size_bytes,
+        duration_seconds=result.duration_seconds,
+        error_message=(
+            "Output acceptance check: "
+            f"net savings {result.size_reduction_pct:.1f}% was below the required "
+            f"{require_net_savings_pct:.1f}%."
+        ),
+        raw_error_message=result.raw_error_message,
+        media_duration_seconds=result.media_duration_seconds,
+        fallback_used=result.fallback_used,
+        retry_kind=result.retry_kind,
+        attempts=list(result.attempts),
+    )
+
+
 def _job_risk_score(job: EncodeJob) -> tuple[int, int]:
     container_risk = 1 if job.output.suffix.lower() in {".mp4", ".m4v"} else 0
     encoder_risk = 1 if is_hardware_preset(job.preset) else 0
@@ -798,19 +852,31 @@ def _job_risk_score(job: EncodeJob) -> tuple[int, int]:
 
 
 def _prioritize_jobs(jobs: list[EncodeJob], queue_strategy: str) -> list[EncodeJob]:
-    if queue_strategy != "safe-first":
+    if queue_strategy == "original":
         return jobs
     skipped = [job for job in jobs if job.skip]
     active = [job for job in jobs if not job.skip]
-    active.sort(
-        key=lambda job: (
-            _job_risk_score(job),
-            job.estimated_output_bytes
-            if job.estimated_output_bytes > 0
-            else job.source.stat().st_size,
-            job.source.name.lower(),
+    if queue_strategy == "largest-first":
+        active.sort(
+            key=lambda job: (
+                -(
+                    job.estimated_output_bytes
+                    if job.estimated_output_bytes > 0
+                    else job.source.stat().st_size
+                ),
+                job.source.name.lower(),
+            )
         )
-    )
+    else:
+        active.sort(
+            key=lambda job: (
+                _job_risk_score(job),
+                job.estimated_output_bytes
+                if job.estimated_output_bytes > 0
+                else job.source.stat().st_size,
+                job.source.name.lower(),
+            )
+        )
     return skipped + active
 
 
@@ -839,12 +905,20 @@ def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
 def _estimate_miss_summary(results: list[EncodeResult]) -> str | None:
     successful = [result for result in results if result.success and not result.skipped]
     oversized_rejections = [result for result in results if result.output_failed_safety_check]
+    acceptance_rejections = [result for result in results if result.output_failed_acceptance_check]
     if oversized_rejections:
         names = ", ".join(result.job.source.name for result in oversized_rejections[:3])
         suffix = "..." if len(oversized_rejections) > 3 else ""
         return (
             f"{len(oversized_rejections)} file(s) were rejected because encoded output grew larger "
             f"than the source ({names}{suffix})."
+        )
+    if acceptance_rejections:
+        names = ", ".join(result.job.source.name for result in acceptance_rejections[:3])
+        suffix = "..." if len(acceptance_rejections) > 3 else ""
+        return (
+            f"{len(acceptance_rejections)} file(s) were rejected because net savings stayed below "
+            f"the configured threshold ({names}{suffix})."
         )
     estimated_inputs = [
         result.job.estimated_output_bytes
@@ -913,6 +987,9 @@ def _write_batch_reports(
     time_confidence: str | None = None,
     split_followup_manifest: Path | None = None,
     estimate_miss_summary: str | None = None,
+    estimate_context: dict[str, object] | None = None,
+    container_fallback_actions: dict[str, object] | None = None,
+    require_net_savings_pct: float | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -981,6 +1058,9 @@ def _write_batch_reports(
             str(split_followup_manifest) if split_followup_manifest is not None else None
         ),
         "estimate_miss_summary": estimate_miss_summary,
+        "estimate_context": estimate_context,
+        "container_fallback_actions": container_fallback_actions,
+        "require_net_savings_pct": require_net_savings_pct,
         "grouped_incompatibilities": grouped_incompatibilities,
         "files": files,
     }
@@ -1015,6 +1095,11 @@ def _write_batch_reports(
             if split_followup_manifest is not None
             else "Split follow-up manifest: -"
         ),
+        (
+            f"Required net savings: {require_net_savings_pct:.1f}%"
+            if require_net_savings_pct is not None
+            else "Required net savings: -"
+        ),
         f"Started: {started_at}",
         f"Finished: {finished_at}",
         "",
@@ -1048,6 +1133,39 @@ def _write_batch_reports(
                 else ""
             )
             lines.append(f"  - {entry['count']}: {entry['reason']}{example_text}")
+    if estimate_context:
+        lines.extend(["", "Estimate context"])
+        initial_scope = estimate_context.get("initial_scope")
+        initial_seconds = estimate_context.get("initial_estimated_seconds")
+        selected_scope = estimate_context.get("selected_scope_label")
+        selected_seconds = estimate_context.get("selected_estimated_seconds")
+        if initial_scope is not None:
+            lines.append(
+                f"  - Initial planner scope: {initial_scope}"
+                + (
+                    f" (~{int(float(initial_seconds) // 60)}m)"
+                    if isinstance(initial_seconds, (int, float)) and initial_seconds > 0
+                    else ""
+                )
+            )
+        if selected_scope is not None:
+            lines.append(
+                f"  - Selected scope: {selected_scope}"
+                + (
+                    f" (~{int(float(selected_seconds) // 60)}m)"
+                    if isinstance(selected_seconds, (int, float)) and selected_seconds > 0
+                    else ""
+                )
+            )
+    if container_fallback_actions:
+        lines.extend(["", "Container fallback actions"])
+        mkv_sidecars = int(container_fallback_actions.get("mkv_sidecar_outputs", 0) or 0)
+        followup_count = int(container_fallback_actions.get("followup_count", 0) or 0)
+        followup_manifest = container_fallback_actions.get("followup_manifest")
+        lines.append(f"  - MKV sidecar outputs: {mkv_sidecars}")
+        lines.append(f"  - Follow-up files: {followup_count}")
+        if followup_manifest:
+            lines.append(f"  - Follow-up manifest: {followup_manifest}")
     lines.extend(["", "Files"])
     for result in results:
         status = _classify_result_status(result).upper()
@@ -1327,6 +1445,7 @@ def _run_encode_loop(
     on_file_failure: str = "retry",
     use_calibration: bool = True,
     retry_mode: str = "balanced",
+    require_net_savings_pct: float | None = None,
 ) -> list[EncodeResult]:
     if stall_warning_seconds is None:
         stall_warning_seconds = STALL_WARNING_SECONDS
@@ -1638,6 +1757,10 @@ def _run_encode_loop(
                     )
                 raise typer.Exit(code=EXIT_USER_CANCELLED)
 
+            result = _apply_net_savings_policy(
+                result,
+                require_net_savings_pct=require_net_savings_pct,
+            )
             results.append(result)
             stall_stop.set()
             if stall_thread is not None:
@@ -1647,7 +1770,7 @@ def _run_encode_loop(
                 if result.success and not result.skipped:
                     _record_success_calibration(result, ffprobe)
                 elif not result.success and not result.skipped:
-                    if result.output_failed_safety_check:
+                    if result.output_failed_safety_check or result.output_failed_acceptance_check:
                         _record_success_calibration(result, ffprobe)
                     _record_failure_calibration(result)
 
@@ -2087,7 +2210,14 @@ def encode_cmd(
     queue_strategy: str = typer.Option(
         "original",
         "--queue-strategy",
-        help="Batch order: original or safe-first.",
+        help="Batch order: original, safe-first, or largest-first.",
+    ),
+    require_net_savings: Optional[float] = typer.Option(
+        None,
+        "--require-net-savings",
+        min=0.0,
+        max=99.9,
+        help="Reject otherwise successful outputs unless they save at least this percentage versus the source.",
     ),
     overnight: bool = typer.Option(
         False,
@@ -2120,6 +2250,7 @@ def encode_cmd(
     policy = str(runtime["policy"])
     retry_mode = str(runtime["retry_mode"])
     queue_strategy = str(runtime["queue_strategy"])
+    require_net_savings = _validate_require_net_savings(require_net_savings)
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
@@ -2296,6 +2427,7 @@ def encode_cmd(
                 on_file_failure=on_file_failure,
                 use_calibration=use_calibration,
                 retry_mode=retry_mode,
+                require_net_savings_pct=require_net_savings,
             )
         )
     cleaned_paths: list[Path] = []
@@ -2329,6 +2461,7 @@ def encode_cmd(
             queue_strategy=queue_strategy,
             split_followup_manifest=split_followup_manifest,
             estimate_miss_summary=_estimate_miss_summary(results),
+            require_net_savings_pct=require_net_savings,
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -2588,7 +2721,14 @@ def apply(
     queue_strategy: str = typer.Option(
         "original",
         "--queue-strategy",
-        help="Batch order: original or safe-first.",
+        help="Batch order: original, safe-first, or largest-first.",
+    ),
+    require_net_savings: Optional[float] = typer.Option(
+        None,
+        "--require-net-savings",
+        min=0.0,
+        max=99.9,
+        help="Reject otherwise successful outputs unless they save at least this percentage versus the source.",
     ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
@@ -2600,6 +2740,7 @@ def apply(
     display = EncodingDisplay(console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     started_at = _now_iso()
+    require_net_savings = _validate_require_net_savings(require_net_savings)
     loaded_manifest = load_manifest(manifest)
 
     effective_crf = loaded_manifest.crf
@@ -2708,6 +2849,7 @@ def apply(
                 on_file_failure=_validate_failure_policy(on_file_failure),
                 use_calibration=use_calibration,
                 retry_mode=_validate_retry_mode(retry_mode),
+                require_net_savings_pct=require_net_savings,
             )
         )
     cleaned_paths: list[Path] = []
@@ -2739,6 +2881,7 @@ def apply(
         queue_strategy=_validate_queue_strategy(queue_strategy),
         split_followup_manifest=split_followup_manifest,
         estimate_miss_summary=_estimate_miss_summary(results),
+        require_net_savings_pct=require_net_savings,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
@@ -2837,14 +2980,22 @@ def wizard(
         min=1,
         help="Warn if FFmpeg produces no progress update for this many seconds.",
     ),
+    require_net_savings: Optional[float] = typer.Option(
+        None,
+        "--require-net-savings",
+        min=0.0,
+        max=99.9,
+        help="Reject otherwise successful outputs unless they save at least this percentage versus the source.",
+    ),
 ) -> None:
     """Interactively detect hardware, choose settings, and optionally save a profile."""
-    from mediashrink.wizard import run_wizard
+    from mediashrink.wizard import consume_last_wizard_report_context, run_wizard
 
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     quiet_console = Console(quiet=True) if json_output else console
     display = EncodingDisplay(quiet_console)
     started_at = _now_iso()
+    require_net_savings = _validate_require_net_savings(require_net_savings)
 
     jobs, action, wizard_cleanup, followup_manifest_path = run_wizard(
         directory=directory,
@@ -2865,6 +3016,7 @@ def wizard(
         non_interactive_wizard=non_interactive_wizard,
         debug_session_log=debug_session_log,
     )
+    wizard_report_context = consume_last_wizard_report_context()
 
     if action == "cancel":
         if not json_output:
@@ -2894,6 +3046,7 @@ def wizard(
             stall_warning_seconds=float(stall_warning_seconds),
             on_file_failure=on_file_failure,
             use_calibration=use_calibration,
+            require_net_savings_pct=require_net_savings,
         )
     )
     followup_report_notes: list[str] = []
@@ -3000,6 +3153,7 @@ def wizard(
                                 stall_warning_seconds=float(stall_warning_seconds),
                                 on_file_failure=on_file_failure,
                                 use_calibration=use_calibration,
+                                require_net_savings_pct=require_net_savings,
                             )
                         )
                         results = results + followup_results
@@ -3032,6 +3186,17 @@ def wizard(
         policy=policy,
         on_file_failure=on_file_failure,
         estimate_miss_summary=_estimate_miss_summary(results),
+        estimate_context=(
+            wizard_report_context.get("estimate_context")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+        container_fallback_actions=(
+            wizard_report_context.get("container_fallback_actions")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+        require_net_savings_pct=require_net_savings,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -3105,7 +3270,14 @@ def resume(
     queue_strategy: str = typer.Option(
         "original",
         "--queue-strategy",
-        help="Batch order: original or safe-first.",
+        help="Batch order: original, safe-first, or largest-first.",
+    ),
+    require_net_savings: Optional[float] = typer.Option(
+        None,
+        "--require-net-savings",
+        min=0.0,
+        max=99.9,
+        help="Reject otherwise successful outputs unless they save at least this percentage versus the source.",
     ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
@@ -3118,6 +3290,7 @@ def resume(
     display = EncodingDisplay(quiet_console)
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     started_at = _now_iso()
+    require_net_savings = _validate_require_net_savings(require_net_savings)
 
     session_path = get_session_path(directory, output_dir)
     session = load_session(session_path)
@@ -3241,6 +3414,7 @@ def resume(
                 on_file_failure=_validate_failure_policy(on_file_failure),
                 use_calibration=use_calibration,
                 retry_mode=_validate_retry_mode(retry_mode),
+                require_net_savings_pct=require_net_savings,
             )
         )
     cleaned_paths: list[Path] = []
@@ -3273,6 +3447,7 @@ def resume(
         estimate_miss_summary=_estimate_miss_summary(results),
         retry_mode=_validate_retry_mode(retry_mode),
         queue_strategy=_validate_queue_strategy(queue_strategy),
+        require_net_savings_pct=require_net_savings,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -3340,7 +3515,14 @@ def overnight(
     queue_strategy: str = typer.Option(
         "safe-first",
         "--queue-strategy",
-        help="Batch order: original or safe-first.",
+        help="Batch order: original, safe-first, or largest-first.",
+    ),
+    require_net_savings: Optional[float] = typer.Option(
+        None,
+        "--require-net-savings",
+        min=0.0,
+        max=99.9,
+        help="Reject otherwise successful outputs unless they save at least this percentage versus the source.",
     ),
     stall_warning_seconds: int = typer.Option(
         int(STALL_WARNING_SECONDS),
@@ -3353,6 +3535,7 @@ def overnight(
     started_at = _now_iso()
     display = EncodingDisplay(console)
     policy = _validate_policy(policy)
+    require_net_savings = _validate_require_net_savings(require_net_savings)
     jobs, effective_preset, effective_crf = _prepare_overnight_jobs(
         directory=directory,
         recursive=recursive,
@@ -3470,6 +3653,7 @@ def overnight(
                 on_file_failure="skip",
                 use_calibration=use_calibration,
                 retry_mode=retry_mode,
+                require_net_savings_pct=require_net_savings,
             )
         )
     else:
@@ -3500,6 +3684,7 @@ def overnight(
         queue_strategy=queue_strategy,
         split_followup_manifest=split_followup_manifest,
         estimate_miss_summary=_estimate_miss_summary(results),
+        require_net_savings_pct=require_net_savings,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
     if stopped_early or any(not r.success and not r.skipped for r in results):
@@ -3619,6 +3804,26 @@ def calibration_summary(
                 f"avg speed {_fmt_speed(entry.get('avg_speed'))}",
                 highlight=False,
             )
+
+    family_summary = format_family_container_summary(summary.get("family_container_summaries"))
+    if family_summary:
+        console.print(f"[bold]History mix[/bold]\n  - {family_summary}", highlight=False)
+
+    bias_summary = summary.get("bias_summary")
+    if isinstance(bias_summary, dict) and isinstance(bias_summary.get("summary"), str):
+        console.print(
+            f"[bold]Recent bias[/bold]\n  - {bias_summary['summary']}"
+            f" ({bias_summary.get('samples', 0)} recent accepted sample(s))",
+            highlight=False,
+        )
+
+    rejection_reasons = summary.get("rejection_reasons")
+    if isinstance(rejection_reasons, list) and rejection_reasons:
+        console.print("[bold]Rejected outputs[/bold]")
+        for entry in rejection_reasons[:5]:
+            if not isinstance(entry, dict):
+                continue
+            console.print(f"  - {entry['count']}: {entry['reason']}", highlight=False)
 
     recent_records = payload.get("recent_records")
     if isinstance(recent_records, list) and recent_records:

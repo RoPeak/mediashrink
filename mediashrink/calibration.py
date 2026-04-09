@@ -376,6 +376,131 @@ def describe_calibration_estimate(estimate: CalibrationEstimate | None) -> str |
     return note
 
 
+def _accepted_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [raw for raw in records if bool(raw.get("accepted_output", True))]
+
+
+def _recent_bias_summary(records: list[dict[str, object]]) -> dict[str, object] | None:
+    accepted = _accepted_records(records)[-25:]
+    if not accepted:
+        return None
+
+    size_errors: list[float] = []
+    speed_errors: list[float] = []
+    for raw in accepted:
+        predicted_ratio = raw.get("predicted_output_ratio")
+        input_bytes = raw.get("input_bytes")
+        output_bytes = raw.get("output_bytes")
+        if (
+            isinstance(predicted_ratio, (int, float))
+            and predicted_ratio > 0
+            and isinstance(input_bytes, (int, float))
+            and input_bytes > 0
+            and isinstance(output_bytes, (int, float))
+            and output_bytes >= 0
+        ):
+            actual_ratio = float(output_bytes) / max(float(input_bytes), 1.0)
+            size_errors.append(actual_ratio - float(predicted_ratio))
+
+        predicted_speed = raw.get("predicted_speed")
+        actual_speed = raw.get("effective_speed")
+        if (
+            isinstance(predicted_speed, (int, float))
+            and predicted_speed > 0
+            and isinstance(actual_speed, (int, float))
+            and actual_speed > 0
+        ):
+            speed_errors.append(
+                (float(actual_speed) - float(predicted_speed)) / float(predicted_speed)
+            )
+
+    size_bias = None
+    size_text = None
+    if size_errors:
+        average_size_error = sum(size_errors) / len(size_errors)
+        if average_size_error >= 0.08:
+            size_bias = "larger_than_estimated"
+            size_text = "recent outputs have usually come out larger than estimated"
+        elif average_size_error <= -0.08:
+            size_bias = "smaller_than_estimated"
+            size_text = "recent outputs have usually come out smaller than estimated"
+
+    speed_bias = None
+    speed_text = None
+    if speed_errors:
+        average_speed_error = sum(speed_errors) / len(speed_errors)
+        if average_speed_error >= 0.15:
+            speed_bias = "faster_than_estimated"
+            speed_text = "recent encodes have usually finished faster than estimated"
+        elif average_speed_error <= -0.15:
+            speed_bias = "slower_than_estimated"
+            speed_text = "recent encodes have usually finished slower than estimated"
+
+    if not size_text and not speed_text:
+        return None
+
+    summary_parts = [part for part in (size_text, speed_text) if part]
+    return {
+        "size_bias": size_bias,
+        "speed_bias": speed_bias,
+        "summary": "; ".join(summary_parts),
+        "samples": len(accepted),
+    }
+
+
+def _family_container_summaries(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    for raw in records:
+        preset_family_name = str(raw.get("preset_family") or "unknown")
+        container = str(raw.get("container") or "unknown")
+        entry = grouped.setdefault(
+            (preset_family_name, container),
+            {
+                "preset_family": preset_family_name,
+                "container": container,
+                "samples": 0,
+                "accepted_samples": 0,
+                "rejected_samples": 0,
+            },
+        )
+        entry["samples"] = int(entry["samples"]) + 1
+        if raw.get("accepted_output", True):
+            entry["accepted_samples"] = int(entry["accepted_samples"]) + 1
+        else:
+            entry["rejected_samples"] = int(entry["rejected_samples"]) + 1
+
+    summaries = list(grouped.values())
+    summaries.sort(
+        key=lambda item: (
+            -int(item["samples"]),
+            str(item["preset_family"]),
+            str(item["container"]),
+        )
+    )
+    return summaries
+
+
+def format_family_container_summary(
+    summaries: list[dict[str, object]] | None,
+    *,
+    limit: int = 2,
+) -> str | None:
+    if not summaries:
+        return None
+    parts: list[str] = []
+    for entry in summaries[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        samples = int(entry.get("samples", 0) or 0)
+        if samples <= 0:
+            continue
+        parts.append(
+            f"{samples} {entry.get('preset_family', 'unknown')} {entry.get('container', 'unknown')} match"
+            + ("es" if samples != 1 else "")
+        )
+    return ", ".join(parts) if parts else None
+
+
 def _average_prediction_error(
     records: list[dict[str, object]],
     predicted_key: str,
@@ -429,6 +554,10 @@ def summarize_calibration_store(store: dict[str, object] | None) -> dict[str, ob
     rejected_records = [
         raw for raw in records if isinstance(raw, dict) and not raw.get("accepted_output", True)
     ]
+    rejection_reasons: dict[str, int] = {}
+    for raw in rejected_records:
+        reason = str(raw.get("safety_rejection_reason") or "unknown")
+        rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
 
     by_preset: dict[tuple[str, str], dict[str, object]] = {}
     for raw in records:
@@ -511,11 +640,28 @@ def summarize_calibration_store(store: dict[str, object] | None) -> dict[str, ob
             }
         )
 
+    family_container_summaries = _family_container_summaries(
+        [raw for raw in records if isinstance(raw, dict)]
+    )
+    bias_summary = _recent_bias_summary([raw for raw in records if isinstance(raw, dict)])
+
     return {
         "records": len(records),
         "accepted_records": len(accepted_records),
         "rejected_records": len(rejected_records),
+        "rejection_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(
+                rejection_reasons.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ],
         "failures": len([raw for raw in failures if isinstance(raw, dict)]),
         "preset_summaries": preset_summaries,
+        "family_container_summaries": family_container_summaries,
+        "family_container_summary_text": format_family_container_summary(
+            family_container_summaries
+        ),
+        "bias_summary": bias_summary,
         "recent_records": recent_records,
     }

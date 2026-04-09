@@ -1733,3 +1733,37 @@ def test_next_step_menu_includes_counts_when_maybe_present() -> None:
     joined = "\n".join(output_lines)
     assert "Compress recommended only (22 file(s))" in joined
     assert "Review maybe files (5 file(s))" in joined
+
+
+def test_display_profiles_table_warns_when_default_is_only_partial_batch() -> None:
+    console = Console(record=True, width=160)
+    profile = EncoderProfile(
+        1,
+        "Fast",
+        "Fast",
+        "faster",
+        22,
+        "faster",
+        500,
+        100.0,
+        "Very good",
+        True,
+        why_choose="Partial-batch default only: 2 file(s) can run now, while 2 likely need follow-up.",
+        compatible_count=2,
+        incompatible_count=2,
+        recommended_compatible_count=2,
+        recommended_incompatible_count=2,
+    )
+
+    display_profiles_table(
+        [profile],
+        total_input_bytes=1_000,
+        candidate_count=4,
+        recommended_count=4,
+        device_labels={},
+        console=console,
+        plain_output=True,
+    )
+
+    output = console.export_text()
+    assert "partial-batch starting point" in output.lower()

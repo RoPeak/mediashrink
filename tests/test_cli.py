@@ -2209,3 +2209,30 @@ def test_overnight_command_runs_prepare_and_encode(tmp_path: Path) -> None:
     assert result.exit_code == 0
     mock_prepare.assert_called_once()
     assert mock_loop.call_args.kwargs["on_file_failure"] == "skip"
+
+
+def test_require_net_savings_rejects_small_savings_outputs(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    weak_result = _make_result(
+        fake_job,
+        input_size_bytes=1_000_000,
+        output_size_bytes=900_000,
+    )
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=weak_result),
+    ):
+        result = runner.invoke(
+            app,
+            [str(tmp_path), "--yes", "--require-net-savings", "20"],
+        )
+
+    assert result.exit_code == 2
+    assert "Output acceptance check" in result.stdout

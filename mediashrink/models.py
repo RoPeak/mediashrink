@@ -111,6 +111,11 @@ class EncodeResult:
         message = self.error_message or ""
         return message.startswith("Output safety check:")
 
+    @property
+    def output_failed_acceptance_check(self) -> bool:
+        message = self.error_message or ""
+        return message.startswith("Output acceptance check:")
+
 
 @dataclass
 class AnalysisItem:
