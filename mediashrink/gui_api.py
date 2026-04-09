@@ -105,9 +105,19 @@ def prepare_encode_run(
     on_file_failure: str = "retry",
     use_calibration: bool = True,
     duplicate_policy: str = "prefer-mkv",
-    progress_callback: Callable[[tuple[int, int, Path]], None] | None = None,
+    progress_callback: Callable[[object], None] | None = None,
 ) -> EncodePreparation:
+    def emit_stage(
+        stage: str,
+        message: str,
+        current: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(("stage", stage, message, current, total, ""))
+
     ffmpeg, ffprobe = prepare_tools()
+    emit_stage("discovering", "Discovering files...")
     files = scan_directory(directory, recursive=recursive)
     if not files:
         return EncodePreparation(
@@ -140,7 +150,9 @@ def prepare_encode_run(
         crf=20,
         use_calibration=use_calibration,
     )
+    emit_stage("analysing", "Analysing files complete.", len(items), len(items))
     items, duplicate_warnings = apply_duplicate_policy_to_items(items, policy=duplicate_policy)
+    emit_stage("benchmarking", "Benchmarking profiles...")
     planning = prepare_profile_planning(
         analysis_items=items,
         ffmpeg=ffmpeg,
@@ -148,6 +160,11 @@ def prepare_encode_run(
         policy=policy,
         use_calibration=use_calibration,
         console=None,
+        stage_callback=lambda stage, message, current, total: (
+            progress_callback(("stage", stage, message, current, total, ""))
+            if progress_callback is not None
+            else None
+        ),
     )
     profile = (
         next((candidate for candidate in planning.profiles if candidate.is_recommended), None)

@@ -744,10 +744,13 @@ def _emit_stage_progress(
     *,
     console: Console | None = None,
     stage_messages: list[str] | None = None,
+    stage_callback: Callable[[str, str, int | None, int | None], None] | None = None,
 ) -> None:
     message = f"{stage}... {current}/{total}"
     if stage_messages is not None and (not stage_messages or stage_messages[-1] != message):
         stage_messages.append(message)
+    if stage_callback is not None:
+        stage_callback(stage, message, current, total)
     if console is not None:
         console.print(f"[dim]{message}[/dim]")
 
@@ -757,9 +760,12 @@ def _emit_stage_status(
     *,
     console: Console | None = None,
     stage_messages: list[str] | None = None,
+    stage_callback: Callable[[str, str, int | None, int | None], None] | None = None,
 ) -> None:
     if stage_messages is not None and (not stage_messages or stage_messages[-1] != message):
         stage_messages.append(message)
+    if stage_callback is not None:
+        stage_callback(message, message, None, None)
     if console is not None:
         console.print(f"[dim]{message}[/dim]")
 
@@ -955,6 +961,7 @@ def prepare_profile_planning(
     use_calibration: bool = True,
     console: Console | None = None,
     available_hw: list[str] | None = None,
+    stage_callback: Callable[[str, str, int | None, int | None], None] | None = None,
 ) -> ProfilePlanningResult | None:
     recommended_items = [item for item in analysis_items if item.recommendation == "recommended"]
     maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
@@ -1021,6 +1028,7 @@ def prepare_profile_planning(
                         completed,
                         len(candidates_to_bench),
                         stage_messages=stage_messages,
+                        stage_callback=stage_callback,
                     )
                     progress.update(task, completed=completed, total=len(candidates_to_bench))
         benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
@@ -1028,6 +1036,7 @@ def prepare_profile_planning(
             "Building provisional profiles...",
             console=console,
             stage_messages=stage_messages,
+            stage_callback=stage_callback,
         )
 
         provisional_profiles = build_profiles(
@@ -1048,6 +1057,7 @@ def prepare_profile_planning(
                 "Preparing smoke probes...",
                 console=console,
                 stage_messages=stage_messages,
+                stage_callback=stage_callback,
             )
             with Progress(
                 SpinnerColumn(),
@@ -1064,7 +1074,13 @@ def prepare_profile_planning(
                 )
 
                 def _update_probe_progress(stage: str, current: int, total: int) -> None:
-                    _emit_stage_progress(stage, current, total, stage_messages=stage_messages)
+                    _emit_stage_progress(
+                        stage,
+                        current,
+                        total,
+                        stage_messages=stage_messages,
+                        stage_callback=stage_callback,
+                    )
                     progress.update(task, completed=current, total=max(total, 1))
 
                 observed_probe_failures = _targeted_profile_probe_failures(
@@ -1081,6 +1097,7 @@ def prepare_profile_planning(
             "Scoring recommendations...",
             console=console,
             stage_messages=stage_messages,
+            stage_callback=stage_callback,
         )
     else:
         if candidates_to_bench:
@@ -1089,6 +1106,7 @@ def prepare_profile_planning(
                 0,
                 len(candidates_to_bench),
                 stage_messages=stage_messages,
+                stage_callback=stage_callback,
             )
             completed = 0
             with ThreadPoolExecutor(max_workers=min(4, len(candidates_to_bench))) as executor:
@@ -1104,12 +1122,14 @@ def prepare_profile_planning(
                         completed,
                         len(candidates_to_bench),
                         stage_messages=stage_messages,
+                        stage_callback=stage_callback,
                     )
             benchmark_speeds = {key: benchmark_speeds.get(key) for key in candidates_to_bench}
             _emit_stage_status(
                 "Building provisional profiles...",
                 console=console,
                 stage_messages=stage_messages,
+                stage_callback=stage_callback,
             )
 
         provisional_profiles = build_profiles(
@@ -1129,6 +1149,7 @@ def prepare_profile_planning(
                 "Preparing smoke probes...",
                 console=console,
                 stage_messages=stage_messages,
+                stage_callback=stage_callback,
             )
         observed_probe_failures = _targeted_profile_probe_failures(
             items=candidate_items,
@@ -1140,6 +1161,7 @@ def prepare_profile_planning(
                 current,
                 total,
                 stage_messages=stage_messages,
+                stage_callback=stage_callback,
             ),
             container_incompatibility_cache=container_incompatibility_cache,
         )
@@ -1147,6 +1169,7 @@ def prepare_profile_planning(
             "Scoring recommendations...",
             console=console,
             stage_messages=stage_messages,
+            stage_callback=stage_callback,
         )
     profiles = build_profiles(
         available_hw=available_hw,
