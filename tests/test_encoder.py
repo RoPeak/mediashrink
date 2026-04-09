@@ -372,6 +372,37 @@ def test_encode_file_reports_progress(tmp_path: Path) -> None:
     assert abs(reported[1] - 100.0) < 0.1
 
 
+def test_encode_file_reports_progress_from_out_time_us(tmp_path: Path) -> None:
+    job = _make_job(tmp_path)
+    reported: list[float] = []
+
+    mock_process = MagicMock()
+    mock_process.returncode = 0
+    mock_process.stdout = iter(
+        [
+            "out_time_us=5000000\n",
+            "out_time_us=10000000\n",
+            "progress=end\n",
+        ]
+    )
+    mock_process.stderr = iter([])
+
+    def fake_replace(self: Path, dest: Path) -> Path:
+        dest.write_bytes(b"x")
+        return dest
+
+    with (
+        patch("mediashrink.encoder.subprocess.Popen", return_value=mock_process),
+        patch("mediashrink.encoder.get_duration_seconds", return_value=10.0),
+        patch("pathlib.Path.replace", fake_replace),
+    ):
+        encode_file(job, FFMPEG, FFPROBE, progress_callback=reported.append)
+
+    assert len(reported) == 2
+    assert abs(reported[0] - 50.0) < 0.1
+    assert abs(reported[1] - 100.0) < 0.1
+
+
 def test_encode_file_success_replaces_existing_output(tmp_path: Path) -> None:
     job = _make_job(tmp_path)
     job.output.write_bytes(b"stale output")

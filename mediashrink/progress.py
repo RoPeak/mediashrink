@@ -249,9 +249,14 @@ class EncodingDisplay:
                 self._progress_layout_width = min(max(92, self.console.width), 108)
             else:
                 self._progress_layout_width = min(max(100, self.console.width), 120)
-        layout_width = self._progress_layout_width
         description_width = 24 if os_name == "Windows" else 28
+        if self.console.width >= 150:
+            description_width += 4
         bar_width = 18 if os_name == "Windows" else 22
+        if self.console.width >= 150:
+            bar_width += 8
+        elif self.console.width >= 120:
+            bar_width += 4
         return Progress(
             SpinnerColumn(),
             TextColumn(

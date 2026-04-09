@@ -613,6 +613,37 @@ def parse_progress_line(line: str) -> dict[str, str]:
     return {}
 
 
+def _parse_ffmpeg_timestamp_seconds(value: str) -> float | None:
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours = float(parts[0])
+        minutes = float(parts[1])
+        seconds = float(parts[2])
+    except ValueError:
+        return None
+    return (hours * 3600.0) + (minutes * 60.0) + seconds
+
+
+def _progress_percent_from_fields(parsed: dict[str, str], media_duration: float) -> float | None:
+    if media_duration <= 0:
+        return None
+
+    out_seconds: float | None = None
+    raw_progress = parsed.get("out_time_us") or parsed.get("out_time_ms")
+    if raw_progress is not None:
+        try:
+            out_seconds = float(raw_progress) / 1_000_000.0
+        except ValueError:
+            out_seconds = None
+    if out_seconds is None and "out_time" in parsed:
+        out_seconds = _parse_ffmpeg_timestamp_seconds(parsed["out_time"])
+    if out_seconds is None:
+        return None
+    return min((out_seconds / media_duration) * 100.0, 100.0)
+
+
 def _summarize_stderr_lines(stderr_lines: list[str], returncode: int) -> str:
     """Return a concise ffmpeg failure summary from captured stderr."""
     cleaned = [line.strip() for line in stderr_lines if line.strip()]
@@ -708,16 +739,11 @@ def encode_file(
         assert process.stdout is not None
         for raw_line in process.stdout:
             parsed = parse_progress_line(raw_line)
-            if progress_callback and "out_time_ms" in parsed:
-                try:
-                    # FFmpeg names the field out_time_ms but unit is microseconds
-                    out_us = float(parsed["out_time_ms"])
-                    if total_duration > 0:
-                        pct = min((out_us / 1_000_000) / media_duration * 100, 100.0)
-                        last_progress_pct = pct
-                        progress_callback(pct)
-                except ValueError:
-                    pass
+            if progress_callback:
+                pct = _progress_percent_from_fields(parsed, media_duration)
+                if pct is not None:
+                    last_progress_pct = pct
+                    progress_callback(pct)
 
         process.wait()
         if stderr_thread is not None:

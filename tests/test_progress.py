@@ -116,6 +116,8 @@ def test_make_progress_bar_uses_resize_safe_windows_layout() -> None:
 
     assert display._progress_layout_width == 108
     assert progress.expand is False
+    bar_column = next(column for column in progress.columns if type(column).__name__ == "BarColumn")
+    assert bar_column.bar_width == 26
 
 
 def test_show_summary_mentions_resumed_context(tmp_path: Path) -> None:

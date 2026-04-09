@@ -1603,6 +1603,66 @@ def test_run_encode_loop_warns_when_progress_stalls(tmp_path: Path) -> None:
     assert "No progress update from FFmpeg" in printed
 
 
+def test_run_encode_loop_uses_output_growth_as_visible_fallback_progress(tmp_path: Path) -> None:
+    from mediashrink.cli import _run_encode_loop
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 5_000_000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=5_000_000,
+        output_size_bytes=2_500_000,
+        duration_seconds=0.05,
+        media_duration_seconds=120.0,
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    def fake_encode_file(*args: object, **kwargs: object) -> EncodeResult:
+        time.sleep(0.01)
+        job.tmp_output.write_bytes(b"x" * 250_000)
+        time.sleep(0.02)
+        job.tmp_output.write_bytes(b"x" * 750_000)
+        time.sleep(0.02)
+        return ok_result
+
+    with (
+        patch("mediashrink.cli.encode_file", side_effect=fake_encode_file),
+        patch("mediashrink.cli.STALL_WARNING_SECONDS", 0.5),
+        patch("mediashrink.cli.STALL_POLL_SECONDS", 0.005),
+    ):
+        _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
+
+    fallback_updates = [
+        kwargs["completed"]
+        for args, kwargs in mock_progress.update.call_args_list
+        if args
+        and args[0] in {0, 1}
+        and "completed" in kwargs
+        and 0 < kwargs["completed"] < job.source.stat().st_size
+    ]
+    assert fallback_updates
+
+
 def test_run_encode_loop_skip_policy_marks_failed_file_skipped(tmp_path: Path) -> None:
     from mediashrink.cli import _run_encode_loop
 

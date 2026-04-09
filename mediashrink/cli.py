@@ -1340,6 +1340,7 @@ def _run_encode_loop(
             started_at = _now_iso()
             stall_state = {
                 "last_update": time.monotonic(),
+                "last_signal": time.monotonic(),
                 "last_percent": 0.0,
                 "warned": False,
                 "last_output_growth": time.monotonic(),
@@ -1373,9 +1374,16 @@ def _run_encode_loop(
                         current_size = 0
                     if current_size > stall_state["last_output_size"]:
                         stall_state["last_output_size"] = current_size
-                        stall_state["last_output_growth"] = time.monotonic()
+                        now = time.monotonic()
+                        stall_state["last_output_growth"] = now
+                        stall_state["last_signal"] = now
                     idle_for = time.monotonic() - stall_state["last_update"]
                     since_growth = time.monotonic() - stall_state["last_output_growth"]
+                    completed_from_ffmpeg = file_size * stall_state["last_percent"] / 100
+                    visible_completed = min(
+                        max(completed_from_ffmpeg, float(current_size)),
+                        float(task_total),
+                    )
                     if idle_for < min(15.0, stall_warning_seconds / 2):
                         state = "active"
                     elif since_growth < stall_warning_seconds * grace_multiplier:
@@ -1385,15 +1393,19 @@ def _run_encode_loop(
                     stall_state["heartbeat_state"] = state
                     progress.update(
                         file_task,
+                        completed=visible_completed,
                         heartbeat_state=state,
-                        last_update_at=stall_state["last_update"],
+                        last_update_at=stall_state["last_signal"],
                         stall_warning_seconds=stall_warning_seconds,
+                        eta_confident=stall_state["last_percent"] >= 5.0,
                     )
                     progress.update(
                         overall_task,
+                        completed=bytes_done + visible_completed,
                         heartbeat_state=state,
-                        last_update_at=stall_state["last_update"],
+                        last_update_at=stall_state["last_signal"],
                         stall_warning_seconds=stall_warning_seconds,
+                        eta_confident=stall_state["last_percent"] >= 5.0 or bytes_done > 0,
                     )
                     if stall_state["warned"] or state != "stalled":
                         continue
@@ -1413,14 +1425,16 @@ def _run_encode_loop(
 
             def make_callback(ft=file_task, fb=file_size):
                 def callback(pct: float) -> None:
-                    stall_state["last_update"] = time.monotonic()
+                    now = time.monotonic()
+                    stall_state["last_update"] = now
+                    stall_state["last_signal"] = now
                     stall_state["last_percent"] = pct
                     progress.update(
                         ft,
                         completed=fb * pct / 100,
                         completed_files=files_done,
                         remaining_files=files_remaining,
-                        last_update_at=stall_state["last_update"],
+                        last_update_at=stall_state["last_signal"],
                         stall_warning_seconds=stall_warning_seconds,
                         heartbeat_state="active",
                         eta_confident=pct >= 5.0,
@@ -1430,7 +1444,7 @@ def _run_encode_loop(
                         completed=bytes_done + (fb * pct / 100),
                         completed_files=files_done,
                         remaining_files=files_remaining + 1,
-                        last_update_at=stall_state["last_update"],
+                        last_update_at=stall_state["last_signal"],
                         stall_warning_seconds=stall_warning_seconds,
                         heartbeat_state="active",
                         eta_confident=pct >= 5.0 or bytes_done > 0,
