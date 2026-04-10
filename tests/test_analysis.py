@@ -350,6 +350,22 @@ def test_estimate_analysis_confidence_prefers_known_durations_and_low_codec_mix(
     assert estimate_analysis_confidence(items, benchmarked_files=1) == "High"
 
 
+def test_estimate_time_confidence_caps_high_before_benchmark_on_mixed_batch(
+    tmp_path: Path,
+) -> None:
+    mkv_item = build_analysis_item_dict_item(
+        source=tmp_path / "episode.mkv", recommendation="recommended"
+    )
+    mp4_item = build_analysis_item_dict_item(
+        source=tmp_path / "movie.mp4", recommendation="recommended"
+    )
+    mp4_item.codec = "mpeg2video"
+
+    confidence = estimate_time_confidence([mkv_item, mp4_item], benchmarked_files=0)
+
+    assert confidence == "Medium"
+
+
 def test_describe_estimate_confidence_mentions_benchmark_and_codecs(tmp_path: Path) -> None:
     items = [build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")]
 
@@ -411,6 +427,48 @@ def test_describe_estimate_calibration_mentions_local_history(tmp_path: Path) ->
 
     assert detail is not None
     assert "close local match" in detail
+
+
+def test_describe_time_confidence_uses_user_facing_bias_and_history_slices(tmp_path: Path) -> None:
+    item = build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "1080p",
+                "bitrate_bucket": "high",
+                "preset": "fast",
+                "preset_family": "software",
+                "crf": 20,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "predicted_output_ratio": 0.5,
+                "duration_seconds": 100.0,
+                "wall_seconds": 80.0,
+                "predicted_speed": 2.0,
+                "effective_speed": 1.5,
+                "accepted_output": True,
+                "fallback_used": False,
+                "retry_used": False,
+            }
+            for _ in range(4)
+        ],
+        "failures": [],
+    }
+
+    detail = describe_time_confidence(
+        [item],
+        benchmarked_files=1,
+        preset="fast",
+        calibration_store=calibration_store,
+    )
+
+    assert "closest preset history:" in detail
+    assert "current container mix:" in detail
+    assert "overall machine history:" in detail
+    assert "saved less space than forecast" in detail
 
 
 def test_duplicate_policy_prefers_mkv_copy(tmp_path: Path) -> None:

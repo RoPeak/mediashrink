@@ -1311,6 +1311,114 @@ def test_write_batch_reports_include_retry_and_queue_metadata(tmp_path: Path) ->
     assert "Queue strategy: safe-first" in text
 
 
+def test_write_batch_reports_include_estimate_context_and_excluded_files(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    job = _make_job(tmp_path / "episode.mkv")
+    job.source.write_bytes(b"x" * 1000)
+    result = _make_result(job)
+
+    json_path, text_path = _write_batch_reports(
+        mode="wizard",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+        estimate_context={
+            "initial_scope": "6 files",
+            "initial_estimated_seconds": 7200.0,
+            "selected_scope_label": "5 files after preflight",
+            "selected_estimated_seconds": 5400.0,
+            "rebenchmarked_after_split": True,
+            "original_benchmark_source": "The Sound of Music (1965).mp4",
+        },
+        container_fallback_actions={
+            "mkv_sidecar_outputs": 0,
+            "mkv_retry_failed_count": 1,
+            "followup_count": 1,
+            "followup_manifest": str(tmp_path / "followup.json"),
+            "excluded_files": [
+                {
+                    "name": "The Sound of Music (1965).mp4",
+                    "reason": "container/copied-stream incompatibility",
+                    "next_step": "Use MKV output first.",
+                }
+            ],
+        },
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["estimate_context"]["rebenchmarked_after_split"] is True
+    assert (
+        payload["container_fallback_actions"]["excluded_files"][0]["name"]
+        == "The Sound of Music (1965).mp4"
+    )
+    assert (
+        "Final selected-scope estimate was re-benchmarked after The Sound of Music (1965).mp4 left the run."
+        in text
+    )
+    assert "Excluded files:" in text
+    assert "The Sound of Music (1965).mp4: container/copied-stream incompatibility" in text
+
+
+def test_write_batch_reports_cleanup_text_distinguishes_true_mkv_sidecars(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    mp4_job = EncodeJob(
+        source=tmp_path / "movie.mp4",
+        output=tmp_path / "mediashrink_mkv_followup" / "movie.mkv",
+        tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_movie.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+        skip_reason=None,
+    )
+    mp4_job.output.parent.mkdir(parents=True)
+    mp4_job.source.write_bytes(b"x" * 1000)
+    mp4_job.output.write_bytes(b"y" * 500)
+    result = _make_result(mp4_job, input_size_bytes=1000, output_size_bytes=500)
+
+    _, text_path = _write_batch_reports(
+        mode="encode",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+    )
+
+    text = text_path.read_text(encoding="utf-8")
+    assert "Cleanup: MKV sidecar output kept alongside the original source" in text
+
+
 def test_safe_first_queue_prioritizes_lower_risk_jobs(tmp_path: Path) -> None:
     from mediashrink.cli import _prioritize_jobs
 

@@ -591,7 +591,7 @@ def test_display_profiles_table_hides_more_duplicate_builtin_rows() -> None:
     display_profiles_table(profiles, 10 * 1024**3, 3, 3, {"amf": "AMD Test"}, console)
 
     output = console.export_text()
-    assert "Hidden 3 near-duplicate profile row(s)." in output
+    assert "Hidden 4 near-duplicate profile row(s)." in output
 
 
 def test_run_custom_wizard_returns_hardware_choice() -> None:
@@ -1683,8 +1683,238 @@ def test_followup_guidance_prefers_mkv_for_software_container_failures(tmp_path:
         grouped_failures={"output header failure": [job]},
     )
 
-    assert "same folder with MKV output or review copied streams manually" in hint
+    assert "same folder with MKV output first" in hint
     assert any("unsupported copied audio codec: dts" in note for note in notes)
+
+
+def test_run_wizard_rebenchmarks_when_original_sample_moves_to_followup(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
+    mp4_source = tmp_path / "movie.mp4"
+    mkv_source = tmp_path / "episode.mkv"
+    mp4_source.write_bytes(b"x" * 1000)
+    mkv_source.write_bytes(b"x" * 1000)
+    recommended_mp4 = _analysis_item(mp4_source, "recommended")
+    recommended_mkv = _analysis_item(mkv_source, "recommended")
+    mp4_job = EncodeJob(
+        source=mp4_source,
+        output=tmp_path / "movie_compressed.mp4",
+        tmp_output=tmp_path / ".tmp_movie_compressed.mp4",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    mkv_job = _job_for(mkv_source)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[mp4_source, mkv_source]),
+        patch(
+            "mediashrink.wizard._run_analysis_with_progress",
+            return_value=[recommended_mp4, recommended_mkv],
+        ),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", side_effect=[1.0, 1.0, 0.8]),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[mp4_job, mkv_job]),
+        patch("mediashrink.wizard._build_mkv_followup_jobs", return_value=[]),
+        patch(
+            "mediashrink.wizard._run_preflight_checks",
+            return_value=(
+                [mkv_job],
+                [
+                    (
+                        mp4_job,
+                        _fake_encode_result(
+                            mp4_source,
+                            success=False,
+                            error_message="[mp4 @ 123] Could not write header\nInvalid argument",
+                        ),
+                    )
+                ],
+            ),
+        ),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[True, True, True]),
+    ):
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    output = console.export_text()
+    assert action == "encode"
+    assert any(job.source == mkv_source for job in jobs)
+    assert (
+        "Time estimate was re-benchmarked after the original sample file moved to follow-up."
+        in output
+    )
+
+
+def test_run_wizard_reports_failed_mkv_retry_and_single_followup_name(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
+    mp4_source = tmp_path / "movie.mp4"
+    mkv_source = tmp_path / "episode.mkv"
+    mp4_source.write_bytes(b"x" * 1000)
+    mkv_source.write_bytes(b"x" * 1000)
+    recommended_mp4 = _analysis_item(mp4_source, "recommended")
+    recommended_mkv = _analysis_item(mkv_source, "recommended")
+    mp4_job = EncodeJob(
+        source=mp4_source,
+        output=tmp_path / "movie_compressed.mp4",
+        tmp_output=tmp_path / ".tmp_movie_compressed.mp4",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    mkv_job = _job_for(mkv_source)
+    mp4_mkv_job = EncodeJob(
+        source=mp4_source,
+        output=tmp_path / "mediashrink_mkv_followup" / "movie.mkv",
+        tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_movie.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[mp4_source, mkv_source]),
+        patch(
+            "mediashrink.wizard._run_analysis_with_progress",
+            return_value=[recommended_mp4, recommended_mkv],
+        ),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", side_effect=[1.0, 1.0, 0.8]),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[mp4_job, mkv_job]),
+        patch("mediashrink.wizard._build_mkv_followup_jobs", return_value=[mp4_mkv_job]),
+        patch(
+            "mediashrink.wizard._run_preflight_checks",
+            side_effect=[
+                (
+                    [mkv_job],
+                    [
+                        (
+                            mp4_job,
+                            _fake_encode_result(
+                                mp4_source,
+                                success=False,
+                                error_message="[mp4 @ 123] Could not write header\nInvalid argument",
+                            ),
+                        )
+                    ],
+                ),
+                (
+                    [],
+                    [
+                        (
+                            mp4_mkv_job,
+                            _fake_encode_result(
+                                mp4_source,
+                                success=False,
+                                error_message="attachment stream incompatibility",
+                            ),
+                        )
+                    ],
+                ),
+            ],
+        ),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[True, True, True]),
+    ):
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    output = console.export_text()
+    assert action == "encode"
+    assert jobs == [mkv_job]
+    assert "Tried MKV sidecar output for 1 file(s), but they still needed follow-up." in output
+    assert "Follow-up file:" in output
+    assert "movie.mp4" in output
+    assert "MKV retry still left out:" in output
+    assert "MKV-first retry command:" in output
+
+
+def test_cleanup_expectation_lines_distinguish_same_format_outputs_from_true_sidecars(
+    tmp_path: Path,
+) -> None:
+    from mediashrink.wizard import _cleanup_expectation_lines
+
+    mkv_source = tmp_path / "episode.mkv"
+    mp4_source = tmp_path / "movie.mp4"
+    mkv_source.write_bytes(b"x")
+    mp4_source.write_bytes(b"x")
+    jobs = [
+        _job_for(mkv_source),
+        EncodeJob(
+            source=mp4_source,
+            output=tmp_path / "mediashrink_mkv_followup" / "movie.mkv",
+            tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_movie.mkv",
+            crf=20,
+            preset="fast",
+            dry_run=False,
+            skip=False,
+        ),
+    ]
+
+    lines = _cleanup_expectation_lines(jobs, cleanup_after=True)
+
+    assert any("same-format output" in line for line in lines)
+    assert any("true MKV sidecar output" in line for line in lines)
+
+
+def test_build_profiles_outlier_hint_calls_out_single_risky_mp4(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
+    mkv_item = _analysis_item(tmp_path / "episode.mkv", "recommended")
+    mp4_item = _analysis_item(tmp_path / "movie.mp4", "recommended")
+
+    with patch(
+        "mediashrink.wizard._cached_container_incompatibility",
+        return_value="audio codec copy incompatibility",
+    ):
+        profiles = build_profiles(
+            available_hw=[],
+            benchmark_speeds={"fast": 1.0},
+            total_media_seconds=3600.0,
+            total_input_bytes=10 * 1024**3,
+            candidate_items=[mkv_item, mp4_item],
+            ffprobe=FFPROBE,
+        )
+
+    recommended = next(profile for profile in profiles if profile.is_recommended)
+    assert (
+        recommended.outlier_hint
+        == "All MKV files look compatible; the single MP4 likely needs MKV output."
+    )
+
+    display_profiles_table(
+        [recommended],
+        total_input_bytes=1_000,
+        candidate_count=2,
+        recommended_count=2,
+        device_labels={},
+        console=console,
+        plain_output=True,
+    )
+
+    assert "single MP4 likely needs MKV output" in console.export_text()
 
 
 # ---------------------------------------------------------------------------

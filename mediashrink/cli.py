@@ -810,6 +810,28 @@ def _record_failure_calibration(result: EncodeResult) -> None:
     )
 
 
+def _is_true_mkv_sidecar_result(result: EncodeResult) -> bool:
+    return (
+        result.job.output.suffix.lower() == ".mkv"
+        and result.job.source.suffix.lower() != ".mkv"
+        and result.job.output != result.job.source
+    )
+
+
+def _cleanup_result_text(result: EncodeResult, *, cleaned: bool) -> str | None:
+    if not result.success or result.skipped:
+        return None
+    if cleaned:
+        return "original removed; same-format output restored to the original filename"
+    if result.job.output == result.job.source:
+        return None
+    if _is_true_mkv_sidecar_result(result):
+        return "MKV sidecar output kept alongside the original source"
+    if result.job.output.suffix.lower() == result.job.source.suffix.lower():
+        return "same-format side-by-side output kept alongside the original source"
+    return "side-by-side output kept alongside the original source"
+
+
 def _apply_net_savings_policy(
     result: EncodeResult,
     *,
@@ -1018,14 +1040,9 @@ def _write_batch_reports(
                 "retry_count": result.retry_count,
                 "first_error": result.first_error,
                 "last_error": result.last_error,
-                "cleanup_result": (
-                    "original removed; compressed file restored to original name"
-                    if result.job.source in cleaned_paths
-                    else (
-                        "compressed output kept side-by-side"
-                        if result.success and result.job.output != result.job.source
-                        else None
-                    )
+                "cleanup_result": _cleanup_result_text(
+                    result,
+                    cleaned=result.job.source in cleaned_paths,
                 ),
                 "attempts": [attempt.to_dict() for attempt in result.attempts],
             }
@@ -1139,6 +1156,8 @@ def _write_batch_reports(
         initial_seconds = estimate_context.get("initial_estimated_seconds")
         selected_scope = estimate_context.get("selected_scope_label")
         selected_seconds = estimate_context.get("selected_estimated_seconds")
+        rebenchmarked_after_split = bool(estimate_context.get("rebenchmarked_after_split"))
+        benchmark_source = estimate_context.get("original_benchmark_source")
         if initial_scope is not None:
             lines.append(
                 f"  - Initial planner scope: {initial_scope}"
@@ -1157,15 +1176,31 @@ def _write_batch_reports(
                     else ""
                 )
             )
+        if rebenchmarked_after_split and benchmark_source:
+            lines.append(
+                f"  - Final selected-scope estimate was re-benchmarked after {benchmark_source} left the run."
+            )
     if container_fallback_actions:
         lines.extend(["", "Container fallback actions"])
         mkv_sidecars = int(container_fallback_actions.get("mkv_sidecar_outputs", 0) or 0)
         followup_count = int(container_fallback_actions.get("followup_count", 0) or 0)
         followup_manifest = container_fallback_actions.get("followup_manifest")
+        mkv_retry_failed = int(container_fallback_actions.get("mkv_retry_failed_count", 0) or 0)
         lines.append(f"  - MKV sidecar outputs: {mkv_sidecars}")
+        if mkv_retry_failed:
+            lines.append(f"  - MKV retries that still moved to follow-up: {mkv_retry_failed}")
         lines.append(f"  - Follow-up files: {followup_count}")
         if followup_manifest:
             lines.append(f"  - Follow-up manifest: {followup_manifest}")
+        excluded_files = container_fallback_actions.get("excluded_files")
+        if isinstance(excluded_files, list) and excluded_files:
+            lines.append("  - Excluded files:")
+            for entry in excluded_files[:5]:
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(
+                    f"    * {entry.get('name')}: {entry.get('reason')} Next step: {entry.get('next_step')}"
+                )
     lines.extend(["", "Files"])
     for result in results:
         status = _classify_result_status(result).upper()
@@ -1185,14 +1220,9 @@ def _write_batch_reports(
             lines.append(f"  Last error: {result.last_error}")
         if result.fallback_used:
             lines.append("  Fallback: hardware retry switched to libx265 faster / CRF 22")
-        cleanup_result = (
-            "original removed; compressed file restored to original name"
-            if result.job.source in cleaned_paths
-            else (
-                "compressed output kept side-by-side"
-                if result.success and result.job.output != result.job.source
-                else None
-            )
+        cleanup_result = _cleanup_result_text(
+            result,
+            cleaned=result.job.source in cleaned_paths,
         )
         if cleanup_result:
             lines.append(f"  Cleanup: {cleanup_result}")
@@ -1314,15 +1344,12 @@ def _record_cleanup_results(
     for result in results:
         if not result.success or result.skipped:
             continue
-        cleanup_result = (
-            "original removed; compressed file restored to original name"
-            if result.job.source in cleaned_sources
-            else (
-                "compressed output kept side-by-side"
-                if result.job.output != result.job.source
-                else "output replaced original in place"
-            )
+        cleanup_result = _cleanup_result_text(
+            result,
+            cleaned=result.job.source in cleaned_sources,
         )
+        if cleanup_result is None and result.job.output == result.job.source:
+            cleanup_result = "output replaced original in place"
         update_session_entry(
             session,
             source=result.job.source,
@@ -1938,7 +1965,7 @@ def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> 
     cleaned = cleanup_successful_results(results)
     if cleaned:
         console.print(
-            f"[green]Cleanup complete:[/green] restored original names for {len(cleaned)} file(s)."
+            f"[green]Cleanup complete:[/green] restored same-format outputs for {len(cleaned)} file(s)."
         )
     return cleaned
 
@@ -3089,6 +3116,7 @@ def wizard(
                 )
             )
             actionable_retry = _followup_retry_is_actionable(followup_details)
+            mkv_retry_dir = (output_dir or directory) / "mediashrink_mkv_followup"
             if not actionable_retry and followup_details:
                 console.print(
                     "[yellow]Follow-up manifest contains container/copied-stream issues that a software retry is unlikely to fix automatically.[/yellow]"
@@ -3108,7 +3136,7 @@ def wizard(
                     ffprobe=ffprobe,
                 )
                 console.print(
-                    f'  [dim]Best next step: use MKV output or adjust copied streams, then retry with: mediashrink apply "{followup_manifest_path}"[/dim]'
+                    f'  [dim]Best next step: use MKV output first. Command: mediashrink apply "{followup_manifest_path}" --output-dir "{mkv_retry_dir}"[/dim]'
                 )
                 results = results + preflight_followup_results
             else:
@@ -3140,7 +3168,7 @@ def wizard(
                             "This points to container or copied-stream compatibility, not just the hardware encoder.[/dim]"
                         )
                         console.print(
-                            f'  [dim]Retry manually after diagnosis: mediashrink apply "{followup_manifest_path}"[/dim]'
+                            f'  [dim]Retry manually after diagnosis with MKV output first: mediashrink apply "{followup_manifest_path}" --output-dir "{mkv_retry_dir}"[/dim]'
                         )
                     results = results + preflight_followup_results
                     if compatible_followup_jobs:

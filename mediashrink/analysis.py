@@ -10,6 +10,7 @@ from rich.table import Table
 from mediashrink.calibration import (
     bitrate_bucket,
     describe_calibration_estimate,
+    describe_history_slices,
     format_family_container_summary,
     load_calibration_store,
     lookup_estimate,
@@ -660,6 +661,8 @@ def estimate_time_confidence(
     candidates = _candidate_items(items)
     if not candidates:
         return "Low"
+    if benchmarked_files <= 0 and base == "High":
+        base = "Medium"
     active_store = calibration_store if calibration_store is not None else load_calibration_store()
     speed_hits = 0
     for item in candidates[:5]:
@@ -736,10 +739,21 @@ def describe_size_confidence(
     if calibration_note:
         detail += f"; local history: {calibration_note}"
     summary = summarize_calibration_store(active_store if use_calibration else None)
+    history_slices = describe_history_slices(
+        active_store if use_calibration else None,
+        preset=preset,
+        containers={item.source.suffix.lower() or ".mkv" for item in candidates},
+    )
+    if history_slices.get("closest_preset_history"):
+        detail += f"; closest preset history: {history_slices['closest_preset_history']}"
+    if history_slices.get("container_mix_history"):
+        detail += f"; current container mix: {history_slices['container_mix_history']}"
+    if history_slices.get("overall_history"):
+        detail += f"; overall machine history: {history_slices['overall_history']}"
     family_summary = format_family_container_summary(
         summary.get("family_container_summaries") if isinstance(summary, dict) else None
     )
-    if family_summary:
+    if family_summary and not history_slices.get("overall_history"):
         detail += f"; history mix: {family_summary}"
     return detail
 
@@ -773,8 +787,19 @@ def describe_time_confidence(
         )
     summary = summarize_calibration_store(active_store if use_calibration else None)
     if isinstance(summary, dict):
+        history_slices = describe_history_slices(
+            active_store if use_calibration else None,
+            preset=preset,
+            containers={item.source.suffix.lower() or ".mkv" for item in candidates},
+        )
+        if history_slices.get("closest_preset_history"):
+            detail += f"; closest preset history: {history_slices['closest_preset_history']}"
+        if history_slices.get("container_mix_history"):
+            detail += f"; current container mix: {history_slices['container_mix_history']}"
+        if history_slices.get("overall_history"):
+            detail += f"; overall machine history: {history_slices['overall_history']}"
         family_summary = format_family_container_summary(summary.get("family_container_summaries"))
-        if family_summary:
+        if family_summary and not history_slices.get("overall_history"):
             detail += f"; history mix: {family_summary}"
         bias_summary = summary.get("bias_summary")
         if isinstance(bias_summary, dict) and isinstance(bias_summary.get("summary"), str):

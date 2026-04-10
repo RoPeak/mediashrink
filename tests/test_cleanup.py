@@ -79,3 +79,11 @@ def test_eligible_cleanup_results_skips_oversized_outputs(tmp_path: Path) -> Non
     eligible = eligible_cleanup_results([oversized])
 
     assert eligible == []
+
+
+def test_eligible_cleanup_results_skips_cross_container_sidecars(tmp_path: Path) -> None:
+    mp4_to_mkv = _make_result(tmp_path, source_name="movie.mp4", output_name="movie.mkv")
+
+    eligible = eligible_cleanup_results([mp4_to_mkv])
+
+    assert eligible == []

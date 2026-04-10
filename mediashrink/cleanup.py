@@ -19,6 +19,8 @@ def eligible_cleanup_results(results: list[EncodeResult]) -> list[EncodeResult]:
         output = result.job.output
         if source == output or not output.exists() or not source.exists():
             continue
+        if source.suffix.lower() != output.suffix.lower():
+            continue
         eligible.append(result)
     return eligible
 

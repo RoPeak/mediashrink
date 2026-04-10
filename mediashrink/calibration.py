@@ -420,10 +420,10 @@ def _recent_bias_summary(records: list[dict[str, object]]) -> dict[str, object] 
         average_size_error = sum(size_errors) / len(size_errors)
         if average_size_error >= 0.08:
             size_bias = "larger_than_estimated"
-            size_text = "recent outputs have usually come out larger than estimated"
+            size_text = "recent runs have usually saved less space than forecast"
         elif average_size_error <= -0.08:
             size_bias = "smaller_than_estimated"
-            size_text = "recent outputs have usually come out smaller than estimated"
+            size_text = "recent runs have usually saved more space than forecast"
 
     speed_bias = None
     speed_text = None
@@ -431,10 +431,10 @@ def _recent_bias_summary(records: list[dict[str, object]]) -> dict[str, object] 
         average_speed_error = sum(speed_errors) / len(speed_errors)
         if average_speed_error >= 0.15:
             speed_bias = "faster_than_estimated"
-            speed_text = "recent encodes have usually finished faster than estimated"
+            speed_text = "recent encodes have usually finished faster than forecast"
         elif average_speed_error <= -0.15:
             speed_bias = "slower_than_estimated"
-            speed_text = "recent encodes have usually finished slower than estimated"
+            speed_text = "recent encodes have usually finished slower than forecast"
 
     if not size_text and not speed_text:
         return None
@@ -499,6 +499,94 @@ def format_family_container_summary(
             + ("es" if samples != 1 else "")
         )
     return ", ".join(parts) if parts else None
+
+
+def _preset_history_label(preset: str | None) -> str:
+    if not preset:
+        return "similar profiles"
+    if preset in {"faster", "fast", "medium"}:
+        return "Fast-like profiles"
+    if preset in {"slow", "slower", "veryslow"}:
+        return "slower software profiles"
+    family = preset_family(preset)
+    if family == "hardware":
+        return "hardware profiles"
+    if family == "software":
+        return "software profiles"
+    return f"{preset} profiles"
+
+
+def describe_history_slices(
+    store: dict[str, object] | None,
+    *,
+    preset: str | None = None,
+    containers: set[str] | None = None,
+) -> dict[str, str | None]:
+    if not store:
+        return {
+            "closest_preset_history": None,
+            "container_mix_history": None,
+            "overall_history": None,
+        }
+    raw_records = store.get("records", [])
+    if not isinstance(raw_records, list):
+        raw_records = []
+    accepted = [
+        raw for raw in raw_records if isinstance(raw, dict) and raw.get("accepted_output", True)
+    ]
+    if not accepted:
+        return {
+            "closest_preset_history": None,
+            "container_mix_history": None,
+            "overall_history": None,
+        }
+
+    preset_matches: list[dict[str, object]] = []
+    if preset:
+        family_name = preset_family(preset)
+        preset_matches = [
+            raw
+            for raw in accepted
+            if raw.get("preset") == preset or raw.get("preset_family") == family_name
+        ]
+
+    normalized_containers = {container.lower() for container in (containers or set()) if container}
+    container_matches = [
+        raw
+        for raw in accepted
+        if not normalized_containers
+        or str(raw.get("container") or "").lower() in normalized_containers
+    ]
+
+    closest_preset_history = None
+    if preset_matches:
+        dominant_container = None
+        if normalized_containers:
+            for candidate in normalized_containers:
+                count = sum(
+                    1
+                    for raw in preset_matches
+                    if str(raw.get("container") or "").lower() == candidate
+                )
+                if count:
+                    dominant_container = candidate
+                    break
+        container_text = f" {dominant_container}" if dominant_container else ""
+        closest_preset_history = f"{len(preset_matches)} accepted sample(s){container_text} for {_preset_history_label(preset)}"
+
+    container_mix_history = None
+    if container_matches and normalized_containers:
+        listed = ", ".join(sorted(normalized_containers))
+        container_mix_history = (
+            f"{len(container_matches)} accepted sample(s) in the current container mix ({listed})"
+        )
+
+    overall_history = f"{len(accepted)} accepted sample(s) overall"
+    return {
+        "closest_preset_history": closest_preset_history,
+        "container_mix_history": container_mix_history,
+        "overall_history": overall_history,
+    }
 
 
 def _average_prediction_error(

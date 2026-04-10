@@ -194,5 +194,5 @@ def test_calibration_summary_exposes_family_mix_and_bias(tmp_path: Path) -> None
     assert summary["family_container_summary_text"] is not None
     bias_summary = summary["bias_summary"]
     assert isinstance(bias_summary, dict)
-    assert "smaller than estimated" in str(bias_summary.get("summary"))
-    assert "slower than estimated" in str(bias_summary.get("summary"))
+    assert "saved more space than forecast" in str(bias_summary.get("summary"))
+    assert "slower than forecast" in str(bias_summary.get("summary"))
