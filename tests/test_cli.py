@@ -1376,6 +1376,49 @@ def test_write_batch_reports_include_estimate_context_and_excluded_files(tmp_pat
     assert "The Sound of Music (1965).mp4: container/copied-stream incompatibility" in text
 
 
+def test_write_batch_reports_include_estimate_ranges_without_crashing(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    job = _make_job(tmp_path / "episode.mkv")
+    job.source.write_bytes(b"x" * 1000)
+    result = _make_result(job)
+
+    json_path, text_path = _write_batch_reports(
+        mode="wizard",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+        estimate_ranges={
+            "output_bytes": {"low": 400_000_000, "high": 550_000_000},
+            "saved_bytes": {"low": 450_000_000, "high": 600_000_000},
+            "encode_seconds": {"low": 3600.0, "high": 5400.0},
+            "bias_note": "recent runs have usually saved less space than forecast",
+        },
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["estimate_ranges"]["encode_seconds"]["low"] == 3600.0
+    assert "Estimate ranges" in text
+    assert "Encode time: ~1h 00m to 1h 30m" in text
+    assert "Bias note: recent runs have usually saved less space than forecast" in text
+
+
 def test_write_batch_reports_cleanup_text_distinguishes_true_mkv_sidecars(tmp_path: Path) -> None:
     from mediashrink.cli import _write_batch_reports
 

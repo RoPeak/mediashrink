@@ -141,6 +141,16 @@ def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _fmt_duration(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 def _fmt_size(size_bytes: int) -> str:
     if size_bytes >= _GB:
         return f"{size_bytes / _GB:.2f} GB"
