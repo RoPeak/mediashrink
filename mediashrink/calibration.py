@@ -376,6 +376,31 @@ def describe_calibration_estimate(estimate: CalibrationEstimate | None) -> str |
     return note
 
 
+def recent_bias_summary(store: dict[str, object] | None) -> dict[str, object] | None:
+    if not store:
+        return None
+    records = store.get("records", [])
+    if not isinstance(records, list):
+        return None
+    return _recent_bias_summary([raw for raw in records if isinstance(raw, dict)])
+
+
+def estimate_display_uncertainty(
+    confidence: str | None,
+    *,
+    average_error: float | None = None,
+    widen_by: float = 0.0,
+) -> float:
+    base = {
+        "High": 0.10,
+        "Medium": 0.18,
+        "Low": 0.30,
+    }.get(confidence or "", 0.22)
+    if average_error is not None:
+        base = max(base, min(abs(average_error) * 1.35, 0.45))
+    return min(max(base + widen_by, 0.06), 0.55)
+
+
 def _accepted_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
     return [raw for raw in records if bool(raw.get("accepted_output", True))]
 

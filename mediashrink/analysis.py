@@ -11,9 +11,11 @@ from mediashrink.calibration import (
     bitrate_bucket,
     describe_calibration_estimate,
     describe_history_slices,
+    estimate_display_uncertainty,
     format_family_container_summary,
     load_calibration_store,
     lookup_estimate,
+    recent_bias_summary,
     resolution_bucket,
     summarize_calibration_store,
 )
@@ -889,6 +891,52 @@ def summarize_container_risks(
     return len(risky), grouped, examples
 
 
+def collect_container_risk_signals(
+    items: list[AnalysisItem],
+    ffprobe: Path,
+) -> dict[Path, str]:
+    signals: dict[Path, str] = {}
+    for item in _candidate_items(items):
+        constraints = describe_output_container_constraints(item.source, item.source, ffprobe)
+        relevant = [
+            constraint.lower()
+            for constraint in constraints
+            if "mp4" in constraint.lower()
+            or "subtitle" in constraint.lower()
+            or "audio codec" in constraint.lower()
+            or "attachment" in constraint.lower()
+            or "data stream" in constraint.lower()
+        ]
+        if not relevant:
+            continue
+        if any(
+            marker in reason
+            for reason in relevant
+            for marker in ("subtitle", "attachment", "audio codec", "data stream")
+        ):
+            signals[item.source] = "MKV first"
+        else:
+            signals[item.source] = "Follow-up"
+    return signals
+
+
+def estimate_value_range(
+    value: float,
+    *,
+    confidence: str | None,
+    average_error: float | None = None,
+    widen_by: float = 0.0,
+) -> tuple[float, float]:
+    uncertainty = estimate_display_uncertainty(
+        confidence,
+        average_error=average_error,
+        widen_by=widen_by,
+    )
+    low = max(0.0, value * (1.0 - uncertainty))
+    high = max(low, value * (1.0 + uncertainty))
+    return low, high
+
+
 def save_manifest(manifest: AnalysisManifest, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest.to_dict(), indent=2), encoding="utf-8")
@@ -915,6 +963,8 @@ def display_analysis_summary(
     time_confidence: str | None = None,
     time_confidence_detail: str | None = None,
     notes: list[str] | None = None,
+    compatibility_signals: dict[Path, str] | None = None,
+    calibration_store: dict[str, object] | None = None,
     plain_output: bool = False,
 ) -> None:
     recommended = [item for item in items if item.recommendation == "recommended"]
@@ -935,9 +985,10 @@ def display_analysis_summary(
                 if item.estimated_savings_bytes <= 0
                 else f"~{_fmt_size(item.estimated_savings_bytes)}"
             )
+            batch_fit = (compatibility_signals or {}).get(item.source, "Now")
             console.print(
                 f"- {item.source.name} | {item.codec or '?'} | {_fmt_size(item.size_bytes)}"
-                f" | {savings_text} | {item.recommendation.upper()} | {item.reason_text}",
+                f" | {savings_text} | {item.recommendation.upper()} | {batch_fit} | {item.reason_text}",
                 highlight=False,
             )
         console.print()
@@ -948,6 +999,7 @@ def display_analysis_summary(
         table.add_column("Size", justify="right", no_wrap=True)
         table.add_column("Est. Saving", justify="right", no_wrap=True)
         table.add_column("Recommendation", justify="center", no_wrap=True)
+        table.add_column("Batch Fit", justify="center", no_wrap=True)
         if not narrow:
             table.add_column("Reason")
 
@@ -967,6 +1019,7 @@ def display_analysis_summary(
                 _fmt_size(item.size_bytes),
                 savings_text,
                 item.recommendation.upper(),
+                (compatibility_signals or {}).get(item.source, "Now"),
             ]
             if not narrow:
                 row.append(item.reason_text)
@@ -1022,20 +1075,42 @@ def display_analysis_summary(
         f"[dim]skip {len(skipped)} / {_fmt_size(skipped_total)}[/dim]",
         highlight=False,
     )
-    if recommended:
-        console.print(
-            f"Recommended set: [yellow]{_fmt_size(total_current)}[/yellow] -> "
-            f"[green]~{_fmt_size(total_estimated)}[/green] "
-            f"([bold green]~{_fmt_size(total_saved)} saved, ~{total_saved_pct:.0f}%[/bold green])",
-            highlight=False,
-        )
-    if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
-        console.print(
-            f"Rough encode time: [cyan]~{_fmt_duration(estimated_total_encode_seconds)}[/cyan]"
-        )
     confidence = estimate_confidence or estimate_analysis_confidence(items)
     resolved_size_confidence = size_confidence or confidence
     resolved_time_confidence = time_confidence or confidence
+    if recommended:
+        range_low, range_high = estimate_value_range(
+            float(total_estimated),
+            confidence=resolved_size_confidence,
+        )
+        saved_low = max(total_current - int(range_high), 0)
+        saved_high = max(total_current - int(range_low), 0)
+        saved_pct_low = saved_low / total_current * 100 if total_current else 0.0
+        saved_pct_high = saved_high / total_current * 100 if total_current else 0.0
+        console.print(
+            f"Recommended set: [yellow]{_fmt_size(total_current)}[/yellow] -> "
+            f"[green]~{_fmt_size(int(range_low))}-{_fmt_size(int(range_high))}[/green] "
+            f"([bold green]~{_fmt_size(saved_low)}-{_fmt_size(saved_high)} saved, "
+            f"~{saved_pct_low:.0f}-{saved_pct_high:.0f}%[/bold green])",
+            highlight=False,
+        )
+    if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
+        time_low, time_high = estimate_value_range(
+            estimated_total_encode_seconds,
+            confidence=time_confidence or estimate_confidence,
+        )
+        console.print(
+            f"Rough encode time: [cyan]~{_fmt_duration(time_low)}-{_fmt_duration(time_high)}[/cyan]"
+        )
+    risky_now = sum(
+        1 for item in recommended + maybe if (compatibility_signals or {}).get(item.source)
+    )
+    if risky_now:
+        console.print(
+            f"Batch-ready now: [green]{len(recommended) + len(maybe) - risky_now}[/green], "
+            f"[yellow]{risky_now} likely need MKV-first routing or follow-up[/yellow]",
+            highlight=False,
+        )
     console.print(
         f"Size confidence: [cyan]{resolved_size_confidence}[/cyan]"
         + (f" [dim]({size_confidence_detail})[/dim]" if size_confidence_detail else "")
@@ -1051,6 +1126,9 @@ def display_analysis_summary(
     if notes:
         for note in notes:
             console.print(f"[dim yellow]{note}[/dim yellow]")
+    bias_summary = recent_bias_summary(calibration_store)
+    if isinstance(bias_summary, dict) and isinstance(bias_summary.get("summary"), str):
+        console.print(f"[dim]Estimate bias: {bias_summary['summary']}.[/dim]")
     console.print("[dim]Analysis estimates are approximate.[/dim]")
     console.print(
         "[dim]Hardware encoders are faster, but source duration, bitrate, and resolution still dominate total runtime.[/dim]"

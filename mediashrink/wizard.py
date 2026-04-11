@@ -19,11 +19,13 @@ from mediashrink.analysis import (
     apply_duplicate_policy_to_items,
     analyze_files,
     build_manifest,
+    collect_container_risk_signals,
     describe_estimate_calibration,
     describe_estimate_confidence,
     describe_size_confidence,
     describe_time_confidence,
     display_analysis_summary,
+    estimate_value_range,
     estimate_analysis_confidence,
     estimate_analysis_encode_seconds,
     estimate_size_confidence,
@@ -36,10 +38,12 @@ from mediashrink.analysis import (
 from mediashrink.calibration import (
     bitrate_bucket,
     describe_history_slices,
+    estimate_display_uncertainty,
     estimate_failure_rate,
     format_family_container_summary,
     load_calibration_store,
     lookup_estimate,
+    recent_bias_summary,
     resolution_bucket,
     summarize_calibration_store,
 )
@@ -1007,27 +1011,25 @@ def _format_ready_size_estimate(
     *,
     input_bytes: int,
     output_bytes: int,
+    confidence: str | None,
     size_error: float | None,
 ) -> str:
-    saved_bytes = max(input_bytes - output_bytes, 0)
-    saved_pct = saved_bytes / input_bytes * 100 if input_bytes else 0.0
-    if size_error is not None and abs(size_error) >= 0.10 and input_bytes > 0:
-        offset = abs(size_error) * input_bytes
-        output_low = max(0, int(output_bytes - offset))
-        output_high = max(output_low, int(output_bytes + offset))
-        saved_low = max(input_bytes - output_high, 0)
-        saved_high = max(input_bytes - output_low, 0)
-        saved_pct_low = saved_low / input_bytes * 100 if input_bytes else 0.0
-        saved_pct_high = saved_high / input_bytes * 100 if input_bytes else 0.0
-        if (saved_pct_high - saved_pct_low) >= 30:
-            return "  Est. out: ~highly variable"
-        return (
-            f"  Est. out: ~{_fmt_size(output_low)}-{_fmt_size(output_high)}  "
-            f"(~{_fmt_size(saved_low)}-{_fmt_size(saved_high)} saved, ~{saved_pct_low:.0f}-{saved_pct_high:.0f}%)"
-        )
+    output_low_f, output_high_f = estimate_value_range(
+        float(output_bytes),
+        confidence=confidence,
+        average_error=size_error,
+    )
+    output_low = max(0, int(output_low_f))
+    output_high = max(output_low, int(output_high_f))
+    saved_low = max(input_bytes - output_high, 0)
+    saved_high = max(input_bytes - output_low, 0)
+    saved_pct_low = saved_low / input_bytes * 100 if input_bytes else 0.0
+    saved_pct_high = saved_high / input_bytes * 100 if input_bytes else 0.0
+    if (saved_pct_high - saved_pct_low) >= 40:
+        return "  Est. out: ~highly variable"
     return (
-        f"  Est. out: ~{_fmt_size(output_bytes)}  "
-        f"(~{_fmt_size(saved_bytes)} saved, ~{saved_pct:.0f}%)"
+        f"  Est. out: ~{_fmt_size(output_low)}-{_fmt_size(output_high)}  "
+        f"(~{_fmt_size(saved_low)}-{_fmt_size(saved_high)} saved, ~{saved_pct_low:.0f}-{saved_pct_high:.0f}%)"
     )
 
 
@@ -1056,6 +1058,37 @@ def _average_size_error_for_items(
     if not errors:
         return None
     return sum(errors) / len(errors)
+
+
+def _average_speed_error_for_items(
+    *,
+    preset: str,
+    items: list[AnalysisItem],
+    ffprobe: Path | None,
+    calibration_store: dict[str, object] | None,
+) -> float | None:
+    if ffprobe is None or not items or not calibration_store:
+        return None
+    errors: list[float] = []
+    for item in items[:8]:
+        width, height = get_video_resolution(item.source, ffprobe)
+        lookup = lookup_estimate(
+            calibration_store,
+            codec=item.codec,
+            resolution=resolution_bucket(width, height) if width > 0 and height > 0 else "unknown",
+            bitrate=bitrate_bucket(item.bitrate_kbps),
+            preset=preset,
+            container=item.source.suffix.lower() or ".mkv",
+        )
+        if lookup is not None and lookup.average_speed_error is not None:
+            errors.append(lookup.average_speed_error)
+    if not errors:
+        return None
+    return sum(errors) / len(errors)
+
+
+def _format_duration_range(low_seconds: float, high_seconds: float) -> str:
+    return f"~{_fmt_duration(low_seconds)}-{_fmt_duration(high_seconds)}"
 
 
 def _summarize_mkv_suitable_candidates(
@@ -2235,6 +2268,7 @@ def display_profiles_table(
     size_confidence: str | None = None,
     size_confidence_detail: str | None = None,
     size_error_by_preset: dict[str, float | None] | None = None,
+    bias_note: str | None = None,
     show_all_profiles: bool = False,
     plain_output: bool = False,
 ) -> tuple[list[EncoderProfile], dict[int, EncoderProfile]]:
@@ -2302,24 +2336,29 @@ def display_profiles_table(
 
     def _est_saving_text(profile: EncoderProfile) -> str:
         saved = total_input_bytes - profile.estimated_output_bytes
-        saved_pct = saved / total_input_bytes * 100 if total_input_bytes else 0
         size_error = (size_error_by_preset or {}).get(profile.encoder_key)
-        if size_error is not None and abs(size_error) >= 0.10 and total_input_bytes > 0:
-            offset = abs(size_error) * total_input_bytes
-            saving_low = max(0, saved - offset)
-            saving_high = saved + offset
-            pct_low = saving_low / total_input_bytes * 100
-            pct_high = saving_high / total_input_bytes * 100
-            if (pct_high - pct_low) >= 35:
-                return "~highly variable"
-            return (
-                f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
-            )
-        return f"~{_fmt_size(saved)} ({saved_pct:.0f}%)"
+        uncertainty = estimate_display_uncertainty(
+            size_confidence,
+            average_error=size_error,
+            widen_by=0.04 if profile.incompatible_count else 0.0,
+        )
+        offset = uncertainty * total_input_bytes
+        saving_low = max(0, int(saved - offset))
+        saving_high = min(total_input_bytes, int(saved + offset))
+        pct_low = saving_low / total_input_bytes * 100 if total_input_bytes else 0.0
+        pct_high = saving_high / total_input_bytes * 100 if total_input_bytes else 0.0
+        if (pct_high - pct_low) >= 40:
+            return "~highly variable"
+        return f"~{_fmt_size(saving_low)}-{_fmt_size(saving_high)} ({pct_low:.0f}-{pct_high:.0f}%)"
 
     def _est_time_text(profile: EncoderProfile) -> str:
         if profile.estimated_encode_seconds > 0:
-            return f"~{_fmt_duration(profile.estimated_encode_seconds)}"
+            low_seconds, high_seconds = estimate_value_range(
+                profile.estimated_encode_seconds,
+                confidence=time_confidence,
+                widen_by=0.05 if profile.incompatible_count else 0.0,
+            )
+            return _format_duration_range(low_seconds, high_seconds)
         if profile.sw_preset in {"slow", "slower", "veryslow"}:
             return "~slower than Balanced"
         return "~unknown"
@@ -2529,6 +2568,8 @@ def display_profiles_table(
         console.print(
             "  [dim]Compact view switches to denser profile summaries on smaller terminals.[/dim]"
         )
+    if bias_note:
+        console.print(f"  [dim]Estimate bias: {bias_note}.[/dim]")
     hidden_rows = len(profiles) - len(visible_profiles)
     if not show_all_profiles and hidden_rows >= 2:
         console.print(
@@ -3280,6 +3321,7 @@ def run_wizard(
             policy=duplicate_policy,
         )
         early_notes = list(duplicate_notes)
+        compatibility_signals = collect_container_risk_signals(analysis_items, ffprobe)
         container_risk_count, container_risk_reasons, container_risk_examples = (
             summarize_container_risks(
                 analysis_items,
@@ -3318,6 +3360,8 @@ def run_wizard(
                 use_calibration=use_calibration,
             ),
             notes=early_notes,
+            compatibility_signals=compatibility_signals,
+            calibration_store=load_calibration_store() if use_calibration else None,
             plain_output=plain_output or requested_non_interactive,
         )
 
@@ -3396,6 +3440,7 @@ def run_wizard(
 
         benchmark_speeds = planning.benchmark_speeds
         active_calibration = planning.active_calibration
+        planning_bias_summary = recent_bias_summary(active_calibration)
         profiles = planning.profiles
         size_error_by_preset = planning.size_error_by_preset
         for profile in profiles:
@@ -3457,6 +3502,11 @@ def run_wizard(
                 use_calibration=use_calibration,
             ),
             size_error_by_preset=size_error_by_preset,
+            bias_note=(
+                planning_bias_summary.get("summary")
+                if isinstance(planning_bias_summary, dict)
+                else None
+            ),
             show_all_profiles=show_all_profiles,
             plain_output=plain_output or requested_non_interactive,
         )
@@ -3688,6 +3738,12 @@ def run_wizard(
                 ffprobe=ffprobe,
                 calibration_store=active_calibration,
             )
+            selected_profile_speed_error = _average_speed_error_for_items(
+                preset=preset,
+                items=selected_items,
+                ffprobe=ffprobe,
+                calibration_store=active_calibration,
+            )
             compatibility_prediction_note = None
             if selected_profile is not None:
                 predicted_compatible, predicted_incompatible, _ = _predict_profile_compatibility(
@@ -3799,65 +3855,55 @@ def run_wizard(
                     "auxiliary data stream incompatibility",
                     "output header failure",
                 }
-                if (
-                    output_dir is None
-                    and grouped_failures
-                    and all(reason in mkv_safe_reasons for reason in grouped_failures)
+                if grouped_failures and all(
+                    reason in mkv_safe_reasons for reason in grouped_failures
                 ):
                     mkv_followup_dir = _default_mkv_followup_dir(directory, output_dir)
-                    should_switch_to_mkv = active_auto or _wizard_confirm(
-                        f"Write {len(incompatible_items)} incompatible file(s) to MKV in {mkv_followup_dir} and include them in this run?",
-                        default=True,
-                        prompt_id="mkv-followup",
-                        acceptance_label="MKV follow-up decision",
+                    console.print(
+                        f"[dim]Auto-routing {len(incompatible_items)} container-risk file(s) to MKV sidecar preflight in {mkv_followup_dir}.[/dim]"
                     )
-                    if should_switch_to_mkv:
-                        candidate_mkv_jobs = _build_mkv_followup_jobs(
-                            incompatible_items,
-                            output_dir=mkv_followup_dir,
-                            overwrite=False,
-                            crf=crf,
-                            preset=preset,
-                            ffprobe=ffprobe,
-                            no_skip=no_skip,
-                        )
-                        mkv_compatible_jobs, _mkv_failures = _run_preflight_checks(
-                            [job for job in candidate_mkv_jobs if not job.skip],
-                            ffmpeg,
-                            ffprobe,
-                            crf=crf,
-                            preset=preset,
-                            console=console,
-                        )
-                        mkv_sources = {job.source for job in mkv_compatible_jobs}
-                        if mkv_compatible_jobs:
-                            mkv_switched_jobs = mkv_compatible_jobs
-                            mkv_sidecar_count = len(mkv_switched_jobs)
-                            retained_jobs.extend(mkv_compatible_jobs)
-                            remaining_incompatible_items = [
-                                item
-                                for item in incompatible_items
-                                if item.source not in mkv_sources
-                            ]
-                            console.print(
-                                f"[green]Switched {len(mkv_compatible_jobs)} file(s) to MKV sidecar output in[/green] {mkv_followup_dir}"
-                            )
-                            session.add_event(
-                                f"Preflight switched {len(mkv_compatible_jobs)} file(s) to MKV sidecar output"
-                            )
-                        failed_mkv_sources = [
-                            job.source
-                            for job in candidate_mkv_jobs
-                            if job.source not in mkv_sources and not job.skip
+                    candidate_mkv_jobs = _build_mkv_followup_jobs(
+                        incompatible_items,
+                        output_dir=mkv_followup_dir,
+                        overwrite=False,
+                        crf=crf,
+                        preset=preset,
+                        ffprobe=ffprobe,
+                        no_skip=no_skip,
+                    )
+                    mkv_compatible_jobs, _mkv_failures = _run_preflight_checks(
+                        [job for job in candidate_mkv_jobs if not job.skip],
+                        ffmpeg,
+                        ffprobe,
+                        crf=crf,
+                        preset=preset,
+                        console=console,
+                    )
+                    mkv_sources = {job.source for job in mkv_compatible_jobs}
+                    if mkv_compatible_jobs:
+                        mkv_switched_jobs = mkv_compatible_jobs
+                        mkv_sidecar_count = len(mkv_switched_jobs)
+                        retained_jobs.extend(mkv_compatible_jobs)
+                        remaining_incompatible_items = [
+                            item for item in incompatible_items if item.source not in mkv_sources
                         ]
-                        if failed_mkv_sources:
-                            mkv_attempt_failed_count = len(failed_mkv_sources)
-                            mkv_attempt_failed_names = [
-                                path.name for path in failed_mkv_sources[:3]
-                            ]
-                            console.print(
-                                f"[yellow]Tried MKV sidecar output for {len(failed_mkv_sources)} file(s), but they still needed follow-up.[/yellow]"
-                            )
+                        console.print(
+                            f"[green]Switched {len(mkv_compatible_jobs)} file(s) to MKV sidecar output in[/green] {mkv_followup_dir}"
+                        )
+                        session.add_event(
+                            f"Preflight switched {len(mkv_compatible_jobs)} file(s) to MKV sidecar output"
+                        )
+                    failed_mkv_sources = [
+                        job.source
+                        for job in candidate_mkv_jobs
+                        if job.source not in mkv_sources and not job.skip
+                    ]
+                    if failed_mkv_sources:
+                        mkv_attempt_failed_count = len(failed_mkv_sources)
+                        mkv_attempt_failed_names = [path.name for path in failed_mkv_sources[:3]]
+                        console.print(
+                            f"[yellow]Tried MKV sidecar output for {len(failed_mkv_sources)} file(s), but they still needed follow-up.[/yellow]"
+                        )
                 followup_manifest = _write_followup_manifest(
                     directory,
                     recursive,
@@ -4051,6 +4097,12 @@ def run_wizard(
                         ffprobe=ffprobe,
                         calibration_store=active_calibration,
                     )
+                    selected_profile_speed_error = _average_speed_error_for_items(
+                        preset=preset,
+                        items=selected_items,
+                        ffprobe=ffprobe,
+                        calibration_store=active_calibration,
+                    )
                     break
                 if fallback_compatible and len(fallback_compatible) < len(fallback_to_encode):
                     fallback_sources = {job.source for job in fallback_compatible}
@@ -4086,6 +4138,12 @@ def run_wizard(
                             calibration_store=active_calibration,
                         )
                         selected_profile_size_error = _average_size_error_for_items(
+                            preset=preset,
+                            items=selected_items,
+                            ffprobe=ffprobe,
+                            calibration_store=active_calibration,
+                        )
+                        selected_profile_speed_error = _average_speed_error_for_items(
                             preset=preset,
                             items=selected_items,
                             ffprobe=ffprobe,
@@ -4178,6 +4236,7 @@ def run_wizard(
                 _format_ready_size_estimate(
                     input_bytes=selected_input_bytes,
                     output_bytes=selected_output_bytes,
+                    confidence=size_confidence_label,
                     size_error=selected_profile_size_error,
                 )
             )
@@ -4186,7 +4245,13 @@ def run_wizard(
                     "  [dim]Local history for this encoder/profile is too inconsistent to offer a tighter output-size estimate for the surviving batch.[/dim]"
                 )
         if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
-            console.print(f"  Est. time: ~{_fmt_duration(estimated_total_encode_seconds)}")
+            time_low, time_high = estimate_value_range(
+                estimated_total_encode_seconds,
+                confidence=time_confidence_label,
+                average_error=selected_profile_speed_error,
+                widen_by=0.04 if (mkv_sidecar_count or followup_count) else 0.0,
+            )
+            console.print(f"  Est. time: {_format_duration_range(time_low, time_high)}")
             if ready_time_refinement_note:
                 console.print(f"  [dim]{ready_time_refinement_note}[/dim]")
             elif (
@@ -4202,6 +4267,11 @@ def run_wizard(
         console.print(f"  Time confidence: {time_confidence_label}")
         if time_confidence_scope_note:
             console.print(f"  [dim]Time confidence note: {time_confidence_scope_note}.[/dim]")
+        ready_bias_summary = recent_bias_summary(active_calibration if use_calibration else None)
+        if isinstance(ready_bias_summary, dict) and isinstance(
+            ready_bias_summary.get("summary"), str
+        ):
+            console.print(f"  [dim]Estimate bias: {ready_bias_summary['summary']}.[/dim]")
         if preset in _HW_ENCODERS:
             console.print(
                 "  [dim]Hardware encoding is faster, but source duration and bitrate still dominate total runtime.[/dim]"
@@ -4268,6 +4338,80 @@ def run_wizard(
                 "selected_estimated_seconds": estimated_total_encode_seconds,
                 "rebenchmarked_after_split": bool(ready_time_refinement_note),
                 "original_benchmark_source": original_benchmark_source.name,
+            },
+            "estimate_ranges": {
+                "output_bytes": (
+                    {
+                        "low": int(
+                            estimate_value_range(
+                                float(selected_output_bytes),
+                                confidence=size_confidence_label,
+                                average_error=selected_profile_size_error,
+                            )[0]
+                        ),
+                        "high": int(
+                            estimate_value_range(
+                                float(selected_output_bytes),
+                                confidence=size_confidence_label,
+                                average_error=selected_profile_size_error,
+                            )[1]
+                        ),
+                    }
+                    if selected_output_bytes > 0
+                    else None
+                ),
+                "saved_bytes": (
+                    {
+                        "low": max(
+                            selected_input_bytes
+                            - int(
+                                estimate_value_range(
+                                    float(selected_output_bytes),
+                                    confidence=size_confidence_label,
+                                    average_error=selected_profile_size_error,
+                                )[1]
+                            ),
+                            0,
+                        ),
+                        "high": max(
+                            selected_input_bytes
+                            - int(
+                                estimate_value_range(
+                                    float(selected_output_bytes),
+                                    confidence=size_confidence_label,
+                                    average_error=selected_profile_size_error,
+                                )[0]
+                            ),
+                            0,
+                        ),
+                    }
+                    if selected_output_bytes > 0
+                    else None
+                ),
+                "encode_seconds": (
+                    {
+                        "low": estimate_value_range(
+                            estimated_total_encode_seconds,
+                            confidence=time_confidence_label,
+                            average_error=selected_profile_speed_error,
+                            widen_by=0.04 if (mkv_sidecar_count or followup_count) else 0.0,
+                        )[0],
+                        "high": estimate_value_range(
+                            estimated_total_encode_seconds,
+                            confidence=time_confidence_label,
+                            average_error=selected_profile_speed_error,
+                            widen_by=0.04 if (mkv_sidecar_count or followup_count) else 0.0,
+                        )[1],
+                    }
+                    if estimated_total_encode_seconds is not None
+                    and estimated_total_encode_seconds > 0
+                    else None
+                ),
+                "bias_note": (
+                    ready_bias_summary.get("summary")
+                    if isinstance(ready_bias_summary, dict)
+                    else None
+                ),
             },
             "container_fallback_actions": {
                 "mkv_sidecar_outputs": mkv_sidecar_count,

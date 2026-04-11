@@ -17,6 +17,7 @@ from mediashrink.analysis import (
     apply_duplicate_policy_to_items,
     analyze_files,
     build_manifest,
+    collect_container_risk_signals,
     describe_size_confidence,
     describe_time_confidence,
     describe_estimate_calibration,
@@ -536,12 +537,32 @@ def _print_grouped_preflight_details(details: list[str], *, style: str, prefix: 
         console.print(f"[{style}]{prefix}[/]{summary}")
 
 
+def _followup_next_step_for_details(details: list[str]) -> str | None:
+    if not details:
+        return None
+    reasons = {detail.partition(": ")[2] or detail for detail in details}
+    mkv_blocking = {
+        "unsupported copied audio codec",
+        "unsupported copied subtitle codec",
+        "attachment stream incompatibility",
+        "auxiliary data stream incompatibility",
+        "output container cannot safely carry one or more copied streams",
+        "output header failure",
+        "unsupported container/stream combination",
+    }
+    if reasons and reasons <= mkv_blocking:
+        return "Best next step: retry the left-out files with MKV output first."
+    return "Best next step: review the left-out files and rerun with a safer software preset or MKV output."
+
+
 def _followup_notes_for_incompatible_details(details: list[str]) -> list[str]:
     if not details:
         return []
     notes = ["Automatically generated from files left out by preflight compatibility checks."]
     notes.extend(_group_incompatibility_details(details))
-    notes.append("Suggested retry: prefer MKV outputs or rerun with --policy highest-confidence.")
+    next_step = _followup_next_step_for_details(details)
+    if next_step:
+        notes.append(next_step)
     return notes
 
 
@@ -1010,6 +1031,7 @@ def _write_batch_reports(
     split_followup_manifest: Path | None = None,
     estimate_miss_summary: str | None = None,
     estimate_context: dict[str, object] | None = None,
+    estimate_ranges: dict[str, object] | None = None,
     container_fallback_actions: dict[str, object] | None = None,
     require_net_savings_pct: float | None = None,
 ) -> tuple[Path, Path]:
@@ -1076,6 +1098,7 @@ def _write_batch_reports(
         ),
         "estimate_miss_summary": estimate_miss_summary,
         "estimate_context": estimate_context,
+        "estimate_ranges": estimate_ranges,
         "container_fallback_actions": container_fallback_actions,
         "require_net_savings_pct": require_net_savings_pct,
         "grouped_incompatibilities": grouped_incompatibilities,
@@ -1180,6 +1203,26 @@ def _write_batch_reports(
             lines.append(
                 f"  - Final selected-scope estimate was re-benchmarked after {benchmark_source} left the run."
             )
+    if estimate_ranges:
+        lines.extend(["", "Estimate ranges"])
+        output_range = estimate_ranges.get("output_bytes")
+        savings_range = estimate_ranges.get("saved_bytes")
+        time_range = estimate_ranges.get("encode_seconds")
+        bias_note = estimate_ranges.get("bias_note")
+        if isinstance(output_range, dict):
+            lines.append(
+                f"  - Output: {_fmt_size(int(output_range.get('low', 0)))} to {_fmt_size(int(output_range.get('high', 0)))}"
+            )
+        if isinstance(savings_range, dict):
+            lines.append(
+                f"  - Saved: {_fmt_size(int(savings_range.get('low', 0)))} to {_fmt_size(int(savings_range.get('high', 0)))}"
+            )
+        if isinstance(time_range, dict):
+            lines.append(
+                f"  - Encode time: ~{_fmt_duration(float(time_range.get('low', 0.0)))} to {_fmt_duration(float(time_range.get('high', 0.0)))}"
+            )
+        if isinstance(bias_note, str) and bias_note:
+            lines.append(f"  - Bias note: {bias_note}")
     if container_fallback_actions:
         lines.extend(["", "Container fallback actions"])
         mkv_sidecars = int(container_fallback_actions.get("mkv_sidecar_outputs", 0) or 0)
@@ -2099,11 +2142,15 @@ def _prepare_overnight_jobs(
         console=Console(quiet=True),
     )
     if preflight_failures:
-        incompatible_sources = {job.source for job, _ in preflight_failures}
+        incompatible_by_source = {
+            job.source: _classify_incompatible_reason(result.error_message, job, ffprobe=ffprobe)
+            for job, result in preflight_failures
+        }
         for job in jobs:
-            if job.source in incompatible_sources:
+            reason = incompatible_by_source.get(job.source)
+            if reason is not None:
                 job.skip = True
-                job.skip_reason = "incompatible: preflight compatibility check failed"
+                job.skip_reason = f"incompatible: {reason}"
         if not compatible_jobs and selected_profile.encoder_key != _FALLBACK_PRESET:
             jobs = build_jobs(
                 files=[item.source for item in selected_items],
@@ -2642,6 +2689,7 @@ def analyze(
         )
         print(json.dumps(manifest.to_dict()))
     else:
+        compatibility_signals = collect_container_risk_signals(items, ffprobe)
         display_analysis_summary(
             items,
             estimated_total_encode_seconds,
@@ -2653,6 +2701,8 @@ def analyze(
             time_confidence=time_confidence,
             time_confidence_detail=time_confidence_detail,
             notes=duplicate_notes,
+            compatibility_signals=compatibility_signals,
+            calibration_store=load_calibration_store() if use_calibration else None,
         )
 
     if manifest_out is not None:
@@ -2829,6 +2879,9 @@ def apply(
         _print_grouped_preflight_details(incompatible, style="yellow", prefix="  ")
         if split_followup_manifest is not None:
             console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
+            next_step = _followup_next_step_for_details(incompatible)
+            if next_step:
+                console.print(f"[dim]{next_step}[/dim]")
     if incompatible and on_file_failure == "stop":
         _print_grouped_preflight_details(
             incompatible,
@@ -3219,6 +3272,11 @@ def wizard(
             if isinstance(wizard_report_context, dict)
             else None
         ),
+        estimate_ranges=(
+            wizard_report_context.get("estimate_ranges")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
         container_fallback_actions=(
             wizard_report_context.get("container_fallback_actions")
             if isinstance(wizard_report_context, dict)
@@ -3374,6 +3432,9 @@ def resume(
         _print_grouped_preflight_details(incompatible, style="yellow", prefix="  ")
         if split_followup_manifest is not None:
             console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
+            next_step = _followup_next_step_for_details(incompatible)
+            if next_step:
+                console.print(f"[dim]{next_step}[/dim]")
     if incompatible and on_file_failure == "stop":
         _print_grouped_preflight_details(
             incompatible,
@@ -3618,6 +3679,9 @@ def overnight(
         _print_grouped_preflight_details(incompatible, style="yellow", prefix="  ")
         if split_followup_manifest is not None:
             console.print(f"[dim]Follow-up manifest:[/dim] {split_followup_manifest}")
+            next_step = _followup_next_step_for_details(incompatible)
+            if next_step:
+                console.print(f"[dim]{next_step}[/dim]")
 
     prior = find_resumable_session(directory, output_dir, effective_preset, effective_crf)
     resumed_from_session = False
