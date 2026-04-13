@@ -726,8 +726,8 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
     mock_build_jobs.assert_not_called()
 
 
-def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> None:
-    console = Console()
+def test_run_wizard_uses_maybe_shortlist_when_no_recommended_files(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
     maybe = _analysis_item(source, "maybe")
@@ -743,15 +743,26 @@ def test_run_wizard_aborts_cleanly_when_no_recommended_files(tmp_path: Path) -> 
         patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
         patch("mediashrink.wizard.display_profiles_table"),
         patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
         patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(source, success=True),
+        ),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[False, False]),
     ):
         jobs, action, _, _fm = run_wizard(
             tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
         )
 
+    output = console.export_text()
     assert action == "cancel"
     assert jobs == []
-    mock_build_jobs.assert_not_called()
+    assert "No strong auto-selections were found" in output
+    mock_build_jobs.assert_called_once()
 
 
 def test_run_wizard_can_include_maybe_files_when_requested(tmp_path: Path) -> None:
@@ -898,6 +909,59 @@ def test_run_wizard_cleanup_prompt_has_no_leading_indent(tmp_path: Path) -> None
         run_wizard(tmp_path, FFMPEG, FFPROBE, False, None, False, False, console)
 
 
+def test_run_wizard_uses_strongest_maybe_shortlist_when_no_recommended(tmp_path: Path) -> None:
+    console = Console(record=True, width=160)
+    strong_path = tmp_path / "strong.mkv"
+    weaker_path = tmp_path / "weaker.mkv"
+    for path in (strong_path, weaker_path):
+        path.write_bytes(b"x" * 1000)
+    strong = _analysis_item(strong_path, "maybe")
+    strong.reason_text = "episode-scale file with worthwhile projected savings; near recommended for TV/library cleanup"
+    strong.size_bytes = 1500 * 1024**2
+    strong.estimated_output_bytes = 760 * 1024**2
+    strong.estimated_savings_bytes = strong.size_bytes - strong.estimated_output_bytes
+    weaker = _analysis_item(weaker_path, "maybe")
+    weaker.size_bytes = 1400 * 1024**2
+    weaker.estimated_output_bytes = 980 * 1024**2
+    weaker.estimated_savings_bytes = weaker.size_bytes - weaker.estimated_output_bytes
+    fake_job = _job_for(strong_path)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[strong_path, weaker_path]),
+        patch("mediashrink.wizard._run_analysis_with_progress", return_value=[strong, weaker]),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]) as mock_build_jobs,
+        patch(
+            "mediashrink.wizard.preflight_encode_job",
+            return_value=_fake_encode_result(strong_path, success=True),
+        ),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[False, False]),
+    ):
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    output = console.export_text()
+    assert action == "cancel"
+    assert jobs == []
+    assert "No strong auto-selections were found" in output
+    assert (
+        "Default shortlist: 1 strongest maybe file(s); 1 broader maybe file(s) left for later review."
+        in output
+    )
+    assert mock_build_jobs.call_args.kwargs["files"] == [strong_path]
+
+
 def test_run_wizard_ready_summary_reframes_profile_for_selected_subset(tmp_path: Path) -> None:
     console = Console(record=True, width=160)
     recommended_path = tmp_path / "recommended.mkv"
@@ -967,6 +1031,36 @@ def test_run_wizard_ready_summary_reframes_profile_for_selected_subset(tmp_path:
         in output
     )
     assert "Not in this run: 1 maybe file(s) were left out by choice." in output
+
+
+def test_display_profiles_table_shows_large_batch_guidance() -> None:
+    console = Console(record=True, width=160)
+    profile = EncoderProfile(
+        1,
+        "Balanced",
+        "Balanced",
+        "fast",
+        20,
+        "fast",
+        80 * 1024**3,
+        10 * 60 * 60,
+        "Excellent",
+        True,
+    )
+
+    display_profiles_table(
+        [profile],
+        total_input_bytes=120 * 1024**3,
+        candidate_count=54,
+        recommended_count=54,
+        device_labels={},
+        console=console,
+        time_confidence="High",
+        size_confidence="High",
+    )
+
+    output = console.export_text()
+    assert "overnight-scale batch" in output
 
 
 # ---------------------------------------------------------------------------

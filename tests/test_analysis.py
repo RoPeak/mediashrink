@@ -21,7 +21,9 @@ from mediashrink.analysis import (
     estimate_analysis_encode_seconds,
     estimate_size_confidence,
     estimate_time_confidence,
+    estimate_time_range_widening,
     load_manifest,
+    rank_maybe_candidates,
     save_manifest,
     select_representative_items,
 )
@@ -100,6 +102,24 @@ def test_build_analysis_item_marks_borderline_candidate(tmp_path: Path) -> None:
 
     assert item.recommendation == "maybe"
     assert item.reason_code == "borderline_candidate"
+
+
+def test_build_analysis_item_recommends_tv_sized_candidate(tmp_path: Path) -> None:
+    path = tmp_path / "episode.mkv"
+    path.write_bytes(b"x" * (1700 * 1024**2))
+
+    with (
+        patch("mediashrink.analysis.probe_video_codec", return_value="h264"),
+        patch("mediashrink.analysis.is_already_compressed", return_value=(False, "")),
+        patch("mediashrink.analysis.get_duration_seconds", return_value=2700.0),
+        patch("mediashrink.analysis.get_video_bitrate_kbps", return_value=7000.0),
+        patch("mediashrink.analysis.estimate_output_size", return_value=900 * 1024**2),
+    ):
+        item = build_analysis_item(path, FFPROBE)
+
+    assert item.recommendation == "recommended"
+    assert item.reason_code == "strong_savings_candidate"
+    assert "TV/library cleanup" in item.reason_text
 
 
 def test_analyze_files_reports_progress_for_each_file(tmp_path: Path) -> None:
@@ -394,6 +414,31 @@ def test_select_representative_items_prefers_legacy_h264_and_maybe(tmp_path: Pat
     assert [item.source.name for item in selected] == ["legacy.mkv", "h264.mkv", "maybe.mkv"]
 
 
+def test_rank_maybe_candidates_prefers_tv_near_recommended_items(tmp_path: Path) -> None:
+    stronger = build_analysis_item_dict_item(
+        source=tmp_path / "stronger.mkv",
+        recommendation="maybe",
+        duration_seconds=2700.0,
+    )
+    stronger.size_bytes = 1500 * 1024**2
+    stronger.estimated_output_bytes = 760 * 1024**2
+    stronger.estimated_savings_bytes = stronger.size_bytes - stronger.estimated_output_bytes
+    stronger.reason_text = "episode-scale file with worthwhile projected savings; near recommended for TV/library cleanup"
+
+    weaker = build_analysis_item_dict_item(
+        source=tmp_path / "weaker.mkv",
+        recommendation="maybe",
+        duration_seconds=5400.0,
+    )
+    weaker.size_bytes = 1400 * 1024**2
+    weaker.estimated_output_bytes = 900 * 1024**2
+    weaker.estimated_savings_bytes = weaker.size_bytes - weaker.estimated_output_bytes
+
+    ranked = rank_maybe_candidates([weaker, stronger])
+
+    assert [item.source.name for item in ranked] == ["stronger.mkv", "weaker.mkv"]
+
+
 def test_describe_estimate_calibration_mentions_local_history(tmp_path: Path) -> None:
     item = build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended")
     calibration_store = {
@@ -576,6 +621,68 @@ def test_size_confidence_drops_when_local_history_is_highly_volatile(tmp_path: P
         )
 
     assert size_conf == "Medium"
+
+
+def test_estimate_time_confidence_downgrades_large_software_batch_with_slow_bias(
+    tmp_path: Path,
+) -> None:
+    items = [
+        build_analysis_item_dict_item(
+            source=tmp_path / f"ep{i:02d}.mkv",
+            recommendation="recommended",
+            duration_seconds=1800.0 + (i % 3) * 1200.0,
+        )
+        for i in range(30)
+    ]
+    calibration_store = {
+        "version": 1,
+        "records": [
+            {
+                "codec": "h264",
+                "container": ".mkv",
+                "resolution_bucket": "unknown",
+                "bitrate_bucket": "unknown",
+                "preset": "fast",
+                "preset_family": "software",
+                "crf": 20,
+                "input_bytes": 1000,
+                "output_bytes": 700,
+                "duration_seconds": 100.0,
+                "wall_seconds": 120.0,
+                "predicted_speed": 2.0,
+                "effective_speed": 1.4,
+                "fallback_used": False,
+                "retry_used": False,
+                "accepted_output": True,
+            }
+            for _ in range(6)
+        ],
+        "failures": [],
+    }
+
+    confidence = estimate_time_confidence(
+        items,
+        benchmarked_files=1,
+        preset="fast",
+        calibration_store=calibration_store,
+    )
+
+    assert confidence == "Medium"
+
+
+def test_estimate_time_range_widening_grows_for_large_software_batches(tmp_path: Path) -> None:
+    items = [
+        build_analysis_item_dict_item(
+            source=tmp_path / f"ep{i:02d}.mkv",
+            recommendation="recommended",
+            duration_seconds=1800.0 + (i % 4) * 1500.0,
+        )
+        for i in range(36)
+    ]
+
+    widen = estimate_time_range_widening(items, preset="fast", benchmarked_files=1)
+
+    assert widen >= 0.17
 
 
 def test_manifest_round_trip_keeps_duplicate_policy_and_notes(tmp_path: Path) -> None:

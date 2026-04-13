@@ -44,6 +44,10 @@ _MIN_SKIP_SAVINGS_BYTES = 250 * _MB
 _MIN_SKIP_SAVINGS_PCT = 10.0
 _MIN_RECOMMENDED_SAVINGS_BYTES = 1 * _GB
 _MIN_RECOMMENDED_SAVINGS_PCT = 25.0
+_MIN_TV_RECOMMENDED_SAVINGS_BYTES = 700 * _MB
+_MIN_TV_RECOMMENDED_SAVINGS_PCT = 20.0
+_TV_EPISODE_MAX_DURATION_SECONDS = 75 * 60
+_TV_EPISODE_MAX_SIZE_BYTES = 8 * _GB
 _HIGH_SIZE_ERROR_THRESHOLD = 0.18
 _VERY_HIGH_SIZE_ERROR_THRESHOLD = 0.25
 
@@ -96,6 +100,65 @@ def _average_size_error_for_items(
 
 def _candidate_items(items: list[AnalysisItem]) -> list[AnalysisItem]:
     return [item for item in items if item.recommendation != "skip"]
+
+
+def _is_tv_episode_scale(size_bytes: int, duration_seconds: float) -> bool:
+    return (
+        duration_seconds > 0
+        and duration_seconds <= _TV_EPISODE_MAX_DURATION_SECONDS
+        and size_bytes <= _TV_EPISODE_MAX_SIZE_BYTES
+    )
+
+
+def _is_tv_sized_recommended_candidate(
+    *,
+    codec: str | None,
+    size_bytes: int,
+    duration_seconds: float,
+    estimated_savings_bytes: int,
+    savings_pct: float,
+) -> bool:
+    return (
+        codec in _RECOMMENDED_CODECS
+        and _is_tv_episode_scale(size_bytes, duration_seconds)
+        and estimated_savings_bytes >= _MIN_TV_RECOMMENDED_SAVINGS_BYTES
+        and savings_pct >= _MIN_TV_RECOMMENDED_SAVINGS_PCT
+    )
+
+
+def maybe_priority_score(item: AnalysisItem) -> float:
+    savings_bytes = max(item.estimated_savings_bytes, 0)
+    savings_pct = (savings_bytes / item.size_bytes * 100.0) if item.size_bytes else 0.0
+    score = savings_bytes / float(_GB)
+    score += savings_pct / 25.0
+    if item.codec in _RECOMMENDED_CODECS:
+        score += 0.75
+    if _is_tv_episode_scale(item.size_bytes, item.duration_seconds):
+        score += 0.75
+    if savings_bytes >= _MIN_TV_RECOMMENDED_SAVINGS_BYTES:
+        score += 0.5
+    if savings_pct >= _MIN_TV_RECOMMENDED_SAVINGS_PCT:
+        score += 0.35
+    return score
+
+
+def rank_maybe_candidates(
+    items: list[AnalysisItem], *, limit: int | None = None
+) -> list[AnalysisItem]:
+    maybe_items = [item for item in items if item.recommendation == "maybe"]
+    ranked = sorted(
+        maybe_items,
+        key=lambda item: (
+            maybe_priority_score(item),
+            item.estimated_savings_bytes,
+            item.duration_seconds,
+            item.size_bytes,
+        ),
+        reverse=True,
+    )
+    if limit is None:
+        return ranked
+    return ranked[:limit]
 
 
 def _selected_batch_complexity_notes(
@@ -263,6 +326,37 @@ def build_analysis_item(
             reason_text="legacy codec with strong projected space savings",
         )
 
+    if _is_tv_sized_recommended_candidate(
+        codec=codec,
+        size_bytes=size_bytes,
+        duration_seconds=duration_seconds,
+        estimated_savings_bytes=estimated_savings_bytes,
+        savings_pct=savings_pct,
+    ):
+        return AnalysisItem(
+            source=path,
+            codec=codec,
+            size_bytes=size_bytes,
+            duration_seconds=duration_seconds,
+            bitrate_kbps=bitrate_kbps,
+            estimated_output_bytes=estimated_output_bytes,
+            estimated_savings_bytes=estimated_savings_bytes,
+            recommendation="recommended",
+            reason_code="strong_savings_candidate",
+            reason_text="episode-scale file with strong projected savings for TV/library cleanup",
+        )
+
+    reason_text = (
+        "episode-scale file with worthwhile projected savings; near recommended for TV/library cleanup"
+        if _is_tv_sized_recommended_candidate(
+            codec=codec,
+            size_bytes=size_bytes,
+            duration_seconds=duration_seconds,
+            estimated_savings_bytes=estimated_savings_bytes,
+            savings_pct=savings_pct + 4.0,
+        )
+        else "projected savings may be worthwhile, but the case is not strong enough for auto-selection"
+    )
     return AnalysisItem(
         source=path,
         codec=codec,
@@ -273,7 +367,7 @@ def build_analysis_item(
         estimated_savings_bytes=estimated_savings_bytes,
         recommendation="maybe",
         reason_code="borderline_candidate",
-        reason_text="projected savings may be worthwhile, but the case is not strong enough for auto-selection",
+        reason_text=reason_text,
     )
 
 
@@ -682,11 +776,72 @@ def estimate_time_confidence(
     if len(candidates) <= 1 and base == "High":
         base = "Medium"
 
+    duration_values = [item.duration_seconds for item in candidates if item.duration_seconds > 0]
+    duration_spread = (
+        max(duration_values) / max(min(duration_values), 1.0) if len(duration_values) >= 2 else 1.0
+    )
+    bias_summary = recent_bias_summary(active_store if use_calibration else None)
+    long_batch_risk = len(candidates) >= 24 and preset not in _HW_ENCODERS
+    if long_batch_risk and benchmarked_files <= 1 and base == "High":
+        base = "Medium"
+    if (
+        long_batch_risk
+        and benchmarked_files <= 1
+        and duration_spread >= 2.5
+        and base in {"High", "Medium"}
+    ):
+        base = "Low" if base == "Medium" else "Medium"
+    if (
+        isinstance(bias_summary, dict)
+        and bias_summary.get("speed_bias") == "slower_than_estimated"
+        and long_batch_risk
+        and base in {"High", "Medium"}
+    ):
+        base = "Low" if base == "Medium" else "Medium"
+
     if base == "High" or (base == "Medium" and speed_hits >= 2):
         return "High"
     if base == "Low" and speed_hits == 0:
         return "Low"
     return "Medium"
+
+
+def estimate_time_range_widening(
+    items: list[AnalysisItem],
+    *,
+    preset: str,
+    benchmarked_files: int = 0,
+    calibration_store: dict[str, object] | None = None,
+    use_calibration: bool = True,
+) -> float:
+    candidates = _candidate_items(items)
+    if not candidates:
+        return 0.0
+    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    widen = 0.0
+    count = len(candidates)
+    if count >= 24:
+        widen += 0.08
+    if count >= 48:
+        widen += 0.06
+    if preset not in _HW_ENCODERS and count >= 18:
+        widen += 0.05
+    if benchmarked_files <= 1 and count >= 24:
+        widen += 0.04
+    durations = [item.duration_seconds for item in candidates if item.duration_seconds > 0]
+    if len(durations) >= 2:
+        spread = max(durations) / max(min(durations), 1.0)
+        if spread >= 4.0:
+            widen += 0.05
+        elif spread >= 2.5:
+            widen += 0.03
+    bias_summary = recent_bias_summary(active_store if use_calibration else None)
+    if isinstance(bias_summary, dict):
+        if bias_summary.get("speed_bias") == "slower_than_estimated":
+            widen += 0.08
+        elif bias_summary.get("speed_bias") == "faster_than_estimated":
+            widen += 0.02
+    return min(widen, 0.28)
 
 
 def describe_estimate_confidence(
@@ -1095,9 +1250,16 @@ def display_analysis_summary(
             highlight=False,
         )
     if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
+        time_widen = estimate_time_range_widening(
+            items,
+            preset="fast",
+            benchmarked_files=0,
+            calibration_store=calibration_store,
+        )
         time_low, time_high = estimate_value_range(
             estimated_total_encode_seconds,
             confidence=time_confidence or estimate_confidence,
+            widen_by=time_widen,
         )
         console.print(
             f"Rough encode time: [cyan]~{_fmt_duration(time_low)}-{_fmt_duration(time_high)}[/cyan]"
@@ -1123,6 +1285,10 @@ def display_analysis_summary(
             else ""
         )
     )
+    if not recommended and maybe:
+        console.print(
+            "[dim]No strong auto-selections yet, but some maybe files still look worthwhile for TV/library cleanup.[/dim]"
+        )
     if notes:
         for note in notes:
             console.print(f"[dim yellow]{note}[/dim yellow]")

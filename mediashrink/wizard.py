@@ -30,6 +30,9 @@ from mediashrink.analysis import (
     estimate_analysis_encode_seconds,
     estimate_size_confidence,
     estimate_time_confidence,
+    estimate_time_range_widening,
+    maybe_priority_score,
+    rank_maybe_candidates,
     save_manifest,
     select_representative_items,
     summarize_container_risks,
@@ -92,6 +95,9 @@ _DEFAULT_FALLBACK_PROFILE = ("faster", 22, "Fast", "faster")
 _CONFIDENCE_LEVELS = ("Low", "Medium", "High")
 _DEGRADED_PROMPT_THRESHOLD = 3
 _LAST_WIZARD_REPORT_CONTEXT: dict[str, object] | None = None
+_STRONGEST_MAYBE_LIMIT = 12
+_LARGE_BATCH_FILE_THRESHOLD = 24
+_OVERNIGHT_BATCH_SECONDS = 8 * 60 * 60
 
 
 class _WizardFallbackRequested(Exception):
@@ -783,9 +789,46 @@ def _describe_selected_scope(
     selected_maybe = len(selected_sources & maybe_sources)
     if selected_sources and selected_sources <= recommended_sources:
         return "recommended files only"
+    if recommended_sources == set() and selected_maybe:
+        return f"strongest maybe files ({selected_maybe} file(s))"
     if selected_maybe:
         return f"recommended files plus {selected_maybe} chosen maybe file(s)"
     return "selected files"
+
+
+def _strongest_maybe_items(
+    maybe_items: list[AnalysisItem], *, limit: int = _STRONGEST_MAYBE_LIMIT
+) -> list[AnalysisItem]:
+    ranked = rank_maybe_candidates(maybe_items, limit=limit)
+    if len(ranked) <= 1:
+        return ranked
+    top_score = maybe_priority_score(ranked[0])
+    shortlisted = [
+        item for item in ranked if maybe_priority_score(item) >= max(3.8, top_score - 1.0)
+    ]
+    return shortlisted or ranked[:1]
+
+
+def _large_batch_guidance(
+    *,
+    selected_count: int,
+    total_candidates: int,
+    estimated_seconds: float | None = None,
+) -> str | None:
+    if selected_count < _LARGE_BATCH_FILE_THRESHOLD and (
+        estimated_seconds is None or estimated_seconds < _OVERNIGHT_BATCH_SECONDS
+    ):
+        return None
+    left_out = max(total_candidates - selected_count, 0)
+    if estimated_seconds is not None and estimated_seconds >= _OVERNIGHT_BATCH_SECONDS:
+        return (
+            f"This looks like an overnight-scale batch. Running {selected_count} now with {left_out} left out is sensible; "
+            "split by season or smaller chunks if you want easier checkpoints."
+        )
+    return (
+        f"This is a large batch ({selected_count} selected, {left_out} left out). "
+        "Consider splitting by season or smaller chunks if you want quicker checkpoints."
+    )
 
 
 def _select_risky_probe_items(
@@ -2353,10 +2396,17 @@ def display_profiles_table(
 
     def _est_time_text(profile: EncoderProfile) -> str:
         if profile.estimated_encode_seconds > 0:
+            widen = 0.0
+            if candidate_count >= _LARGE_BATCH_FILE_THRESHOLD:
+                widen += 0.08
+            if candidate_count >= 48:
+                widen += 0.06
+            if profile.encoder_key not in _HW_ENCODERS and candidate_count >= 18:
+                widen += 0.05
             low_seconds, high_seconds = estimate_value_range(
                 profile.estimated_encode_seconds,
                 confidence=time_confidence,
-                widen_by=0.05 if profile.incompatible_count else 0.0,
+                widen_by=(0.05 if profile.incompatible_count else 0.0) + widen,
             )
             return _format_duration_range(low_seconds, high_seconds)
         if profile.sw_preset in {"slow", "slower", "veryslow"}:
@@ -2513,8 +2563,13 @@ def display_profiles_table(
         f"  [dim]Likely encode candidates: {candidate_count} file(s) / {_fmt_size(total_input_bytes)}[/dim]"
     )
     if recommended_count:
+        scope_tone = "high-value batch"
+        if recommended_count < max(3, candidate_count // 6):
+            scope_tone = "selective starter batch"
+        elif candidate_count >= _LARGE_BATCH_FILE_THRESHOLD and recommended_count < candidate_count:
+            scope_tone = "cleanup-style batch"
         console.print(
-            f"  [dim]Recommended-only default scope: {recommended_count} file(s). Each profile also shows a recommended-only compatibility line.[/dim]"
+            f"  [dim]Recommended-only default scope: {recommended_count} file(s) ({scope_tone}). Each profile also shows a recommended-only compatibility line.[/dim]"
         )
         if recommended is not None and recommended.compatible_count * 2 <= max(
             recommended_count, 1
@@ -2528,6 +2583,17 @@ def display_profiles_table(
     console.print(
         "  [dim]Hardware presets are still full re-encodes; source bitrate, resolution, and runtime dominate total time.[/dim]"
     )
+    guidance = _large_batch_guidance(
+        selected_count=recommended_count or candidate_count,
+        total_candidates=candidate_count,
+        estimated_seconds=(
+            recommended.estimated_encode_seconds
+            if recommended is not None and recommended.estimated_encode_seconds > 0
+            else None
+        ),
+    )
+    if guidance:
+        console.print(f"  [dim]{guidance}[/dim]")
     if time_confidence is not None:
         console.print(
             f"  [dim]Time confidence: {time_confidence}"
@@ -2762,14 +2828,21 @@ def display_candidate_table(title: str, items: list[AnalysisItem], console: Cons
     console.print()
 
 
-def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Console) -> str:
+def prompt_analysis_action(
+    recommended_count: int,
+    maybe_count: int,
+    console: Console,
+    *,
+    recommended_label: str = "recommended",
+    maybe_label: str = "maybe",
+) -> str:
     console.print("[bold]Next step:[/bold]")
     if maybe_count:
-        console.print(f"  1. Compress recommended only ({recommended_count} file(s))")
+        console.print(f"  1. Compress {recommended_label} only ({recommended_count} file(s))")
     else:
-        console.print(f"  1. Compress recommended files ({recommended_count} file(s))")
+        console.print(f"  1. Compress {recommended_label} files ({recommended_count} file(s))")
     if maybe_count:
-        console.print(f"  2. Review maybe files ({maybe_count} file(s))")
+        console.print(f"  2. Review {maybe_label} files ({maybe_count} file(s))")
         console.print("  3. Export manifest")
         console.print("  4. Cancel")
         max_choice = 4
@@ -2796,10 +2869,10 @@ def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Co
             choice = -1
 
         if choice == 1:
-            console.print("[dim]Next step selected:[/dim] Compress recommended files")
+            console.print(f"[dim]Next step selected:[/dim] Compress {recommended_label} files")
             return "compress_recommended"
         if maybe_count and choice == 2:
-            console.print("[dim]Next step selected:[/dim] Review maybe files")
+            console.print(f"[dim]Next step selected:[/dim] Review {maybe_label} files")
             return "review_maybe"
         if choice == export_choice:
             console.print("[dim]Next step selected:[/dim] Export manifest")
@@ -2811,16 +2884,23 @@ def prompt_analysis_action(recommended_count: int, maybe_count: int, console: Co
         console.print("[yellow]Invalid choice.[/yellow]")
 
 
-def review_maybe_items(maybe_items: list[AnalysisItem], console: Console) -> bool:
-    display_candidate_table("Maybe files", maybe_items, console)
+def review_maybe_items(
+    maybe_items: list[AnalysisItem],
+    console: Console,
+    *,
+    title: str = "Maybe files",
+    prompt_text: str = "Include maybe files in this run?",
+    decision_label: str = "Maybe files decision",
+) -> bool:
+    display_candidate_table(title, maybe_items, console)
     include = _wizard_confirm(
-        "Include maybe files in this run?",
+        prompt_text,
         default=False,
         prompt_id="include-maybe",
         acceptance_label="Include maybe files",
     )
     console.print(
-        f"[dim]Maybe files decision:[/dim] {'Included in this run' if include else 'Left out for now'}"
+        f"[dim]{decision_label}:[/dim] {'Included in this run' if include else 'Left out for now'}"
     )
     return include
 
@@ -3370,8 +3450,22 @@ def run_wizard(
         ]
         maybe_items = [item for item in analysis_items if item.recommendation == "maybe"]
         if not recommended_items:
-            console.print("[dim]No recommended files were found for automatic compression.[/dim]")
-            return [], "cancel", False, None
+            if not maybe_items:
+                console.print(
+                    "[dim]No recommended files were found for automatic compression.[/dim]"
+                )
+                return [], "cancel", False, None
+            strongest_maybe_items = _strongest_maybe_items(maybe_items)
+            strongest_sources = {item.source for item in strongest_maybe_items}
+            console.print(
+                "[dim]No strong auto-selections were found, but some maybe files still look worthwhile for TV/library cleanup.[/dim]"
+            )
+            console.print(
+                f"[dim]Default shortlist:[/dim] {len(strongest_maybe_items)} strongest maybe file(s); "
+                f"{max(len(maybe_items) - len(strongest_maybe_items), 0)} broader maybe file(s) left for later review."
+            )
+            recommended_items = strongest_maybe_items
+            maybe_items = [item for item in maybe_items if item.source not in strongest_sources]
 
         candidate_items = recommended_items + maybe_items
         mkv_candidate_count, mkv_grouped_reasons, mkv_examples = _summarize_mkv_suitable_candidates(
@@ -3553,6 +3647,9 @@ def run_wizard(
         direct_followup_names: list[str] = []
         followup_file_names: list[str] = []
         original_benchmark_source = planning.sample_item.source
+        default_scope_is_strongest_maybes = not any(
+            item.recommendation == "recommended" for item in analysis_items
+        ) and bool(recommended_items)
         selected_scope_label = _describe_selected_scope(
             selected_items,
             recommended_items=recommended_items,
@@ -3616,10 +3713,29 @@ def run_wizard(
                 action = (
                     "compress_recommended"
                     if active_auto
-                    else prompt_analysis_action(len(recommended_items), len(maybe_items), console)
+                    else prompt_analysis_action(
+                        len(recommended_items),
+                        len(maybe_items),
+                        console,
+                        recommended_label=(
+                            "strongest maybe shortlist"
+                            if default_scope_is_strongest_maybes
+                            else "recommended"
+                        ),
+                        maybe_label=(
+                            "remaining maybe" if default_scope_is_strongest_maybes else "maybe"
+                        ),
+                    )
                 )
                 if active_auto:
-                    console.print("[dim]Next step selected:[/dim] Compress recommended files")
+                    console.print(
+                        "[dim]Next step selected:[/dim] "
+                        + (
+                            "Compress strongest maybe shortlist files"
+                            if default_scope_is_strongest_maybes
+                            else "Compress recommended files"
+                        )
+                    )
                 if action == "cancel":
                     return [], "cancel", False, None
                 if action == "export":
@@ -3682,7 +3798,25 @@ def run_wizard(
                 if (
                     action == "review_maybe"
                     and maybe_items
-                    and review_maybe_items(maybe_items, console)
+                    and review_maybe_items(
+                        maybe_items,
+                        console,
+                        title=(
+                            "Remaining maybe files"
+                            if default_scope_is_strongest_maybes
+                            else "Maybe files"
+                        ),
+                        prompt_text=(
+                            "Include the remaining maybe files in this run?"
+                            if default_scope_is_strongest_maybes
+                            else "Include maybe files in this run?"
+                        ),
+                        decision_label=(
+                            "Remaining maybe files decision"
+                            if default_scope_is_strongest_maybes
+                            else "Maybe files decision"
+                        ),
+                    )
                 ):
                     selected_items.extend(maybe_items)
                 selected_scope_label = _describe_selected_scope(
@@ -4245,11 +4379,18 @@ def run_wizard(
                     "  [dim]Local history for this encoder/profile is too inconsistent to offer a tighter output-size estimate for the surviving batch.[/dim]"
                 )
         if estimated_total_encode_seconds is not None and estimated_total_encode_seconds > 0:
+            time_widen = estimate_time_range_widening(
+                selected_items,
+                preset=preset,
+                benchmarked_files=1,
+                calibration_store=active_calibration,
+                use_calibration=use_calibration,
+            )
             time_low, time_high = estimate_value_range(
                 estimated_total_encode_seconds,
                 confidence=time_confidence_label,
                 average_error=selected_profile_speed_error,
-                widen_by=0.04 if (mkv_sidecar_count or followup_count) else 0.0,
+                widen_by=(0.04 if (mkv_sidecar_count or followup_count) else 0.0) + time_widen,
             )
             console.print(f"  Est. time: {_format_duration_range(time_low, time_high)}")
             if ready_time_refinement_note:
@@ -4263,6 +4404,13 @@ def run_wizard(
                 console.print(
                     "  [dim]Time estimate was refined after selection using the exact run scope and current calibration data.[/dim]"
                 )
+        ready_guidance = _large_batch_guidance(
+            selected_count=len(selected_items),
+            total_candidates=len(candidate_items),
+            estimated_seconds=estimated_total_encode_seconds,
+        )
+        if ready_guidance:
+            console.print(f"  [dim]{ready_guidance}[/dim]")
         console.print(f"  Size confidence: {size_confidence_label}")
         console.print(f"  Time confidence: {time_confidence_label}")
         if time_confidence_scope_note:
