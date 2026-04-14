@@ -27,9 +27,14 @@ from mediashrink.analysis import (
     estimate_analysis_encode_seconds,
     estimate_size_confidence,
     estimate_time_confidence,
+    format_tv_cohort_lines,
     load_manifest,
+    manifest_split_mode_choices,
     save_manifest,
     select_representative_items,
+    split_items_by_tv_cohort,
+    summarize_tv_cohorts,
+    write_split_manifests,
 )
 from mediashrink.calibration import (
     CalibrationRecord,
@@ -77,6 +82,8 @@ from mediashrink.progress import EncodingDisplay
 from mediashrink.scanner import (
     build_jobs,
     duplicate_policy_choices,
+    episodic_duplicate_warnings,
+    parse_episode_grouping,
     scan_directory,
     supported_formats_label,
 )
@@ -135,6 +142,7 @@ _FAILURE_POLICY_CHOICES = {"skip", "retry", "stop"}
 _RETRY_MODE_CHOICES = {"conservative", "balanced", "aggressive"}
 _QUEUE_STRATEGY_CHOICES = {"original", "safe-first", "largest-first"}
 _DUPLICATE_POLICY_CHOICES = set(duplicate_policy_choices())
+_MANIFEST_SPLIT_MODE_CHOICES = set(manifest_split_mode_choices())
 
 
 def _now_iso() -> str:
@@ -224,12 +232,107 @@ def _validate_duplicate_policy(value: str) -> str:
     return value
 
 
+def _validate_manifest_split_mode(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value not in _MANIFEST_SPLIT_MODE_CHOICES:
+        raise typer.BadParameter(f"invalid manifest split mode '{value}'")
+    return value
+
+
 def _validate_require_net_savings(value: float | None) -> float | None:
     if value is None:
         return None
     if value < 0 or value >= 100:
         raise typer.BadParameter("--require-net-savings must be between 0 and less than 100")
     return float(value)
+
+
+def _summarize_result_cohorts(
+    results: list[EncodeResult],
+    *,
+    group_by: str,
+    limit: int = 5,
+) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for result in results:
+        episode = parse_episode_grouping(result.job.source)
+        if episode is None:
+            continue
+        label = episode.show if group_by == "show" else episode.season_label
+        entry = grouped.setdefault(
+            label,
+            {
+                "label": label,
+                "group_by": group_by,
+                "file_count": 0,
+                "input_bytes": 0,
+                "output_bytes": 0,
+                "saved_bytes": 0,
+                "elapsed_seconds": 0.0,
+                "avg_speed": 0.0,
+                "containers": {},
+            },
+        )
+        entry["file_count"] = int(entry["file_count"]) + 1
+        entry["input_bytes"] = int(entry["input_bytes"]) + result.input_size_bytes
+        entry["output_bytes"] = int(entry["output_bytes"]) + result.output_size_bytes
+        entry["saved_bytes"] = int(entry["saved_bytes"]) + max(result.size_reduction_bytes, 0)
+        entry["elapsed_seconds"] = float(entry["elapsed_seconds"]) + result.duration_seconds
+        speed = (
+            result.media_duration_seconds / result.duration_seconds
+            if result.media_duration_seconds > 0 and result.duration_seconds > 0
+            else 0.0
+        )
+        entry["avg_speed"] = float(entry["avg_speed"]) + speed
+        containers = entry["containers"]
+        if isinstance(containers, dict):
+            suffix = result.job.source.suffix.lower() or "?"
+            containers[suffix] = int(containers.get(suffix, 0)) + 1
+    summaries = []
+    for entry in grouped.values():
+        count = int(entry["file_count"])
+        if count > 0:
+            entry["avg_speed"] = float(entry["avg_speed"]) / count
+        summaries.append(entry)
+    summaries.sort(
+        key=lambda entry: (
+            -float(entry["elapsed_seconds"]),
+            -int(entry["saved_bytes"]),
+            str(entry["label"]).lower(),
+        )
+    )
+    return summaries[:limit]
+
+
+def _runtime_outliers(results: list[EncodeResult], *, limit: int = 5) -> list[dict[str, object]]:
+    outliers: list[dict[str, object]] = []
+    for result in results:
+        estimate_miss = None
+        if result.job.estimated_output_bytes > 0 and result.output_size_bytes > 0:
+            estimate_miss = (
+                result.output_size_bytes - result.job.estimated_output_bytes
+            ) / result.job.estimated_output_bytes
+        outliers.append(
+            {
+                "name": result.job.source.name,
+                "duration_seconds": result.duration_seconds,
+                "speed": (
+                    result.media_duration_seconds / result.duration_seconds
+                    if result.media_duration_seconds > 0 and result.duration_seconds > 0
+                    else None
+                ),
+                "estimate_miss_ratio": estimate_miss,
+            }
+        )
+    outliers.sort(
+        key=lambda entry: (
+            -float(entry["duration_seconds"]),
+            -abs(float(entry["estimate_miss_ratio"] or 0.0)),
+            str(entry["name"]).lower(),
+        )
+    )
+    return outliers[:limit]
 
 
 def _resolve_runtime_settings(
@@ -762,6 +865,18 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
     followup_manifest = payload.get("split_followup_manifest")
     if isinstance(followup_manifest, str) and followup_manifest:
         guidance.append(f"Review the follow-up manifest for left-out files: {followup_manifest}")
+    cohort_summaries = payload.get("cohort_summaries")
+    if isinstance(cohort_summaries, dict):
+        show_summaries = cohort_summaries.get("show")
+        if isinstance(show_summaries, list) and show_summaries:
+            top = show_summaries[0]
+            if isinstance(top, dict) and top.get("label"):
+                guidance.append(f"Top time-saving cohort in this run: {top['label']}.")
+    runtime_outliers = payload.get("runtime_outliers")
+    if isinstance(runtime_outliers, list) and runtime_outliers:
+        slowest = runtime_outliers[0]
+        if isinstance(slowest, dict) and slowest.get("name"):
+            guidance.append(f"Slowest file in this run: {slowest['name']}.")
     if not guidance:
         guidance.append("No manual follow-up is suggested from this report.")
     return guidance
@@ -1044,6 +1159,7 @@ def _write_batch_reports(
     estimate_ranges: dict[str, object] | None = None,
     container_fallback_actions: dict[str, object] | None = None,
     require_net_savings_pct: float | None = None,
+    split_manifest_index: dict[str, object] | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1112,6 +1228,15 @@ def _write_batch_reports(
         "container_fallback_actions": container_fallback_actions,
         "require_net_savings_pct": require_net_savings_pct,
         "grouped_incompatibilities": grouped_incompatibilities,
+        "cohort_summaries": {
+            "show": _summarize_result_cohorts(results, group_by="show"),
+            "season": _summarize_result_cohorts(results, group_by="season"),
+        },
+        "runtime_outliers": _runtime_outliers(results),
+        "duplicate_episode_warnings": episodic_duplicate_warnings(
+            [result.job.source for result in results], limit=5
+        ),
+        "split_manifest_index": split_manifest_index,
         "files": files,
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1254,6 +1379,61 @@ def _write_batch_reports(
                 lines.append(
                     f"    * {entry.get('name')}: {entry.get('reason')} Next step: {entry.get('next_step')}"
                 )
+    duplicate_episode_notes = payload.get("duplicate_episode_warnings")
+    if isinstance(duplicate_episode_notes, list) and duplicate_episode_notes:
+        lines.extend(["", "Duplicate-looking TV episodes"])
+        for note in duplicate_episode_notes:
+            if isinstance(note, str):
+                lines.append(f"  - {note}")
+    cohort_summaries = payload.get("cohort_summaries")
+    if isinstance(cohort_summaries, dict):
+        show_summaries = cohort_summaries.get("show")
+        if isinstance(show_summaries, list) and show_summaries:
+            lines.extend(["", "Top show cohorts"])
+            for entry in show_summaries[:3]:
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(
+                    f"  - {entry.get('label')}: {entry.get('file_count')} file(s), "
+                    f"{_fmt_size(int(entry.get('saved_bytes', 0) or 0))} saved in "
+                    f"{_fmt_duration(float(entry.get('elapsed_seconds', 0.0) or 0.0))}"
+                )
+        season_summaries = cohort_summaries.get("season")
+        if isinstance(season_summaries, list) and season_summaries:
+            lines.extend(["", "Top season cohorts"])
+            for entry in season_summaries[:3]:
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(
+                    f"  - {entry.get('label')}: {entry.get('file_count')} file(s), "
+                    f"avg speed {float(entry.get('avg_speed', 0.0) or 0.0):.2f}x"
+                )
+    runtime_outliers = payload.get("runtime_outliers")
+    if isinstance(runtime_outliers, list) and runtime_outliers:
+        lines.extend(["", "Runtime outliers"])
+        for entry in runtime_outliers[:5]:
+            if not isinstance(entry, dict):
+                continue
+            miss = entry.get("estimate_miss_ratio")
+            miss_text = ""
+            if isinstance(miss, (int, float)):
+                miss_text = f", estimate miss {miss * 100:+.0f}%"
+            lines.append(
+                f"  - {entry.get('name')}: {_fmt_duration(float(entry.get('duration_seconds', 0.0) or 0.0))}"
+                + miss_text
+            )
+    if split_manifest_index:
+        entries = split_manifest_index.get("generated_manifests")
+        lines.extend(["", "Split manifest index"])
+        if isinstance(entries, list) and entries:
+            for entry in entries[:5]:
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(
+                    f"  - {entry.get('label')}: {entry.get('manifest_path')} ({entry.get('file_count')} file(s))"
+                )
+        else:
+            lines.append("  - none")
     lines.extend(["", "Files"])
     for result in results:
         status = _classify_result_status(result).upper()
@@ -2614,7 +2794,15 @@ def analyze(
         "--duplicate-policy",
         help="How to handle likely duplicate titles across formats: prefer-mkv, all, or skip-title.",
     ),
+    manifest_split_by: Optional[str] = typer.Option(
+        None,
+        "--manifest-split-by",
+        help="When exporting manifests, split them by show or season instead of writing one combined manifest.",
+    ),
 ) -> None:
+    split_mode = _validate_manifest_split_mode(manifest_split_by)
+    if split_mode is not None and manifest_out is None:
+        raise typer.BadParameter("--manifest-split-by requires --manifest-out")
     quiet_console = Console(quiet=True) if json_output else console
     ffmpeg, ffprobe = _prepare_tools(None)
     effective_crf, effective_preset, profile_name = _resolve_encode_settings(profile, crf, preset)
@@ -2716,22 +2904,42 @@ def analyze(
         )
 
     if manifest_out is not None:
-        manifest = build_manifest(
-            directory=directory,
-            recursive=recursive,
-            preset=effective_preset,
-            crf=effective_crf,
-            profile_name=profile_name,
-            estimated_total_encode_seconds=estimated_total_encode_seconds,
-            estimate_confidence=estimate_confidence,
-            size_confidence=size_confidence,
-            size_confidence_detail=size_confidence_detail,
-            time_confidence=time_confidence,
-            time_confidence_detail=time_confidence_detail,
-            duplicate_policy=duplicate_policy,
-            items=items,
-        )
-        save_manifest(manifest, manifest_out)
+        if split_mode is None:
+            manifest = build_manifest(
+                directory=directory,
+                recursive=recursive,
+                preset=effective_preset,
+                crf=effective_crf,
+                profile_name=profile_name,
+                estimated_total_encode_seconds=estimated_total_encode_seconds,
+                estimate_confidence=estimate_confidence,
+                size_confidence=size_confidence,
+                size_confidence_detail=size_confidence_detail,
+                time_confidence=time_confidence,
+                time_confidence_detail=time_confidence_detail,
+                duplicate_policy=duplicate_policy,
+                items=items,
+            )
+            save_manifest(manifest, manifest_out)
+        else:
+            write_split_manifests(
+                directory=directory,
+                recursive=recursive,
+                preset=effective_preset,
+                crf=effective_crf,
+                profile_name=profile_name,
+                estimated_total_encode_seconds=estimated_total_encode_seconds,
+                estimate_confidence=estimate_confidence,
+                size_confidence=size_confidence,
+                size_confidence_detail=size_confidence_detail,
+                time_confidence=time_confidence,
+                time_confidence_detail=time_confidence_detail,
+                duplicate_policy=duplicate_policy,
+                items=[item for item in items if item.recommendation == "recommended"],
+                split_by=split_mode,
+                index_path=manifest_out,
+                notes=duplicate_notes,
+            )
         if not json_output:
             console.print(f"[green]Wrote manifest[/green] {manifest_out}")
 

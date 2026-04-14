@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,10 +23,13 @@ from mediashrink.analysis import (
     estimate_size_confidence,
     estimate_time_confidence,
     estimate_time_range_widening,
+    format_tv_cohort_lines,
     load_manifest,
     rank_maybe_candidates,
     save_manifest,
     select_representative_items,
+    summarize_tv_cohorts,
+    write_split_manifests,
 )
 
 FFMPEG = Path("/usr/bin/ffmpeg")
@@ -194,6 +198,88 @@ def test_manifest_load_rejects_invalid_shape(tmp_path: Path) -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_summarize_tv_cohorts_groups_common_episode_names(tmp_path: Path) -> None:
+    one = build_analysis_item_dict_item(
+        source=tmp_path / "Show Name (2012) - s01e01 - Pilot.mkv",
+        recommendation="recommended",
+    )
+    two = build_analysis_item_dict_item(
+        source=tmp_path / "Show Name (2012) - s01e02 - Episode 2.mkv",
+        recommendation="maybe",
+    )
+    movie = build_analysis_item_dict_item(
+        source=tmp_path / "A Film (2010).mkv",
+        recommendation="recommended",
+    )
+
+    summaries = summarize_tv_cohorts([one, two, movie], group_by="show")
+
+    assert len(summaries) == 1
+    assert summaries[0]["label"] == "Show Name (2012)"
+    assert summaries[0]["recommended"] == 1
+    assert summaries[0]["maybe"] == 1
+
+
+def test_format_tv_cohort_lines_mentions_season_and_mix(tmp_path: Path) -> None:
+    first = build_analysis_item_dict_item(
+        source=tmp_path / "Example Show - s02e01 - A.mkv",
+        recommendation="recommended",
+    )
+    second = build_analysis_item_dict_item(
+        source=tmp_path / "Example Show - s02e02 - B.mp4",
+        recommendation="maybe",
+    )
+
+    lines = format_tv_cohort_lines([first, second], group_by="season", limit=1)
+
+    assert len(lines) == 1
+    assert "Example Show S02" in lines[0]
+    assert "mix:" in lines[0]
+
+
+def test_write_split_manifests_creates_index_and_grouped_manifests(tmp_path: Path) -> None:
+    show_a_1 = build_analysis_item_dict_item(
+        source=tmp_path / "Show A - s01e01 - Pilot.mkv",
+        recommendation="recommended",
+    )
+    show_a_2 = build_analysis_item_dict_item(
+        source=tmp_path / "Show A - s01e02 - Two.mkv",
+        recommendation="recommended",
+    )
+    show_b_1 = build_analysis_item_dict_item(
+        source=tmp_path / "Show B - s02e01 - Start.mkv",
+        recommendation="recommended",
+    )
+    index_path = tmp_path / "split-index.json"
+
+    written_index, entries = write_split_manifests(
+        directory=tmp_path,
+        recursive=True,
+        preset="fast",
+        crf=20,
+        profile_name=None,
+        estimated_total_encode_seconds=1000.0,
+        estimate_confidence="Medium",
+        size_confidence="Medium",
+        size_confidence_detail="detail",
+        time_confidence="Medium",
+        time_confidence_detail="detail",
+        duplicate_policy="prefer-mkv",
+        items=[show_a_1, show_a_2, show_b_1],
+        split_by="show",
+        index_path=index_path,
+        notes=["note"],
+    )
+
+    assert written_index == index_path
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["split_by"] == "show"
+    assert len(entries) == 2
+    first_manifest = Path(entries[0]["manifest_path"])
+    loaded = load_manifest(first_manifest)
+    assert loaded.notes == ["note"]
+
+
 def test_estimate_analysis_encode_seconds_uses_recommended_only(tmp_path: Path) -> None:
     recommended = build_analysis_item_dict_item(
         source=tmp_path / "recommended.mkv",
@@ -336,8 +422,12 @@ def test_estimate_analysis_encode_seconds_software_blend_leans_toward_slower_his
 def test_display_analysis_summary_prints_counts(tmp_path: Path) -> None:
     console = Console(record=True, width=140)
     items = [
-        build_analysis_item_dict_item(source=tmp_path / "a.mkv", recommendation="recommended"),
-        build_analysis_item_dict_item(source=tmp_path / "b.mkv", recommendation="maybe"),
+        build_analysis_item_dict_item(
+            source=tmp_path / "Show A - s01e01 - Pilot.mkv", recommendation="recommended"
+        ),
+        build_analysis_item_dict_item(
+            source=tmp_path / "Show A - s01e02 - Second.mkv", recommendation="maybe"
+        ),
         build_analysis_item_dict_item(source=tmp_path / "c.mkv", recommendation="skip"),
     ]
 
@@ -357,6 +447,7 @@ def test_display_analysis_summary_prints_counts(tmp_path: Path) -> None:
     assert "Rough encode time" in output
     assert "Size confidence: High" in output
     assert "Time confidence: High" in output
+    assert "Top shows:" in output
 
 
 def test_estimate_analysis_confidence_prefers_known_durations_and_low_codec_mix(

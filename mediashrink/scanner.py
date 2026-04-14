@@ -2,12 +2,35 @@ from __future__ import annotations
 
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from mediashrink.models import EncodeJob
 
 SUPPORTED_EXTENSIONS = (".mkv", ".mp4", ".m4v")
 _DUPLICATE_POLICY_CHOICES = {"prefer-mkv", "all", "skip-title"}
+
+
+@dataclass(frozen=True)
+class EpisodeGrouping:
+    show: str
+    season: int
+    episode: int
+    season_label: str
+    episode_code: str
+    episode_title: str | None
+
+
+_TV_PATTERNS = (
+    re.compile(
+        r"^(?P<show>.+?)\s*-\s*s(?P<season>\d{1,2})e(?P<episode>\d{1,3})(?:\s*-\s*(?P<title>.+))?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?P<show>.+?)[ ._-]+s(?P<season>\d{1,2})e(?P<episode>\d{1,3})(?:[ ._-]+(?P<title>.+))?$",
+        re.IGNORECASE,
+    ),
+)
 
 
 def _natural_sort_key(path: Path) -> list[int | str]:
@@ -32,6 +55,55 @@ def scan_directory(directory: Path, recursive: bool = False) -> list[Path]:
 
 def duplicate_policy_choices() -> tuple[str, ...]:
     return tuple(sorted(_DUPLICATE_POLICY_CHOICES))
+
+
+def parse_episode_grouping(path: Path) -> EpisodeGrouping | None:
+    stem = path.stem.strip()
+    for pattern in _TV_PATTERNS:
+        match = pattern.match(stem)
+        if match is None:
+            continue
+        show = re.sub(r"\s+", " ", match.group("show").strip(" -._"))
+        if not show:
+            return None
+        season = int(match.group("season"))
+        episode = int(match.group("episode"))
+        title = match.groupdict().get("title")
+        cleaned_title = (
+            re.sub(r"\s+", " ", title.strip(" -._"))
+            if isinstance(title, str) and title.strip()
+            else None
+        )
+        return EpisodeGrouping(
+            show=show,
+            season=season,
+            episode=episode,
+            season_label=f"{show} S{season:02d}",
+            episode_code=f"S{season:02d}E{episode:02d}",
+            episode_title=cleaned_title,
+        )
+    return None
+
+
+def episodic_duplicate_warnings(paths: list[Path], *, limit: int = 5) -> list[str]:
+    grouped: dict[tuple[str, int, int], list[Path]] = {}
+    for path in paths:
+        episode = parse_episode_grouping(path)
+        if episode is None:
+            continue
+        grouped.setdefault((episode.show, episode.season, episode.episode), []).append(path)
+    warnings: list[str] = []
+    for show, season, episode in sorted(grouped):
+        group = sorted(grouped[(show, season, episode)], key=_natural_sort_key)
+        if len(group) <= 1:
+            continue
+        warnings.append(
+            f"Possible duplicate TV episode kept for review: {show} S{season:02d}E{episode:02d} -> "
+            + ", ".join(path.name for path in group)
+        )
+        if len(warnings) >= limit:
+            break
+    return warnings
 
 
 def _normalize_title(path: Path) -> str:

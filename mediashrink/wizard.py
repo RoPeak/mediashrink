@@ -31,10 +31,13 @@ from mediashrink.analysis import (
     estimate_size_confidence,
     estimate_time_confidence,
     estimate_time_range_widening,
+    format_tv_cohort_lines,
     maybe_priority_score,
     rank_maybe_candidates,
     save_manifest,
     select_representative_items,
+    summarize_tv_cohorts,
+    write_split_manifests,
     summarize_container_risks,
     describe_time_confidence_scope_adjustment,
 )
@@ -829,6 +832,37 @@ def _large_batch_guidance(
         f"This is a large batch ({selected_count} selected, {left_out} left out). "
         "Consider splitting by season or smaller chunks if you want quicker checkpoints."
     )
+
+
+def _cohort_guidance_lines(
+    *,
+    selected_items: list[AnalysisItem],
+    left_out_items: list[AnalysisItem],
+) -> list[str]:
+    lines: list[str] = []
+    top_shows = format_tv_cohort_lines(selected_items, group_by="show", limit=2)
+    top_seasons = format_tv_cohort_lines(selected_items, group_by="season", limit=2)
+    if top_shows:
+        lines.append("Selected shows: " + " | ".join(top_shows))
+    if top_seasons:
+        lines.append("Selected seasons: " + " | ".join(top_seasons))
+    if left_out_items:
+        left_show_count = len(summarize_tv_cohorts(left_out_items, group_by="show"))
+        left_season_count = len(summarize_tv_cohorts(left_out_items, group_by="season"))
+        if left_show_count or left_season_count:
+            lines.append(
+                f"Left out for later review: {left_show_count} show cohort(s), {left_season_count} season cohort(s)."
+            )
+    risky = [
+        item
+        for item in selected_items
+        if item.source.suffix.lower() in {".mp4", ".m4v"} and (item.codec or "") == "h264"
+    ]
+    if risky:
+        lines.append(
+            f"Tail-risk hint: {len(risky)} MP4/H.264 file(s) in this selection may dominate the end of the batch."
+        )
+    return lines
 
 
 def _select_risky_probe_items(
@@ -2905,6 +2939,27 @@ def review_maybe_items(
     return include
 
 
+def prompt_manifest_split_mode(console: Console) -> str:
+    console.print("[bold]Manifest export:[/bold]")
+    console.print("  1. Combined manifest")
+    console.print("  2. Split manifests by show")
+    console.print("  3. Split manifests by season")
+    while True:
+        choice = _wizard_prompt(
+            "Choose export mode [1-3]",
+            default="1",
+            prompt_id="manifest-split-mode",
+            acceptance_label="Manifest export mode",
+        ).strip()
+        if choice == "1":
+            return "combined"
+        if choice == "2":
+            return "show"
+        if choice == "3":
+            return "season"
+        console.print("[yellow]Invalid choice.[/yellow]")
+
+
 def _subtitle_drop_warning(jobs: list[EncodeJob], ffprobe: Path) -> str | None:
     affected: list[str] = []
     for job in jobs:
@@ -3790,7 +3845,48 @@ def run_wizard(
                             acceptance_label="Manifest path",
                         )
                     )
-                    save_manifest(manifest, manifest_path)
+                    split_mode = "combined" if active_auto else prompt_manifest_split_mode(console)
+                    if split_mode == "combined":
+                        save_manifest(manifest, manifest_path)
+                    else:
+                        write_split_manifests(
+                            directory=directory,
+                            recursive=recursive,
+                            preset=preset,
+                            crf=crf,
+                            profile_name=None,
+                            estimated_total_encode_seconds=export_estimate,
+                            estimate_confidence=estimate_analysis_confidence(
+                                recommended_items, benchmarked_files=1
+                            ),
+                            size_confidence=estimate_size_confidence(
+                                analysis_items,
+                                preset=preset,
+                                use_calibration=use_calibration,
+                            ),
+                            size_confidence_detail=describe_size_confidence(
+                                analysis_items,
+                                preset=preset,
+                                use_calibration=use_calibration,
+                            ),
+                            time_confidence=estimate_time_confidence(
+                                analysis_items,
+                                benchmarked_files=1,
+                                preset=preset,
+                                use_calibration=use_calibration,
+                            ),
+                            time_confidence_detail=describe_time_confidence(
+                                analysis_items,
+                                benchmarked_files=1,
+                                preset=preset,
+                                use_calibration=use_calibration,
+                            ),
+                            duplicate_policy=duplicate_policy,
+                            items=recommended_items,
+                            split_by=split_mode,
+                            index_path=manifest_path,
+                            notes=duplicate_notes,
+                        )
                     console.print(f"[green]Wrote manifest[/green] {manifest_path}")
                     return [], "export", False, None
 
@@ -4365,6 +4461,16 @@ def run_wizard(
             console.print(
                 f"  [dim]Skipped before encode:[/dim] {skip_left_out} file(s) were already HEVC or otherwise marked skip."
             )
+        left_out_items = [
+            item
+            for item in analysis_items
+            if item not in selected_items and item.recommendation in {"recommended", "maybe"}
+        ]
+        for line in _cohort_guidance_lines(
+            selected_items=selected_items,
+            left_out_items=left_out_items,
+        ):
+            console.print(f"  [dim]{line}[/dim]")
         if selected_output_bytes > 0:
             console.print(
                 _format_ready_size_estimate(

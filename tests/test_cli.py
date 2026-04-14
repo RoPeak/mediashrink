@@ -292,6 +292,71 @@ def test_analyze_writes_manifest(tmp_path: Path) -> None:
     assert "Wrote manifest" in result.stdout
 
 
+def test_analyze_writes_split_manifest_index(tmp_path: Path) -> None:
+    first = tmp_path / "Show A - s01e01 - Pilot.mkv"
+    second = tmp_path / "Show B - s01e01 - Start.mkv"
+    for path in (first, second):
+        path.write_bytes(b"x" * 1000)
+    manifest_path = tmp_path / "split-index.json"
+    items = [
+        AnalysisItem(
+            source=first,
+            codec="h264",
+            size_bytes=2 * 1024**3,
+            duration_seconds=120.0,
+            bitrate_kbps=12000.0,
+            estimated_output_bytes=800 * 1024**2,
+            estimated_savings_bytes=(2 * 1024**3) - (800 * 1024**2),
+            recommendation="recommended",
+            reason_code="strong_savings_candidate",
+            reason_text="legacy codec with strong projected space savings",
+        ),
+        AnalysisItem(
+            source=second,
+            codec="h264",
+            size_bytes=2 * 1024**3,
+            duration_seconds=120.0,
+            bitrate_kbps=12000.0,
+            estimated_output_bytes=800 * 1024**2,
+            estimated_savings_bytes=(2 * 1024**3) - (800 * 1024**2),
+            recommendation="recommended",
+            reason_code="strong_savings_candidate",
+            reason_text="legacy codec with strong projected space savings",
+        ),
+    ]
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli._analyze_with_optional_progress", return_value=items),
+        patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "analyze",
+                str(tmp_path),
+                "--manifest-out",
+                str(manifest_path),
+                "--manifest-split-by",
+                "show",
+            ],
+        )
+
+    assert result.exit_code == 0
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload["split_by"] == "show"
+    assert len(payload["generated_manifests"]) == 2
+
+
+def test_analyze_split_requires_manifest_out(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["analyze", str(tmp_path), "--manifest-split-by", "show"])
+
+    assert result.exit_code != 0
+    assert "manifest-out" in result.stdout.lower()
+
+
 def test_analyze_profile_and_explicit_overrides_apply(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     source = tmp_path / "ep01.mkv"
@@ -1419,6 +1484,52 @@ def test_write_batch_reports_include_estimate_ranges_without_crashing(tmp_path: 
     assert "Bias note: recent runs have usually saved less space than forecast" in text
 
 
+def test_write_batch_reports_include_cohort_summaries_and_outliers(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    first = _make_job(tmp_path / "Show A - s01e01 - Pilot.mkv")
+    second = _make_job(tmp_path / "Show A - s01e02 - Two.mkv")
+    for job in (first, second):
+        job.source.write_bytes(b"x" * 1000)
+        job.estimated_output_bytes = 400_000_000
+    first_result = _make_result(first, duration_seconds=600.0, media_duration_seconds=2400.0)
+    second_result = _make_result(
+        second,
+        duration_seconds=900.0,
+        media_duration_seconds=2400.0,
+        output_size_bytes=500_000_000,
+    )
+
+    json_path, text_path = _write_batch_reports(
+        mode="wizard",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[first_result, second_result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["cohort_summaries"]["show"][0]["label"] == "Show A"
+    assert payload["runtime_outliers"][0]["name"].endswith("Two.mkv")
+    assert "Top show cohorts" in text
+    assert "Runtime outliers" in text
+
+
 def test_write_batch_reports_cleanup_text_distinguishes_true_mkv_sidecars(tmp_path: Path) -> None:
     from mediashrink.cli import _write_batch_reports
 
@@ -1974,6 +2085,45 @@ def test_review_command_mentions_followup_manifest_and_estimate_miss(tmp_path: P
 
     assert result.exit_code == 0
     assert "follow-up manifest" in result.stdout.lower()
+
+
+def test_review_command_mentions_top_cohort_and_slowest_file(tmp_path: Path) -> None:
+    report = tmp_path / "mediashrink_report_20260406_120000.json"
+    report.write_text(
+        json.dumps(
+            {
+                "mode": "encode",
+                "directory": str(tmp_path),
+                "totals": {
+                    "succeeded": 2,
+                    "failed": 0,
+                    "skipped_incompatible": 0,
+                    "skipped_by_policy": 0,
+                },
+                "cohort_summaries": {
+                    "show": [
+                        {
+                            "label": "Show A",
+                            "file_count": 2,
+                            "saved_bytes": 1234,
+                            "elapsed_seconds": 1000.0,
+                        }
+                    ],
+                    "season": [],
+                },
+                "runtime_outliers": [
+                    {"name": "Show A - s01e02 - Two.mkv", "duration_seconds": 900.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["review", str(report)])
+
+    assert result.exit_code == 0
+    assert "Top time-saving cohort in this run: Show A." in result.stdout
+    assert "Slowest file in this run: Show A - s01e02 - Two.mkv." in result.stdout
 
 
 def test_calibration_command_summarizes_local_history(tmp_path: Path, monkeypatch) -> None:

@@ -29,7 +29,9 @@ from mediashrink.encoder import (
 from mediashrink.models import AnalysisItem, AnalysisManifest
 from mediashrink.scanner import (
     apply_duplicate_title_policy,
+    episodic_duplicate_warnings,
     is_already_compressed,
+    parse_episode_grouping,
     probe_video_codec,
     scan_directory,
 )
@@ -100,6 +102,102 @@ def _average_size_error_for_items(
 
 def _candidate_items(items: list[AnalysisItem]) -> list[AnalysisItem]:
     return [item for item in items if item.recommendation != "skip"]
+
+
+def summarize_tv_cohorts(
+    items: list[AnalysisItem],
+    *,
+    group_by: str = "show",
+    limit: int | None = None,
+) -> list[dict[str, object]]:
+    grouped: dict[str, dict[str, object]] = {}
+    for item in items:
+        episode = parse_episode_grouping(item.source)
+        if episode is None:
+            continue
+        label = episode.show if group_by == "show" else episode.season_label
+        entry = grouped.setdefault(
+            label,
+            {
+                "label": label,
+                "group_by": group_by,
+                "recommended": 0,
+                "maybe": 0,
+                "skip": 0,
+                "count": 0,
+                "input_bytes": 0,
+                "estimated_savings_bytes": 0,
+                "container_codec_mix": {},
+            },
+        )
+        entry[item.recommendation] = int(entry[item.recommendation]) + 1
+        entry["count"] = int(entry["count"]) + 1
+        entry["input_bytes"] = int(entry["input_bytes"]) + item.size_bytes
+        entry["estimated_savings_bytes"] = int(entry["estimated_savings_bytes"]) + max(
+            item.estimated_savings_bytes, 0
+        )
+        mix = entry["container_codec_mix"]
+        if isinstance(mix, dict):
+            key = f"{item.source.suffix.lower() or '?'} {item.codec or '?'}"
+            mix[key] = int(mix.get(key, 0)) + 1
+    summaries = list(grouped.values())
+    summaries.sort(
+        key=lambda entry: (
+            -int(entry["estimated_savings_bytes"]),
+            -int(entry["input_bytes"]),
+            str(entry["label"]).lower(),
+        )
+    )
+    if limit is not None:
+        return summaries[:limit]
+    return summaries
+
+
+def format_tv_cohort_lines(
+    items: list[AnalysisItem],
+    *,
+    group_by: str = "show",
+    limit: int = 3,
+) -> list[str]:
+    summaries = summarize_tv_cohorts(items, group_by=group_by, limit=limit)
+    lines: list[str] = []
+    for summary in summaries:
+        mix = summary.get("container_codec_mix")
+        mix_summary = ""
+        if isinstance(mix, dict) and mix:
+            top_mix = ", ".join(
+                f"{count} {label}"
+                for label, count in sorted(mix.items(), key=lambda item: (-item[1], item[0]))[:2]
+            )
+            mix_summary = f"; mix: {top_mix}"
+        lines.append(
+            f"{summary['label']}: {summary['count']} file(s), "
+            f"{summary['recommended']} recommended / {summary['maybe']} maybe / {summary['skip']} skip, "
+            f"{_fmt_size(int(summary['input_bytes']))} in, ~{_fmt_size(int(summary['estimated_savings_bytes']))} saved{mix_summary}"
+        )
+    return lines
+
+
+def split_items_by_tv_cohort(
+    items: list[AnalysisItem],
+    *,
+    group_by: str,
+) -> dict[str, list[AnalysisItem]]:
+    grouped: dict[str, list[AnalysisItem]] = {}
+    for item in items:
+        episode = parse_episode_grouping(item.source)
+        if episode is None:
+            continue
+        label = episode.show if group_by == "show" else episode.season_label
+        grouped.setdefault(label, []).append(item)
+    return {
+        label: sorted(grouped_items, key=lambda entry: entry.source.name.lower())
+        for label, grouped_items in sorted(grouped.items(), key=lambda entry: entry[0].lower())
+    }
+
+
+def manifest_split_mode_choices() -> tuple[str, ...]:
+    return ("show", "season")
 
 
 def _is_tv_episode_scale(size_bytes: int, duration_seconds: float) -> bool:
@@ -1107,6 +1205,74 @@ def load_manifest(path: Path) -> AnalysisManifest:
     return manifest
 
 
+def write_split_manifests(
+    *,
+    directory: Path,
+    recursive: bool,
+    preset: str,
+    crf: int,
+    profile_name: str | None,
+    estimated_total_encode_seconds: float | None,
+    estimate_confidence: str | None,
+    size_confidence: str | None,
+    size_confidence_detail: str | None,
+    time_confidence: str | None,
+    time_confidence_detail: str | None,
+    duplicate_policy: str | None,
+    items: list[AnalysisItem],
+    split_by: str,
+    index_path: Path,
+    notes: list[str] | None = None,
+) -> tuple[Path, list[dict[str, str | int]]]:
+    grouped = split_items_by_tv_cohort(items, group_by=split_by)
+    output_dir = index_path.parent / f"{index_path.stem}_{split_by}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, str | int]] = []
+    for index, (label, grouped_items) in enumerate(grouped.items(), start=1):
+        safe_label = (
+            "".join(
+                ch if ch.isalnum() or ch in {"-", "_"} else "_"
+                for ch in label.lower().replace(" ", "_")
+            ).strip("_")
+            or f"group_{index:02d}"
+        )
+        manifest_path = output_dir / f"{index:02d}_{safe_label}.json"
+        manifest = build_manifest(
+            directory=directory,
+            recursive=recursive,
+            preset=preset,
+            crf=crf,
+            profile_name=profile_name,
+            estimated_total_encode_seconds=None,
+            estimate_confidence=estimate_confidence,
+            size_confidence=size_confidence,
+            size_confidence_detail=size_confidence_detail,
+            time_confidence=time_confidence,
+            time_confidence_detail=time_confidence_detail,
+            duplicate_policy=duplicate_policy,
+            recommended_only=False,
+            notes=notes,
+            items=grouped_items,
+        )
+        save_manifest(manifest, manifest_path)
+        entries.append(
+            {
+                "label": label,
+                "split_by": split_by,
+                "manifest_path": str(manifest_path),
+                "file_count": len(grouped_items),
+            }
+        )
+    index_payload = {
+        "version": MANIFEST_VERSION,
+        "split_by": split_by,
+        "directory": str(directory),
+        "generated_manifests": entries,
+    }
+    index_path.write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
+    return index_path, entries
+
+
 def display_analysis_summary(
     items: list[AnalysisItem],
     estimated_total_encode_seconds: float | None,
@@ -1126,6 +1292,9 @@ def display_analysis_summary(
     maybe = [item for item in items if item.recommendation == "maybe"]
     skipped = [item for item in items if item.recommendation == "skip"]
     narrow = plain_output or console.width < 120
+    show_lines = format_tv_cohort_lines(items, group_by="show", limit=3)
+    season_lines = format_tv_cohort_lines(items, group_by="season", limit=3)
+    duplicate_episode_notes = episodic_duplicate_warnings([item.source for item in items], limit=3)
 
     if plain_output:
         console.print()
@@ -1212,6 +1381,14 @@ def display_analysis_summary(
             f"[dim]Candidate mix: {', '.join(top_groups)}.[/dim]",
             highlight=False,
         )
+    if show_lines:
+        console.print("[dim]Top shows:[/dim]", highlight=False)
+        for line in show_lines:
+            console.print(f"[dim]  - {line}[/dim]", highlight=False)
+    if season_lines:
+        console.print("[dim]Top seasons:[/dim]", highlight=False)
+        for line in season_lines:
+            console.print(f"[dim]  - {line}[/dim]", highlight=False)
     if narrow and not plain_output:
         console.print(
             "[dim]Compact analysis view hides the longer reason column on narrow terminals.[/dim]"
@@ -1292,6 +1469,8 @@ def display_analysis_summary(
     if notes:
         for note in notes:
             console.print(f"[dim yellow]{note}[/dim yellow]")
+    for note in duplicate_episode_notes:
+        console.print(f"[dim yellow]{note}[/dim yellow]")
     bias_summary = recent_bias_summary(calibration_store)
     if isinstance(bias_summary, dict) and isinstance(bias_summary.get("summary"), str):
         console.print(f"[dim]Estimate bias: {bias_summary['summary']}.[/dim]")

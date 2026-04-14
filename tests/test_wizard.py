@@ -712,7 +712,10 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
         patch("mediashrink.wizard._maybe_run_preview", return_value=True),
         patch("mediashrink.wizard.display_analysis_summary"),
         patch("mediashrink.wizard.prompt_analysis_action", return_value="export"),
-        patch("mediashrink.wizard._wizard_prompt", return_value=str(manifest_path)),
+        patch(
+            "mediashrink.wizard._wizard_prompt",
+            side_effect=[str(manifest_path), "1"],
+        ),
         patch("mediashrink.wizard.save_manifest") as mock_save_manifest,
         patch("mediashrink.wizard.build_jobs") as mock_build_jobs,
     ):
@@ -724,6 +727,52 @@ def test_run_wizard_can_export_manifest_and_exit(tmp_path: Path) -> None:
     assert jobs == []
     mock_save_manifest.assert_called_once()
     mock_build_jobs.assert_not_called()
+
+
+def test_run_wizard_can_export_split_manifests(tmp_path: Path) -> None:
+    console = Console()
+    first = tmp_path / "Show A - s01e01 - Pilot.mkv"
+    second = tmp_path / "Show B - s01e01 - Start.mkv"
+    for path in (first, second):
+        path.write_bytes(b"x" * 1000)
+    recommended_one = _analysis_item(first, "recommended")
+    recommended_two = _analysis_item(second, "recommended")
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 0.0, "Excellent", True
+    )
+    manifest_path = tmp_path / "split-index.json"
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[first, second]),
+        patch(
+            "mediashrink.wizard._run_analysis_with_progress",
+            return_value=[recommended_one, recommended_two],
+        ),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.benchmark_encoder", return_value=1.0),
+        patch("mediashrink.wizard._targeted_profile_probe_failures", return_value={}),
+        patch("mediashrink.wizard.display_profiles_table"),
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.display_analysis_summary"),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="export"),
+        patch(
+            "mediashrink.wizard._wizard_prompt",
+            side_effect=[str(manifest_path), "2"],
+        ),
+        patch("mediashrink.wizard.write_split_manifests") as mock_split_manifests,
+        patch("mediashrink.wizard.save_manifest") as mock_save_manifest,
+    ):
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    assert action == "export"
+    assert jobs == []
+    mock_split_manifests.assert_called_once()
+    mock_save_manifest.assert_not_called()
 
 
 def test_run_wizard_uses_maybe_shortlist_when_no_recommended_files(tmp_path: Path) -> None:
@@ -1031,6 +1080,70 @@ def test_run_wizard_ready_summary_reframes_profile_for_selected_subset(tmp_path:
         in output
     )
     assert "Not in this run: 1 maybe file(s) were left out by choice." in output
+
+
+def test_run_wizard_ready_summary_includes_cohort_guidance(tmp_path: Path) -> None:
+    console = Console(record=True, width=180)
+    first = tmp_path / "Show A - s01e01 - Pilot.mkv"
+    second = tmp_path / "Show A - s01e02 - Two.mkv"
+    maybe_path = tmp_path / "Show B - s02e01 - Other.mkv"
+    for path in (first, second, maybe_path):
+        path.write_bytes(b"x" * 1000)
+    recommended_one = _analysis_item(first, "recommended")
+    recommended_two = _analysis_item(second, "recommended")
+    maybe = _analysis_item(maybe_path, "maybe")
+    fake_job = _job_for(first)
+    selected_profile = EncoderProfile(
+        1, "Balanced", "Balanced", "fast", 20, "fast", 0, 300.0, "Excellent", True
+    )
+
+    with (
+        patch("mediashrink.wizard.scan_directory", return_value=[first, second, maybe_path]),
+        patch(
+            "mediashrink.wizard._run_analysis_with_progress",
+            return_value=[recommended_one, recommended_two, maybe],
+        ),
+        patch("mediashrink.wizard.detect_available_encoders", return_value=[]),
+        patch("mediashrink.wizard.detect_device_labels", return_value={}),
+        patch("mediashrink.wizard.prepare_profile_planning") as mock_planning,
+        patch("mediashrink.wizard.prompt_profile_selection", return_value=selected_profile),
+        patch("mediashrink.wizard.maybe_save_profile"),
+        patch("mediashrink.wizard._maybe_run_preview", return_value=True),
+        patch("mediashrink.wizard.prompt_analysis_action", return_value="compress_recommended"),
+        patch("mediashrink.wizard.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.wizard._run_preflight_checks", return_value=([fake_job], [])),
+        patch("mediashrink.wizard.estimate_analysis_encode_seconds", return_value=180.0),
+        patch("mediashrink.wizard._estimate_selected_output_bytes", return_value=500),
+        patch("mediashrink.wizard._wizard_confirm", side_effect=[False, False]),
+    ):
+        mock_planning.return_value = ProfilePlanningResult(
+            candidate_items=[recommended_one, recommended_two, maybe],
+            candidate_input_bytes=sum(
+                item.size_bytes for item in [recommended_one, recommended_two, maybe]
+            ),
+            candidate_media_seconds=sum(
+                item.duration_seconds for item in [recommended_one, recommended_two, maybe]
+            ),
+            sample_item=recommended_one,
+            sample_duration=recommended_one.duration_seconds,
+            preview_items=[recommended_one],
+            available_hw=[],
+            benchmark_speeds={"fast": 3.0},
+            observed_probe_failures={},
+            profiles=[selected_profile],
+            active_calibration={"version": 1, "records": [], "failures": []},
+            size_error_by_preset={"fast": None},
+            stage_messages=[],
+        )
+        jobs, action, _, _fm = run_wizard(
+            tmp_path, FFMPEG, FFPROBE, False, None, False, False, console
+        )
+
+    output = console.export_text()
+    assert action == "cancel"
+    assert jobs == []
+    assert "Selected shows:" in output
+    assert "Left out for later review:" in output
 
 
 def test_display_profiles_table_shows_large_batch_guidance() -> None:
