@@ -60,6 +60,25 @@ class _EtaColumn(ProgressColumn):
 
 class _FileCountsColumn(ProgressColumn):
     def render(self, task) -> Text:
+        task_kind = task.fields.get("task_kind")
+        if task_kind == "overall":
+            processed_files = int(task.fields.get("processed_files", 0) or 0)
+            remaining_files = int(task.fields.get("remaining_files", 0) or 0)
+            succeeded_files = int(task.fields.get("succeeded_files", 0) or 0)
+            failed_files = int(task.fields.get("failed_files", 0) or 0)
+            skipped_files = int(task.fields.get("skipped_files", 0) or 0)
+            return Text(
+                f"processed {processed_files} / rem {remaining_files} / ok {succeeded_files} / fail {failed_files} / skip {skipped_files}",
+                style="dim",
+            )
+        if task_kind == "file":
+            current_file = int(task.fields.get("current_file_number", 0) or 0)
+            total_files = int(task.fields.get("total_files", 0) or 0)
+            remaining_files = int(task.fields.get("remaining_files", 0) or 0)
+            return Text(
+                f"file {current_file}/{max(total_files, 1)} / rem {remaining_files}",
+                style="dim",
+            )
         completed_files = task.fields.get("completed_files")
         remaining_files = task.fields.get("remaining_files")
         if completed_files is None or remaining_files is None:

@@ -606,6 +606,10 @@ def test_apply_warns_when_output_container_drops_subtitles(tmp_path: Path) -> No
         patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
         patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.cli._maybe_prepare_mkv_reroute",
+            return_value=([fake_job], [], None, [], []),
+        ),
         patch("mediashrink.cli.source_has_subtitle_streams", return_value=True),
         patch("mediashrink.cli.encode_file", return_value=fake_result),
     ):
@@ -1119,6 +1123,46 @@ def test_run_encode_loop_removes_file_task_and_updates_overall_only_on_completio
     )
 
 
+def test_run_encode_loop_uses_overall_processed_label(tmp_path: Path) -> None:
+    from mediashrink.cli import _run_encode_loop
+
+    source = tmp_path / "vid.mkv"
+    source.write_bytes(b"x" * 5_000_000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "vid_out.mkv",
+        tmp_output=tmp_path / ".tmp_vid_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=5_000_000,
+        output_size_bytes=2_500_000,
+        duration_seconds=2.0,
+        media_duration_seconds=120.0,
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    mock_display.show_summary = MagicMock()
+
+    with patch("mediashrink.cli.encode_file", return_value=ok_result):
+        _run_encode_loop([job], FFMPEG, FFPROBE, mock_display)
+
+    assert "Overall processed" in mock_progress.add_task.call_args_list[0].args[0]
+
+
 def test_run_encode_loop_interrupt_preserves_session_and_prints_resume_guidance(
     tmp_path: Path,
 ) -> None:
@@ -1246,7 +1290,7 @@ def test_encode_warns_on_low_disk_and_aborts_when_declined(tmp_path: Path) -> No
         patch("mediashrink.cli.scan_directory", return_value=[source]),
         patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
         patch("mediashrink.cli.shutil.disk_usage") as mock_disk_usage,
-        patch("mediashrink.cli.typer.confirm", return_value=False),
+        patch("mediashrink.cli.typer.prompt", return_value="x"),
         patch("mediashrink.progress.EncodingDisplay.confirm_proceed") as mock_confirm_proceed,
     ):
         mock_disk_usage.return_value = shutil._ntuple_diskusage(1000, 990, 10)
@@ -1255,6 +1299,72 @@ def test_encode_warns_on_low_disk_and_aborts_when_declined(tmp_path: Path) -> No
     assert result.exit_code == 3
     assert "Low disk space warning" in result.stdout
     mock_confirm_proceed.assert_not_called()
+
+
+def test_encode_low_disk_prompt_allows_rescan_before_proceeding(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    source.write_bytes(b"x" * 1000)
+    fake_job = _make_job(source)
+    fake_job.estimated_output_bytes = 800
+    fake_result = _make_result(fake_job)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+        patch("mediashrink.cli._maybe_prompt_for_cleanup", return_value=[]),
+        patch("mediashrink.cli.shutil.disk_usage") as mock_disk_usage,
+        patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True),
+    ):
+        calls = iter(
+            [
+                shutil._ntuple_diskusage(1000, 990, 10),
+                shutil._ntuple_diskusage(3000, 100, 2900),
+            ]
+        )
+
+        def fake_disk_usage(_path: object) -> shutil._ntuple_diskusage:
+            return next(calls, shutil._ntuple_diskusage(3000, 100, 2900))
+
+        mock_disk_usage.side_effect = fake_disk_usage
+        result = runner.invoke(app, [str(tmp_path)], input="r\n")
+
+    assert result.exit_code == 0
+    assert "Disk space rescan" in result.stdout
+
+
+def test_encode_reconciles_completed_sidecars_before_building_jobs(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mkv"
+    sidecar = tmp_path / "ep01_compressed.mkv"
+    source.write_bytes(b"original")
+    sidecar.write_bytes(b"compressed")
+    rebuilt_job = _make_job(source)
+    rebuilt_job.skip = True
+    rebuilt_job.skip_reason = "video stream is already H.265/HEVC"
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch(
+            "mediashrink.cli.scan_directory", side_effect=[[source, sidecar], [source]]
+        ) as mock_scan,
+        patch(
+            "mediashrink.cli._maybe_reconcile_recoverable_sidecars",
+            return_value=[source],
+        ) as mock_reconcile,
+        patch("mediashrink.cli.build_jobs", return_value=[rebuilt_job]),
+        patch("mediashrink.cli.encode_file") as mock_encode,
+    ):
+        result = runner.invoke(app, [str(tmp_path)])
+
+    assert result.exit_code == 3
+    assert mock_scan.call_count == 2
+    mock_reconcile.assert_called_once()
+    mock_encode.assert_not_called()
 
 
 def test_encode_writes_json_and_text_reports(tmp_path: Path) -> None:
@@ -1282,6 +1392,87 @@ def test_encode_writes_json_and_text_reports(tmp_path: Path) -> None:
     assert "retry_count" in report_payload["files"][0]
     assert report_payload["files"][0]["source"].endswith("ep01.mkv")
     assert "mediashrink batch report" in report_text.read_text(encoding="utf-8")
+
+
+def test_maybe_prepare_mkv_reroute_interactive_accepts_and_builds_followup_jobs(
+    tmp_path: Path,
+) -> None:
+    from mediashrink.cli import _maybe_prepare_mkv_reroute
+
+    source = tmp_path / "ep01.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+
+    with (
+        patch(
+            "mediashrink.cli._find_mkv_reroute_candidates",
+            return_value=([job], ["ep01.mp4: unsupported container/stream combination"]),
+        ),
+        patch("mediashrink.cli.typer.confirm", return_value=True) as mock_confirm,
+        patch(
+            "mediashrink.cli._write_followup_manifest_for_jobs",
+            return_value=tmp_path / "followup.json",
+        ),
+    ):
+        remaining, rerouted, manifest_path, details, notes = _maybe_prepare_mkv_reroute(
+            [job],
+            ffmpeg=FFMPEG,
+            ffprobe=FFPROBE,
+            base_dir=tmp_path,
+            output_dir=None,
+            recursive=True,
+            preset="slow",
+            crf=20,
+            duplicate_policy=None,
+            assume_yes=False,
+        )
+
+    assert remaining == []
+    assert len(rerouted) == 1
+    assert rerouted[0].output.parent == tmp_path / "mediashrink_mkv_followup"
+    assert rerouted[0].output.suffix == ".mkv"
+    assert manifest_path == tmp_path / "followup.json"
+    assert details == ["ep01.mp4: unsupported container/stream combination"]
+    assert notes and "Rerouted 1 incompatible file(s)" in notes[0]
+    mock_confirm.assert_called_once()
+
+
+def test_maybe_prepare_mkv_reroute_unattended_skips_prompt(tmp_path: Path) -> None:
+    from mediashrink.cli import _maybe_prepare_mkv_reroute
+
+    source = tmp_path / "ep01.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = _make_job(source)
+
+    with (
+        patch(
+            "mediashrink.cli._find_mkv_reroute_candidates",
+            return_value=([job], ["ep01.mp4: unsupported container/stream combination"]),
+        ),
+        patch("mediashrink.cli.typer.confirm") as mock_confirm,
+        patch(
+            "mediashrink.cli._write_followup_manifest_for_jobs",
+            return_value=tmp_path / "followup.json",
+        ),
+    ):
+        remaining, rerouted, manifest_path, details, _ = _maybe_prepare_mkv_reroute(
+            [job],
+            ffmpeg=FFMPEG,
+            ffprobe=FFPROBE,
+            base_dir=tmp_path,
+            output_dir=None,
+            recursive=True,
+            preset="slow",
+            crf=20,
+            duplicate_policy=None,
+            assume_yes=True,
+        )
+
+    assert remaining == []
+    assert len(rerouted) == 1
+    assert manifest_path == tmp_path / "followup.json"
+    assert details == ["ep01.mp4: unsupported container/stream combination"]
+    mock_confirm.assert_not_called()
 
 
 def test_write_batch_reports_include_skip_breakdown(tmp_path: Path) -> None:
@@ -2211,6 +2402,10 @@ def test_encode_skip_policy_writes_followup_manifest(tmp_path: Path) -> None:
         patch("mediashrink.cli.scan_directory", return_value=[source]),
         patch("mediashrink.cli.build_jobs", return_value=[job]),
         patch(
+            "mediashrink.cli._maybe_prepare_mkv_reroute",
+            return_value=([job], [], None, [], []),
+        ),
+        patch(
             "mediashrink.cli.preflight_encode_job",
             return_value=_make_result(
                 job, success=False, output_size_bytes=0, error_message="Could not write header"
@@ -2249,6 +2444,10 @@ def test_encode_skip_policy_skips_incompatible_file_before_batch(tmp_path: Path)
         patch("mediashrink.cli.scan_directory", return_value=[source]),
         patch("mediashrink.cli.build_jobs", return_value=[job]),
         patch(
+            "mediashrink.cli._maybe_prepare_mkv_reroute",
+            return_value=([job], [], None, [], []),
+        ),
+        patch(
             "mediashrink.cli.preflight_encode_job",
             return_value=_make_result(
                 job, success=False, output_size_bytes=0, error_message="Could not write header"
@@ -2273,6 +2472,10 @@ def test_encode_stop_policy_aborts_on_incompatible_file_before_batch(tmp_path: P
         patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
         patch("mediashrink.cli.scan_directory", return_value=[source]),
         patch("mediashrink.cli.build_jobs", return_value=[job]),
+        patch(
+            "mediashrink.cli._maybe_prepare_mkv_reroute",
+            return_value=([job], [], None, [], []),
+        ),
         patch(
             "mediashrink.cli.preflight_encode_job",
             return_value=_make_result(

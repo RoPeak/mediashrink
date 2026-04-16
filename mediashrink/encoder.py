@@ -425,6 +425,15 @@ def _probe_streams(path: Path, ffprobe: Path) -> list[dict[str, str]]:
     return streams
 
 
+def probe_stream_type_counts(path: Path, ffprobe: Path) -> dict[str, int]:
+    counts = {"video": 0, "audio": 0, "subtitle": 0, "attachment": 0, "data": 0}
+    for stream in _probe_streams(path, ffprobe):
+        stream_type = stream.get("codec_type")
+        if stream_type in counts:
+            counts[stream_type] += 1
+    return counts
+
+
 def source_has_subtitle_streams(path: Path, ffprobe: Path) -> bool:
     for stream in _probe_streams(path, ffprobe):
         if stream.get("codec_type") == "subtitle":

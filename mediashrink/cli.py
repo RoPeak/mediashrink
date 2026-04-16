@@ -50,13 +50,20 @@ from mediashrink.calibration import (
     resolution_bucket,
     summarize_calibration_store,
 )
-from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
+from mediashrink.cleanup import (
+    RecoverableSidecar,
+    cleanup_successful_results,
+    eligible_cleanup_results,
+    find_recoverable_sidecars,
+    reconcile_recoverable_sidecars,
+)
 from mediashrink.encoder import (
     describe_container_incompatibilities,
     describe_container_incompatibility,
     describe_output_container_constraints,
     encode_file,
     encode_preview,
+    estimate_output_size,
     get_duration_seconds,
     get_video_bitrate_kbps,
     get_video_resolution,
@@ -453,9 +460,77 @@ def _maybe_warn_low_disk_space(
     console.print(
         "[dim]This is a warning only. Side-by-side encodes and temporary outputs may need more space than is currently free.[/dim]"
     )
-    if not assume_yes and not typer.confirm("Continue anyway?", default=False):
-        console.print("[dim]Aborted.[/dim]")
-        raise typer.Exit(code=EXIT_USER_CANCELLED)
+    if assume_yes:
+        return
+    while True:
+        choice = (
+            typer.prompt(
+                "Choose action: [r]escan free space, [c]ontinue anyway, or [x] cancel",
+                default="r",
+            )
+            .strip()
+            .lower()
+        )
+        if choice in {"r", "rescan"}:
+            free_bytes = shutil.disk_usage(output_root).free
+            if free_bytes >= required_bytes:
+                console.print(
+                    f"[green]Disk space rescan:[/green] free space is now {_fmt_size(free_bytes)}, which meets the estimated requirement."
+                )
+                return
+            console.print(
+                f"[yellow]Still low on space:[/yellow] {_fmt_size(free_bytes)} free vs roughly {_fmt_size(required_bytes)} required."
+            )
+            continue
+        if choice in {"c", "continue"}:
+            return
+        if choice in {"x", "cancel"}:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(code=EXIT_USER_CANCELLED)
+        console.print("[yellow]Please enter r, c, or x.[/yellow]")
+
+
+def _recoverable_sidecar_summary(pairs: list[RecoverableSidecar]) -> list[str]:
+    grouped: dict[str, list[str]] = {}
+    for pair in pairs:
+        grouped.setdefault(pair.source.suffix.lower() or "unknown", []).append(pair.source.name)
+    lines: list[str] = []
+    for suffix, names in sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0])):
+        lines.append(
+            f"{len(names)} file(s) with recoverable {suffix} sidecars ({', '.join(names[:3])})"
+        )
+    return lines
+
+
+def _maybe_reconcile_recoverable_sidecars(
+    files: list[Path],
+    *,
+    ffprobe: Path,
+    assume_yes: bool,
+) -> list[Path]:
+    pairs = find_recoverable_sidecars(files, ffprobe)
+    if not pairs:
+        return []
+    console.print(
+        f"[yellow]Found {len(pairs)} recoverable completed sidecar file(s) from an earlier run.[/yellow]"
+    )
+    for line in _recoverable_sidecar_summary(pairs):
+        console.print(f"[dim]  {line}[/dim]")
+    if assume_yes:
+        console.print(
+            "[dim]Automatic sidecar reconciliation is disabled in unattended mode; rerun interactively to restore them before encoding.[/dim]"
+        )
+        return []
+    if not typer.confirm(
+        "Replace the original files with these completed sidecars before encoding starts?",
+        default=True,
+    ):
+        return []
+    reconciled = reconcile_recoverable_sidecars(pairs)
+    console.print(
+        f"[green]Recovered {len(reconciled)} file(s):[/green] completed sidecars were restored to the original filenames."
+    )
+    return reconciled
 
 
 def _collect_preflight_warnings(jobs: list[EncodeJob], ffprobe: Path) -> list[str]:
@@ -677,6 +752,152 @@ def _followup_notes_for_incompatible_details(details: list[str]) -> list[str]:
     if next_step:
         notes.append(next_step)
     return notes
+
+
+def _is_container_reroute_reason(reason: str) -> bool:
+    reroute_reasons = (
+        "unsupported copied audio codec",
+        "attachment stream incompatibility",
+        "auxiliary data stream incompatibility",
+        "unsupported container/stream combination",
+        "output container cannot safely carry one or more copied streams",
+        "audio codec copy is not supported by the chosen output container",
+        "attachment streams are not supported by the chosen output container",
+        "auxiliary data streams are not supported by the chosen output container",
+    )
+    return any(reason.startswith(prefix) for prefix in reroute_reasons)
+
+
+def _find_mkv_reroute_candidates(
+    jobs: list[EncodeJob],
+    *,
+    ffmpeg: Path,
+    ffprobe: Path,
+) -> tuple[list[EncodeJob], list[str]]:
+    candidates: list[EncodeJob] = []
+    details: list[str] = []
+    for job in _preflight_candidates(jobs):
+        result = preflight_encode_job(
+            job.source,
+            ffmpeg,
+            ffprobe,
+            crf=job.crf,
+            preset=job.preset,
+        )
+        if result.success:
+            continue
+        reason = _classify_incompatible_reason(result.error_message, job, ffprobe=ffprobe)
+        if not _is_container_reroute_reason(reason):
+            continue
+        lowered = (result.error_message or "").lower()
+        generic_reason = reason in {
+            "unsupported container/stream combination",
+            "output container cannot safely carry one or more copied streams",
+        }
+        if generic_reason and not (
+            "could not write header" in lowered
+            or "invalid argument" in lowered
+            or "not currently supported in container" in lowered
+        ):
+            continue
+        candidates.append(job)
+        details.append(f"{job.source.name}: {reason}")
+    return candidates, details
+
+
+def _mkv_followup_root(base_dir: Path, output_dir: Path | None) -> Path:
+    return (output_dir or base_dir) / "mediashrink_mkv_followup"
+
+
+def _build_rerouted_mkv_jobs(
+    jobs: list[EncodeJob],
+    *,
+    ffprobe: Path,
+    output_root: Path,
+) -> list[EncodeJob]:
+    rerouted: list[EncodeJob] = []
+    for job in jobs:
+        output = output_root / f"{job.source.stem}.mkv"
+        tmp_output = output.parent / f".tmp_{output.stem}{output.suffix}"
+        rerouted.append(
+            EncodeJob(
+                source=job.source,
+                output=output,
+                tmp_output=tmp_output,
+                crf=job.crf,
+                preset=job.preset,
+                dry_run=job.dry_run,
+                skip=False,
+                skip_reason=None,
+                source_codec=job.source_codec,
+                estimated_output_bytes=estimate_output_size(
+                    job.source,
+                    ffprobe,
+                    codec=job.source_codec,
+                    crf=job.crf,
+                    preset=job.preset,
+                ),
+            )
+        )
+    return rerouted
+
+
+def _maybe_prepare_mkv_reroute(
+    jobs: list[EncodeJob],
+    *,
+    ffmpeg: Path,
+    ffprobe: Path,
+    base_dir: Path,
+    output_dir: Path | None,
+    recursive: bool,
+    preset: str,
+    crf: int,
+    duplicate_policy: str | None,
+    assume_yes: bool,
+) -> tuple[list[EncodeJob], list[EncodeJob], Path | None, list[str], list[str]]:
+    candidates, details = _find_mkv_reroute_candidates(jobs, ffmpeg=ffmpeg, ffprobe=ffprobe)
+    if not candidates:
+        return jobs, [], None, [], []
+
+    console.print(
+        f"[yellow]Preflight found {len(candidates)} file(s) that are better handled as MKV sidecars.[/yellow]"
+    )
+    _print_grouped_preflight_details(details, style="yellow", prefix="  ")
+
+    reroute_now = assume_yes or typer.confirm(
+        "Reroute these incompatible files into an MKV sidecar follow-up batch now?",
+        default=True,
+    )
+    if not reroute_now:
+        manifest_path = _write_followup_manifest_for_jobs(
+            directory=base_dir,
+            recursive=recursive,
+            preset=preset,
+            crf=crf,
+            jobs=candidates,
+            ffprobe=ffprobe,
+            duplicate_policy=duplicate_policy,
+            details=details,
+        )
+        return jobs, [], manifest_path, details, []
+
+    reroute_root = _mkv_followup_root(base_dir, output_dir)
+    rerouted_jobs = _build_rerouted_mkv_jobs(candidates, ffprobe=ffprobe, output_root=reroute_root)
+    retained_sources = {job.source for job in candidates}
+    remaining_jobs = [job for job in jobs if job.source not in retained_sources]
+    manifest_path = _write_followup_manifest_for_jobs(
+        directory=base_dir,
+        recursive=recursive,
+        preset=preset,
+        crf=crf,
+        jobs=rerouted_jobs,
+        ffprobe=ffprobe,
+        duplicate_policy=duplicate_policy,
+        details=details,
+    )
+    note = f"Rerouted {len(rerouted_jobs)} incompatible file(s) into MKV sidecars under {reroute_root}."
+    console.print(f"[green]{note}[/green]")
+    return remaining_jobs, rerouted_jobs, manifest_path, details, [note]
 
 
 def _print_incompatibility_stream_details(
@@ -1592,6 +1813,24 @@ def _record_cleanup_results(
     save_session(session, session_path)
 
 
+def _record_recovered_sidecars(
+    session: SessionManifest | None,
+    session_path: Path | None,
+    recovered_paths: list[Path],
+) -> None:
+    if session is None or session_path is None or not recovered_paths:
+        return
+    for path in recovered_paths:
+        update_session_entry(
+            session,
+            source=path,
+            status="success",
+            output=path,
+            cleanup_result="recovered completed sidecar before encode start",
+        )
+    save_session(session, session_path)
+
+
 def _results_to_json(results: list[EncodeResult], exit_code: int) -> str:
     files = []
     total_saved = 0
@@ -1714,34 +1953,57 @@ def _run_encode_loop(
     results = []
     bytes_done = 0
     stopped_early = False
+    succeeded_files = 0
+    failed_files = 0
+    skipped_files = 0
+    processed_files = 0
+    total_files = len(to_encode)
 
     with display.make_progress_bar() as progress:
         overall_task = progress.add_task(
-            f"[cyan]Overall ({len(to_encode)} file(s))",
+            f"[cyan]Overall processed ({len(to_encode)} file(s))",
             total=total_bytes,
-            completed_files=0,
-            remaining_files=len(to_encode),
+            task_kind="overall",
+            processed_files=0,
+            remaining_files=total_files,
+            succeeded_files=0,
+            failed_files=0,
+            skipped_files=0,
             last_update_at=time.monotonic(),
             stall_warning_seconds=stall_warning_seconds,
             heartbeat_state="active",
             eta_confident=False,
         )
-        file_task = progress.add_task("", total=1)
+        file_task = progress.add_task(
+            "",
+            total=1,
+            task_kind="file",
+            current_file_number=1 if total_files else 0,
+            total_files=max(total_files, 1),
+            remaining_files=total_files,
+        )
 
         for job in jobs:
             filename = job.source.name
             file_size = job.source.stat().st_size
-            files_done = len(results)
-            files_remaining = max(len(jobs) - files_done - 1, 0)
+            files_remaining = (
+                max(total_files - processed_files - 1, 0)
+                if not job.skip
+                else max(
+                    total_files - processed_files,
+                    0,
+                )
+            )
             # Use input size as the task total so DownloadColumn shows GB-scale numbers
             task_total = max(file_size, 1)
             progress.update(
                 file_task,
-                description=f"[dim]In progress:[/dim] [white]{filename}",
+                description=f"[dim]Current file:[/dim] [white]{filename}",
                 completed=0,
                 total=task_total,
-                completed_files=files_done,
                 remaining_files=files_remaining,
+                current_file_number=min(processed_files + 1, max(total_files, 1)),
+                total_files=max(total_files, 1),
                 last_update_at=time.monotonic(),
                 stall_warning_seconds=stall_warning_seconds,
                 heartbeat_state="active",
@@ -1749,8 +2011,11 @@ def _run_encode_loop(
             )
             progress.update(
                 overall_task,
-                completed_files=files_done,
-                remaining_files=files_remaining + 1,
+                processed_files=processed_files,
+                remaining_files=max(total_files - processed_files, 0),
+                succeeded_files=succeeded_files,
+                failed_files=failed_files,
+                skipped_files=skipped_files,
                 last_update_at=time.monotonic(),
                 stall_warning_seconds=stall_warning_seconds,
                 heartbeat_state="active",
@@ -1851,8 +2116,9 @@ def _run_encode_loop(
                     progress.update(
                         ft,
                         completed=fb * pct / 100,
-                        completed_files=files_done,
                         remaining_files=files_remaining,
+                        current_file_number=min(processed_files + 1, max(total_files, 1)),
+                        total_files=max(total_files, 1),
                         last_update_at=stall_state["last_signal"],
                         stall_warning_seconds=stall_warning_seconds,
                         heartbeat_state="active",
@@ -1861,8 +2127,11 @@ def _run_encode_loop(
                     progress.update(
                         overall_task,
                         completed=bytes_done + (fb * pct / 100),
-                        completed_files=files_done,
-                        remaining_files=files_remaining + 1,
+                        processed_files=processed_files,
+                        remaining_files=max(total_files - processed_files, 0),
+                        succeeded_files=succeeded_files,
+                        failed_files=failed_files,
+                        skipped_files=skipped_files,
                         last_update_at=stall_state["last_signal"],
                         stall_warning_seconds=stall_warning_seconds,
                         heartbeat_state="active",
@@ -2070,30 +2339,50 @@ def _run_encode_loop(
                 save_session(session, session_path)
 
             if not job.skip:
+                processed_files += 1
+                if result.skipped:
+                    skipped_files += 1
+                elif result.success:
+                    succeeded_files += 1
+                else:
+                    failed_files += 1
                 bytes_done += file_size
                 progress.update(
                     overall_task,
                     completed=bytes_done,
-                    completed_files=min(len(results), len(to_encode)),
-                    remaining_files=max(len(to_encode) - len(results), 0),
+                    processed_files=processed_files,
+                    remaining_files=max(total_files - processed_files, 0),
+                    succeeded_files=succeeded_files,
+                    failed_files=failed_files,
+                    skipped_files=skipped_files,
                     last_update_at=time.monotonic(),
                     heartbeat_state="active",
                     eta_confident=bytes_done > 0,
                 )
-                progress.update(file_task, completed=task_total)
+                progress.update(
+                    file_task,
+                    completed=task_total,
+                    remaining_files=max(total_files - processed_files, 0),
+                    current_file_number=min(processed_files, max(total_files, 1)),
+                    total_files=max(total_files, 1),
+                )
             if stopped_early:
                 break
 
         progress.update(
             overall_task,
-            completed_files=len(to_encode),
+            processed_files=processed_files,
             remaining_files=0,
+            succeeded_files=succeeded_files,
+            failed_files=failed_files,
+            skipped_files=skipped_files,
             heartbeat_state="complete",
             eta_confident=True,
         )
         progress.update(
             file_task,
-            completed_files=len(to_encode),
+            current_file_number=min(processed_files, max(total_files, 1)),
+            total_files=max(total_files, 1),
             remaining_files=0,
             heartbeat_state="complete",
             eta_confident=True,
@@ -2529,6 +2818,16 @@ def encode_cmd(
         )
         raise typer.Exit(code=EXIT_NO_FILES)
 
+    recovered_paths: list[Path] = []
+    if not dry_run and not overwrite and output_dir is None:
+        recovered_paths = _maybe_reconcile_recoverable_sidecars(
+            files,
+            ffprobe=ffprobe,
+            assume_yes=yes,
+        )
+        if recovered_paths:
+            files = scan_directory(directory, recursive=recursive)
+
     jobs = build_jobs(
         files=files,
         output_dir=output_dir,
@@ -2541,6 +2840,8 @@ def encode_cmd(
     )
     jobs = _prioritize_jobs(jobs, queue_strategy)
     split_followup_manifest: Path | None = None
+    rerouted_jobs: list[EncodeJob] = []
+    reroute_notes: list[str] = []
 
     prior: SessionManifest | None = None
     resumed_from_session = False
@@ -2567,9 +2868,21 @@ def encode_cmd(
                             job.skip_reason = "resumed (already done)"
                     _reconcile_session_with_jobs(prior, jobs)
 
-    display.show_scan_table(jobs)
-
     if not dry_run:
+        jobs, rerouted_jobs, reroute_manifest, _, reroute_notes = _maybe_prepare_mkv_reroute(
+            jobs,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            base_dir=directory,
+            output_dir=output_dir,
+            recursive=recursive,
+            preset=effective_preset,
+            crf=effective_crf,
+            duplicate_policy=None,
+            assume_yes=yes or overnight,
+        )
+        if reroute_manifest is not None:
+            split_followup_manifest = reroute_manifest
         jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
             jobs,
             ffmpeg=ffmpeg,
@@ -2614,23 +2927,32 @@ def encode_cmd(
             )
             raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
-    to_encode = [job for job in jobs if not job.skip]
+    active_jobs = jobs + rerouted_jobs
+    if resumed_from_session and prior is not None:
+        _reconcile_session_with_jobs(prior, active_jobs)
+
+    display.show_scan_table(active_jobs)
+
+    to_encode = [job for job in active_jobs if not job.skip]
     if not to_encode:
-        results = _build_skipped_results(jobs)
-        if not results or not _has_incompatible_skips(jobs):
+        results = _build_skipped_results(active_jobs)
+        if not results or not _has_incompatible_skips(active_jobs):
             console.print("[dim]Nothing to encode.[/dim]")
             raise typer.Exit(code=EXIT_USER_CANCELLED)
         console.print("[dim]All remaining files were skipped before encode start.[/dim]")
         stopped_early = False
     else:
         stopped_early = False
-    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    preflight_warnings = _collect_preflight_warnings(active_jobs, ffprobe)
+    preflight_warnings.extend(reroute_notes)
 
     if to_encode and not dry_run and not yes:
         if not json_output:
             _print_safe_interrupt_guidance()
             _print_preflight_warnings(preflight_warnings)
-        _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=json_output)
+        _maybe_warn_low_disk_space(
+            active_jobs, output_dir or directory, overwrite, assume_yes=json_output
+        )
         if not display.confirm_proceed(len(to_encode)):
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(code=EXIT_USER_CANCELLED)
@@ -2638,7 +2960,7 @@ def encode_cmd(
         if not json_output:
             _print_safe_interrupt_guidance()
             _print_preflight_warnings(preflight_warnings)
-        _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=True)
+        _maybe_warn_low_disk_space(active_jobs, output_dir or directory, overwrite, assume_yes=True)
     elif not dry_run and not json_output:
         _print_preflight_warnings(preflight_warnings)
 
@@ -2654,7 +2976,7 @@ def encode_cmd(
                 effective_crf,
                 overwrite,
                 output_dir,
-                jobs,
+                active_jobs,
                 policy=policy,
                 on_file_failure=on_file_failure,
                 use_calibration=use_calibration,
@@ -2677,7 +2999,7 @@ def encode_cmd(
     if to_encode:
         results, stopped_early = _normalize_loop_result(
             _run_encode_loop(
-                jobs,
+                active_jobs,
                 ffmpeg,
                 ffprobe,
                 display,
@@ -2699,6 +3021,7 @@ def encode_cmd(
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not dry_run and not overwrite and output_dir is None and not yes:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+    _record_recovered_sidecars(active_session, session_path, recovered_paths)
     _record_cleanup_results(active_session, session_path, results, cleaned_paths)
 
     if not dry_run:
@@ -3064,7 +3387,23 @@ def apply(
     )
     jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
     split_followup_manifest: Path | None = None
+    rerouted_jobs: list[EncodeJob] = []
+    reroute_notes: list[str] = []
 
+    jobs, rerouted_jobs, reroute_manifest, _, reroute_notes = _maybe_prepare_mkv_reroute(
+        jobs,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        base_dir=loaded_manifest.analyzed_directory,
+        output_dir=output_dir,
+        recursive=loaded_manifest.recursive,
+        preset=effective_preset,
+        crf=effective_crf,
+        duplicate_policy=loaded_manifest.duplicate_policy,
+        assume_yes=yes,
+    )
+    if reroute_manifest is not None:
+        split_followup_manifest = reroute_manifest
     jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
         jobs,
         ffmpeg=ffmpeg,
@@ -3108,24 +3447,26 @@ def apply(
         )
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
-    display.show_scan_table(jobs)
-    to_encode = [job for job in jobs if not job.skip]
+    active_jobs = jobs + rerouted_jobs
+    display.show_scan_table(active_jobs)
+    to_encode = [job for job in active_jobs if not job.skip]
     if not to_encode:
-        results = _build_skipped_results(jobs)
-        if not results or not _has_incompatible_skips(jobs):
+        results = _build_skipped_results(active_jobs)
+        if not results or not _has_incompatible_skips(active_jobs):
             console.print("[dim]Nothing to encode.[/dim]")
             raise typer.Exit(code=EXIT_USER_CANCELLED)
         console.print("[dim]All manifest files were skipped before encode start.[/dim]")
         stopped_early = False
     else:
         stopped_early = False
-    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    preflight_warnings = _collect_preflight_warnings(active_jobs, ffprobe)
+    preflight_warnings.extend(reroute_notes)
 
     if to_encode:
         _print_safe_interrupt_guidance()
         _print_preflight_warnings(preflight_warnings)
         _maybe_warn_low_disk_space(
-            jobs,
+            active_jobs,
             output_dir or loaded_manifest.analyzed_directory,
             overwrite,
             assume_yes=yes,
@@ -3139,7 +3480,7 @@ def apply(
     if to_encode:
         results, stopped_early = _normalize_loop_result(
             _run_encode_loop(
-                jobs,
+                active_jobs,
                 ffmpeg,
                 ffprobe,
                 display,
@@ -3611,13 +3952,42 @@ def resume(
             "[red bold]Error:[/red bold] session output directory does not match --output-dir."
         )
         raise typer.Exit(code=EXIT_NO_FILES)
+    recovered_paths: list[Path] = []
+    if not session.overwrite and output_dir is None:
+        pending_sources = [
+            Path(entry.source)
+            for entry in session.entries
+            if entry.status in {"pending", "failed", "in_progress"} and Path(entry.source).exists()
+        ]
+        recovered_paths = _maybe_reconcile_recoverable_sidecars(
+            pending_sources,
+            ffprobe=ffprobe,
+            assume_yes=yes,
+        )
+        _record_recovered_sidecars(session, session_path, recovered_paths)
     jobs = _build_resume_jobs(session, ffprobe=ffprobe)
     jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
     split_followup_manifest: Path | None = None
+    rerouted_jobs: list[EncodeJob] = []
+    reroute_notes: list[str] = []
     if not jobs:
         console.print("[yellow]No resumable files remain in the saved session.[/yellow]")
         raise typer.Exit(code=EXIT_NO_FILES)
 
+    jobs, rerouted_jobs, reroute_manifest, _, reroute_notes = _maybe_prepare_mkv_reroute(
+        jobs,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        base_dir=directory,
+        output_dir=output_dir,
+        recursive=False,
+        preset=session.preset,
+        crf=session.crf,
+        duplicate_policy=None,
+        assume_yes=yes,
+    )
+    if reroute_manifest is not None:
+        split_followup_manifest = reroute_manifest
     jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
         jobs,
         ffmpeg=ffmpeg,
@@ -3661,30 +4031,32 @@ def resume(
         )
         raise typer.Exit(code=EXIT_ENCODE_FAILURES)
 
-    _reconcile_session_with_jobs(session, jobs)
+    active_jobs = jobs + rerouted_jobs
+    _reconcile_session_with_jobs(session, active_jobs)
     console.print(
         f"[cyan]Resuming session:[/cyan] {_format_resume_counts(session)}",
         highlight=False,
     )
     console.print(f"[dim]Session path:[/dim] {session_path}")
-    display.show_scan_table(jobs)
-    to_encode = [job for job in jobs if not job.skip]
-    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    display.show_scan_table(active_jobs)
+    to_encode = [job for job in active_jobs if not job.skip]
+    preflight_warnings = _collect_preflight_warnings(active_jobs, ffprobe)
+    preflight_warnings.extend(reroute_notes)
     if not json_output and to_encode:
         _print_safe_interrupt_guidance()
     if not json_output:
         _print_preflight_warnings(preflight_warnings)
     if to_encode:
         _maybe_warn_low_disk_space(
-            jobs,
+            active_jobs,
             output_dir or directory,
             session.overwrite,
             assume_yes=yes,
         )
 
     if not to_encode:
-        results = _build_skipped_results(jobs)
-        if not results or not _has_incompatible_skips(jobs):
+        results = _build_skipped_results(active_jobs)
+        if not results or not _has_incompatible_skips(active_jobs):
             console.print("[dim]Nothing to encode.[/dim]")
             raise typer.Exit(code=EXIT_USER_CANCELLED)
         console.print("[dim]All resumable files were skipped before encode start.[/dim]")
@@ -3707,7 +4079,7 @@ def resume(
     if to_encode:
         results, stopped_early = _normalize_loop_result(
             _run_encode_loop(
-                jobs,
+                active_jobs,
                 ffmpeg,
                 ffprobe,
                 display,
@@ -3859,12 +4231,28 @@ def overnight(
     retry_mode = _validate_retry_mode(retry_mode)
     jobs = _prioritize_jobs(jobs, queue_strategy)
     split_followup_manifest: Path | None = None
+    rerouted_jobs: list[EncodeJob] = []
+    reroute_notes: list[str] = []
     if not jobs:
         console.print(
             f"[yellow]No supported video files ({supported_formats_label()}) found in[/yellow] {directory}"
         )
         raise typer.Exit(code=EXIT_NO_FILES)
 
+    jobs, rerouted_jobs, reroute_manifest, _, reroute_notes = _maybe_prepare_mkv_reroute(
+        jobs,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        base_dir=directory,
+        output_dir=output_dir,
+        recursive=recursive,
+        preset=effective_preset,
+        crf=effective_crf,
+        duplicate_policy=duplicate_policy,
+        assume_yes=True,
+    )
+    if reroute_manifest is not None:
+        split_followup_manifest = reroute_manifest
     jobs, preflight_notes, incompatible = _apply_batch_preflight_policy(
         jobs,
         ffmpeg=ffmpeg,
@@ -3912,6 +4300,8 @@ def overnight(
         _reconcile_session_with_jobs(prior, jobs)
         resumed_from_session = True
 
+    active_jobs = jobs + rerouted_jobs
+
     session_path = get_session_path(directory, output_dir)
     session = (
         prior
@@ -3922,7 +4312,7 @@ def overnight(
             effective_crf,
             overwrite,
             output_dir,
-            jobs,
+            active_jobs,
             policy=policy,
             on_file_failure="skip",
             use_calibration=use_calibration,
@@ -3931,10 +4321,13 @@ def overnight(
         )
     )
     save_session(session, session_path)
-    preflight_warnings = _collect_preflight_warnings(jobs, ffprobe)
+    if resumed_from_session and prior is not None:
+        _reconcile_session_with_jobs(session, active_jobs)
+    preflight_warnings = _collect_preflight_warnings(active_jobs, ffprobe)
+    preflight_warnings.extend(reroute_notes)
     _print_safe_interrupt_guidance()
     _print_preflight_warnings(preflight_warnings)
-    _maybe_warn_low_disk_space(jobs, output_dir or directory, overwrite, assume_yes=True)
+    _maybe_warn_low_disk_space(active_jobs, output_dir or directory, overwrite, assume_yes=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = output_dir if output_dir is not None else directory
@@ -3945,11 +4338,11 @@ def overnight(
     resume_completed, resume_skipped = _resume_summary_counts(
         session if resumed_from_session else None
     )
-    to_encode = [job for job in jobs if not job.skip]
+    to_encode = [job for job in active_jobs if not job.skip]
     if to_encode:
         results, stopped_early = _normalize_loop_result(
             _run_encode_loop(
-                jobs,
+                active_jobs,
                 ffmpeg,
                 ffprobe,
                 display,
@@ -3967,7 +4360,7 @@ def overnight(
             )
         )
     else:
-        results = _build_skipped_results(jobs)
+        results = _build_skipped_results(active_jobs)
         stopped_early = False
         console.print("[dim]All overnight candidates were skipped before encode start.[/dim]")
     _record_cleanup_results(session, session_path, results, [])

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from rich.console import Console
 
 from mediashrink.models import EncodeJob, EncodeResult
-from mediashrink.progress import EncodingDisplay
+from mediashrink.progress import EncodingDisplay, _FileCountsColumn
 
 
 def _job(source: Path, *, preview: bool = False, dry_run: bool = False) -> EncodeJob:
@@ -192,3 +192,19 @@ def test_show_summary_breaks_down_incompatible_and_policy_skips(tmp_path: Path) 
     assert "1 skipped by policy" in output
     assert "Incompatible files skipped" in output
     assert "bad.mp4" in output
+
+
+def test_file_counts_column_uses_processed_batch_wording() -> None:
+    class DummyTask:
+        fields = {
+            "task_kind": "overall",
+            "processed_files": 3,
+            "remaining_files": 2,
+            "succeeded_files": 1,
+            "failed_files": 1,
+            "skipped_files": 1,
+        }
+
+    rendered = _FileCountsColumn().render(DummyTask())
+
+    assert rendered.plain == "processed 3 / rem 2 / ok 1 / fail 1 / skip 1"

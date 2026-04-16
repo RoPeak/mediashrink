@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mediashrink.cleanup import cleanup_successful_results, eligible_cleanup_results
+from unittest.mock import patch
+
+from mediashrink.cleanup import (
+    RecoverableSidecar,
+    cleanup_successful_results,
+    eligible_cleanup_results,
+    find_recoverable_sidecars,
+    reconcile_recoverable_sidecars,
+)
 from mediashrink.models import EncodeJob, EncodeResult
 
 
@@ -87,3 +95,45 @@ def test_eligible_cleanup_results_skips_cross_container_sidecars(tmp_path: Path)
     eligible = eligible_cleanup_results([mp4_to_mkv])
 
     assert eligible == []
+
+
+def test_find_recoverable_sidecars_accepts_matching_completed_sidecars(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mkv"
+    sidecar = tmp_path / "episode_compressed.mkv"
+    source.write_bytes(b"x" * 1000)
+    sidecar.write_bytes(b"x" * 900)
+
+    with (
+        patch("mediashrink.cleanup.get_duration_seconds", side_effect=[120.0, 120.5]),
+        patch(
+            "mediashrink.cleanup.probe_stream_type_counts",
+            side_effect=[
+                {"video": 1, "audio": 2, "subtitle": 1, "attachment": 0, "data": 0},
+                {"video": 1, "audio": 2, "subtitle": 1, "attachment": 0, "data": 0},
+            ],
+        ),
+    ):
+        pairs = find_recoverable_sidecars([source, sidecar], Path("/usr/bin/ffprobe"))
+
+    assert pairs == [
+        RecoverableSidecar(
+            source=source,
+            sidecar=sidecar,
+            reason="completed same-format sidecar output looks safe to restore",
+        )
+    ]
+
+
+def test_reconcile_recoverable_sidecars_restores_original_name(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mp4"
+    sidecar = tmp_path / "episode_compressed.mp4"
+    source.write_bytes(b"original")
+    sidecar.write_bytes(b"compressed")
+
+    reconciled = reconcile_recoverable_sidecars(
+        [RecoverableSidecar(source=source, sidecar=sidecar, reason="safe")]
+    )
+
+    assert reconciled == [source]
+    assert source.read_bytes() == b"compressed"
+    assert not sidecar.exists()
