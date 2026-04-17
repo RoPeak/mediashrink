@@ -54,7 +54,9 @@ from mediashrink.cleanup import (
     RecoverableSidecar,
     cleanup_successful_results,
     eligible_cleanup_results,
+    eligible_mkv_replacement_results,
     find_recoverable_sidecars,
+    replace_successful_mkv_results,
     reconcile_recoverable_sidecars,
 )
 from mediashrink.encoder import (
@@ -837,6 +839,8 @@ def _build_rerouted_mkv_jobs(
                     crf=job.crf,
                     preset=job.preset,
                 ),
+                action_label="MKV REROUTE",
+                batch_cohort="mkv_reroute",
             )
         )
     return rerouted
@@ -897,6 +901,12 @@ def _maybe_prepare_mkv_reroute(
     )
     note = f"Rerouted {len(rerouted_jobs)} incompatible file(s) into MKV sidecars under {reroute_root}."
     console.print(f"[green]{note}[/green]")
+    console.print(
+        f"[dim]Primary batch:[/dim] {len(remaining_jobs)} file(s) remain in the normal encode cohort."
+    )
+    console.print(
+        f"[dim]MKV reroute cohort:[/dim] {len(rerouted_jobs)} file(s) will write sidecars to {reroute_root}."
+    )
     return remaining_jobs, rerouted_jobs, manifest_path, details, [note]
 
 
@@ -1051,6 +1061,7 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
     guidance: list[str] = []
     failed = int(totals.get("failed", 0))
     skipped_incompatible = int(totals.get("skipped_incompatible", 0))
+    batch_cohorts = payload.get("batch_cohorts")
     mode = payload.get("mode") if isinstance(payload.get("mode"), str) else "encode"
     directory = payload.get("directory") if isinstance(payload.get("directory"), str) else None
     if failed:
@@ -1066,6 +1077,17 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
         guidance.append(
             f"Skipped incompatible files likely need MKV outputs or a different preset path for: {directory}"
         )
+    if isinstance(batch_cohorts, dict):
+        rerouted_count = int(batch_cohorts.get("rerouted_count", 0) or 0)
+        reroute_destination = batch_cohorts.get("reroute_destination")
+        if rerouted_count:
+            guidance.append(
+                f"{rerouted_count} file(s) were rerouted into MKV sidecars"
+                + (f" at {reroute_destination}." if isinstance(reroute_destination, str) else ".")
+            )
+    cleanup_policy = payload.get("cleanup_policy")
+    if isinstance(cleanup_policy, str) and cleanup_policy:
+        guidance.append(f"Cleanup policy used for this run: {cleanup_policy}.")
     estimate_miss = payload.get("estimate_miss_summary")
     if isinstance(estimate_miss, str) and "larger" in estimate_miss:
         guidance.append("Review the estimate miss summary before reusing the same preset.")
@@ -1185,11 +1207,21 @@ def _is_true_mkv_sidecar_result(result: EncodeResult) -> bool:
     )
 
 
-def _cleanup_result_text(result: EncodeResult, *, cleaned: bool) -> str | None:
+def _cleanup_result_text(
+    result: EncodeResult,
+    *,
+    cleaned: bool,
+    replaced_with_mkv: bool = False,
+) -> str | None:
     if not result.success or result.skipped:
         return None
     if cleaned:
         return "original removed; same-format output restored to the original filename"
+    if replaced_with_mkv:
+        return (
+            f"original {result.job.source.suffix.lower()} removed; newly encoded MKV output restored"
+            " beside the source as an .mkv file"
+        )
     if result.job.output == result.job.source:
         return None
     if _is_true_mkv_sidecar_result(result):
@@ -1291,6 +1323,23 @@ def _results_totals(results: list[EncodeResult]) -> dict[str, int | float]:
     }
 
 
+def _batch_cohort_summary(jobs: list[EncodeJob] | None) -> dict[str, object]:
+    if not jobs:
+        return {
+            "primary_count": 0,
+            "rerouted_count": 0,
+            "reroute_destination": None,
+        }
+    rerouted = [job for job in jobs if job.batch_cohort == "mkv_reroute" and not job.skip]
+    primary = [job for job in jobs if job.batch_cohort != "mkv_reroute" and not job.skip]
+    destinations = sorted({str(job.output.parent) for job in rerouted})
+    return {
+        "primary_count": len(primary),
+        "rerouted_count": len(rerouted),
+        "reroute_destination": destinations[0] if len(destinations) == 1 else destinations or None,
+    }
+
+
 def _estimate_miss_summary(results: list[EncodeResult]) -> str | None:
     successful = [result for result in results if result.success and not result.skipped]
     oversized_rejections = [result for result in results if result.output_failed_safety_check]
@@ -1367,6 +1416,7 @@ def _write_batch_reports(
     results: list[EncodeResult],
     cleaned_paths: list[Path],
     log_path: Path | None,
+    mkv_replaced_paths: dict[Path, Path] | None = None,
     warnings: list[str] | None = None,
     policy: str | None = None,
     on_file_failure: str | None = None,
@@ -1381,6 +1431,9 @@ def _write_batch_reports(
     container_fallback_actions: dict[str, object] | None = None,
     require_net_savings_pct: float | None = None,
     split_manifest_index: dict[str, object] | None = None,
+    launch_mode: str | None = None,
+    cleanup_policy: str | None = None,
+    batch_jobs: list[EncodeJob] | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1388,14 +1441,16 @@ def _write_batch_reports(
     json_path = report_dir / f"mediashrink_report_{timestamp}.json"
     text_path = report_dir / f"mediashrink_report_{timestamp}.txt"
     totals = _results_totals(results)
+    cohort_summary = _batch_cohort_summary(batch_jobs)
     grouped_incompatibilities = _group_incompatible_results(results)
+    mkv_replaced_paths = mkv_replaced_paths or {}
     files = []
     for result in results:
         status = _classify_result_status(result)
         files.append(
             {
                 "source": str(result.job.source),
-                "output": str(result.job.output),
+                "output": str(mkv_replaced_paths.get(result.job.source, result.job.output)),
                 "status": status,
                 "skipped_reason": result.skip_reason,
                 "error_message": result.error_message,
@@ -1412,8 +1467,11 @@ def _write_batch_reports(
                 "cleanup_result": _cleanup_result_text(
                     result,
                     cleaned=result.job.source in cleaned_paths,
+                    replaced_with_mkv=result.job.source in mkv_replaced_paths,
                 ),
                 "attempts": [attempt.to_dict() for attempt in result.attempts],
+                "batch_cohort": result.job.batch_cohort,
+                "action_label": result.job.action_label,
             }
         )
     payload = {
@@ -1435,6 +1493,9 @@ def _write_batch_reports(
         "totals": totals,
         "warnings": warnings or [],
         "policy": policy,
+        "launch_mode": launch_mode,
+        "cleanup_policy": cleanup_policy,
+        "mkv_replacements_completed": len(mkv_replaced_paths),
         "on_file_failure": on_file_failure,
         "retry_mode": retry_mode,
         "queue_strategy": queue_strategy,
@@ -1449,6 +1510,7 @@ def _write_batch_reports(
         "container_fallback_actions": container_fallback_actions,
         "require_net_savings_pct": require_net_savings_pct,
         "grouped_incompatibilities": grouped_incompatibilities,
+        "batch_cohorts": cohort_summary,
         "cohort_summaries": {
             "show": _summarize_result_cohorts(results, group_by="show"),
             "season": _summarize_result_cohorts(results, group_by="season"),
@@ -1471,6 +1533,9 @@ def _write_batch_reports(
         f"Output dir: {output_dir}" if output_dir is not None else "Output dir: alongside sources",
         f"Overwrite: {'yes' if overwrite else 'no'}",
         f"Cleanup requested: {'yes' if cleanup_requested else 'no'}",
+        f"Cleanup policy: {cleanup_policy}" if cleanup_policy is not None else "Cleanup policy: -",
+        f"MKV replacements completed: {len(mkv_replaced_paths)}",
+        f"Launch mode: {launch_mode}" if launch_mode is not None else "Launch mode: -",
         f"Cleanup completed: {len(cleaned_paths)}",
         f"Resumed from session: {'yes' if resumed_from_session else 'no'}",
         f"Session path: {session_path}" if session_path is not None else "Session path: -",
@@ -1495,6 +1560,15 @@ def _write_batch_reports(
             f"Required net savings: {require_net_savings_pct:.1f}%"
             if require_net_savings_pct is not None
             else "Required net savings: -"
+        ),
+        (
+            "Batch cohorts: "
+            f"{cohort_summary['primary_count']} primary, {cohort_summary['rerouted_count']} rerouted"
+            + (
+                f" -> {cohort_summary['reroute_destination']}"
+                if cohort_summary.get("reroute_destination")
+                else ""
+            )
         ),
         f"Started: {started_at}",
         f"Finished: {finished_at}",
@@ -1677,6 +1751,7 @@ def _write_batch_reports(
         cleanup_result = _cleanup_result_text(
             result,
             cleaned=result.job.source in cleaned_paths,
+            replaced_with_mkv=result.job.source in mkv_replaced_paths,
         )
         if cleanup_result:
             lines.append(f"  Cleanup: {cleanup_result}")
@@ -1791,16 +1866,19 @@ def _record_cleanup_results(
     session_path: Path | None,
     results: list[EncodeResult],
     cleaned_paths: list[Path],
+    mkv_replaced_paths: dict[Path, Path] | None = None,
 ) -> None:
     if session is None or session_path is None:
         return
     cleaned_sources = {path for path in cleaned_paths}
+    mkv_replaced_sources = mkv_replaced_paths or {}
     for result in results:
         if not result.success or result.skipped:
             continue
         cleanup_result = _cleanup_result_text(
             result,
             cleaned=result.job.source in cleaned_sources,
+            replaced_with_mkv=result.job.source in mkv_replaced_sources,
         )
         if cleanup_result is None and result.job.output == result.job.source:
             cleanup_result = "output replaced original in place"
@@ -1808,6 +1886,7 @@ def _record_cleanup_results(
             session,
             source=result.job.source,
             status="success",
+            output=mkv_replaced_sources.get(result.job.source),
             cleanup_result=cleanup_result,
         )
     save_session(session, session_path)
@@ -1894,7 +1973,8 @@ class DefaultCommandGroup(TyperGroup):
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         if args and args[0] not in self.commands and args[0] not in {"--help", "-h"}:
-            args.insert(0, self.default_command_name)
+            chosen = _choose_interactive_default_command(args)
+            args.insert(0, chosen)
         return super().parse_args(ctx, args)
 
 
@@ -1908,6 +1988,28 @@ profiles_app = typer.Typer(help="Manage saved encoding profiles.")
 app.add_typer(profiles_app, name="profiles")
 
 console = Console()
+
+
+def _choose_interactive_default_command(args: list[str]) -> str:
+    if not args:
+        return "encode"
+    if any(arg.startswith("-") for arg in args[1:]):
+        return "encode"
+    if "--json" in args:
+        return "encode"
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return "encode"
+    choice = (
+        typer.prompt(
+            "Choose mode: [w]izard or [e]ncode",
+            default="w",
+        )
+        .strip()
+        .lower()
+    )
+    if choice in {"w", "wizard"}:
+        return "wizard"
+    return "encode"
 
 
 def _fmt_ratio(value: float | None) -> str:
@@ -1986,6 +2088,7 @@ def _run_encode_loop(
         for job in jobs:
             filename = job.source.name
             file_size = job.source.stat().st_size
+            cohort_label = "MKV reroute" if job.batch_cohort == "mkv_reroute" else "Primary batch"
             files_remaining = (
                 max(total_files - processed_files - 1, 0)
                 if not job.skip
@@ -1998,7 +2101,7 @@ def _run_encode_loop(
             task_total = max(file_size, 1)
             progress.update(
                 file_task,
-                description=f"[dim]Current file:[/dim] [white]{filename}",
+                description=f"[dim]Current file ({cohort_label}):[/dim] [white]{filename}",
                 completed=0,
                 total=task_total,
                 remaining_files=files_remaining,
@@ -2492,6 +2595,185 @@ def _maybe_prompt_for_cleanup(results: list[EncodeResult], assume_yes: bool) -> 
     return cleaned
 
 
+def _mkv_replacement_summary(candidates: list[EncodeResult]) -> list[str]:
+    if not candidates:
+        return []
+    source_types = sorted({result.job.source.suffix.lower() for result in candidates})
+    names = [result.job.source.name for result in candidates[:5]]
+    lines = [
+        f"{len(candidates)} newly encoded MKV file(s) are ready to replace original "
+        + ", ".join(source_types)
+        + " source file(s)."
+    ]
+    if names:
+        extra = (
+            "" if len(candidates) <= len(names) else f", and {len(candidates) - len(names)} more"
+        )
+        lines.append(f"Examples: {', '.join(names)}{extra}.")
+    return lines
+
+
+def _maybe_prompt_for_mkv_replacements(
+    results: list[EncodeResult],
+    *,
+    ffprobe: Path,
+    assume_yes: bool,
+) -> dict[Path, Path]:
+    if assume_yes:
+        return {}
+    candidates = eligible_mkv_replacement_results(results, ffprobe=ffprobe)
+    if not candidates:
+        return {}
+
+    source_types = sorted({result.job.source.suffix.lower() for result in candidates})
+    target_dirs = sorted({str(result.job.source.parent) for result in candidates})
+    console.print(
+        "[yellow]Successful MKV follow-up outputs detected:[/yellow] these files were newly encoded"
+        " and compressed to MKV because the original container could not safely carry the copied streams."
+    )
+    for line in _mkv_replacement_summary(candidates):
+        console.print(f"[dim]{line}[/dim]")
+    if len(target_dirs) == 1:
+        console.print(
+            f"[dim]If you replace them, the new MKV files will be moved back into {target_dirs[0]}.[/dim]"
+        )
+    if not typer.confirm(
+        "Replace the original "
+        + ", ".join(source_types)
+        + " files with these newly encoded .mkv files now?",
+        default=False,
+    ):
+        return {}
+
+    replaced = replace_successful_mkv_results(results, ffprobe=ffprobe)
+    if replaced:
+        console.print(
+            "[green]MKV replacement complete:[/green] removed the original source files and restored"
+            f" {len(replaced)} newly encoded MKV output(s) beside them."
+        )
+    return replaced
+
+
+def _cleanup_expectation_lines(jobs: list[EncodeJob], *, cleanup_after: bool) -> list[str]:
+    if not jobs:
+        return []
+    true_mkv_sidecars = [
+        job
+        for job in jobs
+        if job.output.suffix.lower() == ".mkv" and job.source.suffix.lower() != ".mkv"
+    ]
+    same_format_outputs = [
+        job
+        for job in jobs
+        if job.output != job.source and job.output.suffix.lower() == job.source.suffix.lower()
+    ]
+    lines: list[str] = []
+    if cleanup_after:
+        if same_format_outputs:
+            lines.append(
+                f"Cleanup will restore {len(same_format_outputs)} same-format output"
+                + ("s" if len(same_format_outputs) != 1 else "")
+                + " to the original filename."
+            )
+        if true_mkv_sidecars:
+            lines.append(
+                f"{len(true_mkv_sidecars)} MKV reroute sidecar output"
+                + ("s" if len(true_mkv_sidecars) != 1 else "")
+                + " will get a separate end-of-run prompt about replacing the original non-MKV files."
+            )
+    else:
+        if same_format_outputs:
+            lines.append(
+                "Cleanup is off, so same-format outputs will stay side-by-side until you review them."
+            )
+        if true_mkv_sidecars:
+            lines.append(
+                f"{len(true_mkv_sidecars)} file(s) are planned as MKV reroute sidecars and will get a separate end-of-run replacement prompt."
+            )
+    return lines
+
+
+def _should_prompt_direct_cleanup_policy(
+    *,
+    dry_run: bool,
+    overwrite: bool,
+    output_dir: Path | None,
+    yes: bool,
+    jobs: list[EncodeJob],
+) -> bool:
+    if dry_run or overwrite or output_dir is not None or yes:
+        return False
+    return any(
+        job.output != job.source and job.output.suffix.lower() == job.source.suffix.lower()
+        for job in jobs
+    )
+
+
+def _batch_composition_lines(jobs: list[EncodeJob]) -> list[str]:
+    active = [job for job in jobs if not job.skip]
+    if not active:
+        return []
+    codec_counts: dict[str, int] = {}
+    container_counts: dict[str, int] = {}
+    for job in active:
+        codec_counts[job.source_codec or "?"] = codec_counts.get(job.source_codec or "?", 0) + 1
+        suffix = job.source.suffix.lower() or "?"
+        container_counts[suffix] = container_counts.get(suffix, 0) + 1
+    top_codecs = ", ".join(
+        f"{count} {codec}"
+        for codec, count in sorted(codec_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+    )
+    top_containers = ", ".join(
+        f"{count} {suffix}"
+        for suffix, count in sorted(container_counts.items(), key=lambda item: (-item[1], item[0]))[
+            :3
+        ]
+    )
+    lines = []
+    if top_codecs:
+        lines.append(f"Composition by codec: {top_codecs}")
+    if top_containers:
+        lines.append(f"Composition by container: {top_containers}")
+    return lines
+
+
+def _print_direct_encode_plan(
+    *,
+    mode_label: str,
+    preset: str,
+    crf: int,
+    profile_name: str | None,
+    jobs: list[EncodeJob],
+    cleanup_after: bool,
+) -> None:
+    primary_count = sum(1 for job in jobs if not job.skip and job.batch_cohort != "mkv_reroute")
+    reroute_count = sum(1 for job in jobs if not job.skip and job.batch_cohort == "mkv_reroute")
+    console.print(f"[dim]Mode:[/dim] {mode_label}")
+    setting_line = f"[dim]Encoding settings:[/dim] preset={preset}, crf={crf}"
+    if profile_name:
+        setting_line += f", profile={profile_name}"
+    else:
+        setting_line += ", profile=direct flags/defaults"
+    console.print(setting_line)
+    for line in _batch_composition_lines(jobs):
+        console.print(f"[dim]{line}[/dim]")
+    console.print(
+        f"[dim]Batch cohorts:[/dim] {primary_count} primary encode"
+        + ("s" if primary_count != 1 else "")
+        + f", {reroute_count} MKV reroute sidecar"
+        + ("s" if reroute_count != 1 else "")
+        + "."
+    )
+    console.print(
+        f"[dim]Cleanup policy:[/dim] {'Replace originals after successful same-format encodes' if cleanup_after else 'Keep original files until reviewed'}"
+    )
+    for line in _cleanup_expectation_lines(jobs, cleanup_after=cleanup_after):
+        console.print(f"[dim]{line}[/dim]")
+    console.print(
+        '[dim]Hint:[/dim] use `mediashrink wizard "<dir>"` for guided profile selection and setup.'
+    )
+
+
 def _resolve_encode_settings(
     profile: str | None,
     crf: int | None,
@@ -2809,7 +3091,7 @@ def encode_cmd(
     ffmpeg, ffprobe = _prepare_tools(output_dir)
     started_at = _now_iso()
 
-    effective_crf, effective_preset, _ = _resolve_encode_settings(profile, crf, preset)
+    effective_crf, effective_preset, profile_name = _resolve_encode_settings(profile, crf, preset)
 
     files = scan_directory(directory, recursive=recursive)
     if not files:
@@ -2932,6 +3214,7 @@ def encode_cmd(
         _reconcile_session_with_jobs(prior, active_jobs)
 
     display.show_scan_table(active_jobs)
+    direct_cleanup_policy = cleanup
 
     to_encode = [job for job in active_jobs if not job.skip]
     if not to_encode:
@@ -2946,10 +3229,33 @@ def encode_cmd(
     preflight_warnings = _collect_preflight_warnings(active_jobs, ffprobe)
     preflight_warnings.extend(reroute_notes)
 
+    if _should_prompt_direct_cleanup_policy(
+        dry_run=dry_run,
+        overwrite=overwrite,
+        output_dir=output_dir,
+        yes=yes,
+        jobs=active_jobs,
+    ):
+        direct_cleanup_policy = typer.confirm(
+            "Replace originals after successful same-format side-by-side encodes?",
+            default=False,
+        )
+        console.print(
+            f"[dim]Cleanup decision:[/dim] {'Replace originals after success' if direct_cleanup_policy else 'Keep originals'}"
+        )
+
     if to_encode and not dry_run and not yes:
         if not json_output:
             _print_safe_interrupt_guidance()
             _print_preflight_warnings(preflight_warnings)
+            _print_direct_encode_plan(
+                mode_label="Direct encode",
+                preset=effective_preset,
+                crf=effective_crf,
+                profile_name=profile_name,
+                jobs=active_jobs,
+                cleanup_after=direct_cleanup_policy,
+            )
         _maybe_warn_low_disk_space(
             active_jobs, output_dir or directory, overwrite, assume_yes=json_output
         )
@@ -2960,6 +3266,14 @@ def encode_cmd(
         if not json_output:
             _print_safe_interrupt_guidance()
             _print_preflight_warnings(preflight_warnings)
+            _print_direct_encode_plan(
+                mode_label="Direct encode",
+                preset=effective_preset,
+                crf=effective_crf,
+                profile_name=profile_name,
+                jobs=active_jobs,
+                cleanup_after=direct_cleanup_policy,
+            )
         _maybe_warn_low_disk_space(active_jobs, output_dir or directory, overwrite, assume_yes=True)
     elif not dry_run and not json_output:
         _print_preflight_warnings(preflight_warnings)
@@ -3017,12 +3331,23 @@ def encode_cmd(
             )
         )
     cleaned_paths: list[Path] = []
-    if cleanup:
+    mkv_replaced_paths: dict[Path, Path] = {}
+    if direct_cleanup_policy:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
-    elif not dry_run and not overwrite and output_dir is None and not yes:
-        cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+    if not dry_run and not yes and not json_output:
+        mkv_replaced_paths = _maybe_prompt_for_mkv_replacements(
+            results,
+            ffprobe=ffprobe,
+            assume_yes=False,
+        )
     _record_recovered_sidecars(active_session, session_path, recovered_paths)
-    _record_cleanup_results(active_session, session_path, results, cleaned_paths)
+    _record_cleanup_results(
+        active_session,
+        session_path,
+        results,
+        cleaned_paths,
+        mkv_replaced_paths,
+    )
 
     if not dry_run:
         json_report, text_report = _write_batch_reports(
@@ -3033,7 +3358,7 @@ def encode_cmd(
             preset=effective_preset,
             crf=effective_crf,
             overwrite=overwrite,
-            cleanup_requested=cleanup,
+            cleanup_requested=direct_cleanup_policy,
             resumed_from_session=resumed_from_session,
             session_path=session_path,
             started_at=started_at,
@@ -3041,6 +3366,7 @@ def encode_cmd(
             results=results,
             cleaned_paths=cleaned_paths,
             log_path=log_path,
+            mkv_replaced_paths=mkv_replaced_paths,
             warnings=preflight_warnings,
             policy=policy,
             on_file_failure=on_file_failure,
@@ -3049,6 +3375,9 @@ def encode_cmd(
             split_followup_manifest=split_followup_manifest,
             estimate_miss_summary=_estimate_miss_summary(results),
             require_net_savings_pct=require_net_savings,
+            launch_mode="direct_encode",
+            cleanup_policy="replace_originals" if direct_cleanup_policy else "keep_originals",
+            batch_jobs=active_jobs,
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -3492,10 +3821,17 @@ def apply(
             )
         )
     cleaned_paths: list[Path] = []
+    mkv_replaced_paths: dict[Path, Path] = {}
     if cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not overwrite and output_dir is None and not yes:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
+    if not yes:
+        mkv_replaced_paths = _maybe_prompt_for_mkv_replacements(
+            results,
+            ffprobe=ffprobe,
+            assume_yes=False,
+        )
 
     json_report, text_report = _write_batch_reports(
         mode="apply",
@@ -3513,6 +3849,7 @@ def apply(
         results=results,
         cleaned_paths=cleaned_paths,
         log_path=None,
+        mkv_replaced_paths=mkv_replaced_paths,
         warnings=preflight_warnings,
         policy=_validate_policy(policy),
         on_file_failure=on_file_failure,
@@ -3521,6 +3858,9 @@ def apply(
         split_followup_manifest=split_followup_manifest,
         estimate_miss_summary=_estimate_miss_summary(results),
         require_net_savings_pct=require_net_savings,
+        launch_mode="apply",
+        cleanup_policy="replace_originals" if cleanup else "keep_originals",
+        batch_jobs=active_jobs,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
@@ -3801,10 +4141,17 @@ def wizard(
                             stopped_early = True
 
     cleaned_paths: list[Path] = []
+    mkv_replaced_paths: dict[Path, Path] = {}
     if wizard_cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not json_output and not overwrite and output_dir is None:
         pass  # cleanup was already asked upfront; no second prompt
+    if not json_output:
+        mkv_replaced_paths = _maybe_prompt_for_mkv_replacements(
+            results,
+            ffprobe=ffprobe,
+            assume_yes=False,
+        )
 
     json_report, text_report = _write_batch_reports(
         mode="wizard",
@@ -3822,6 +4169,7 @@ def wizard(
         results=results,
         cleaned_paths=cleaned_paths,
         log_path=None,
+        mkv_replaced_paths=mkv_replaced_paths,
         warnings=preflight_warnings,
         policy=policy,
         on_file_failure=on_file_failure,
@@ -3842,6 +4190,9 @@ def wizard(
             else None
         ),
         require_net_savings_pct=require_net_savings,
+        launch_mode="wizard",
+        cleanup_policy="replace_originals" if wizard_cleanup else "keep_originals",
+        batch_jobs=jobs,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -4097,11 +4448,18 @@ def resume(
             )
         )
     cleaned_paths: list[Path] = []
+    mkv_replaced_paths: dict[Path, Path] = {}
     if cleanup:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=True)
     elif not session.overwrite and output_dir is None and not yes:
         cleaned_paths = _maybe_prompt_for_cleanup(results, assume_yes=False)
-    _record_cleanup_results(session, session_path, results, cleaned_paths)
+    if not yes:
+        mkv_replaced_paths = _maybe_prompt_for_mkv_replacements(
+            results,
+            ffprobe=ffprobe,
+            assume_yes=False,
+        )
+    _record_cleanup_results(session, session_path, results, cleaned_paths, mkv_replaced_paths)
 
     json_report, text_report = _write_batch_reports(
         mode="resume",
@@ -4119,6 +4477,7 @@ def resume(
         results=results,
         cleaned_paths=cleaned_paths,
         log_path=log_path,
+        mkv_replaced_paths=mkv_replaced_paths,
         warnings=preflight_warnings,
         policy=_validate_policy(policy),
         on_file_failure=on_file_failure,
@@ -4127,6 +4486,9 @@ def resume(
         retry_mode=_validate_retry_mode(retry_mode),
         queue_strategy=_validate_queue_strategy(queue_strategy),
         require_net_savings_pct=require_net_savings,
+        launch_mode="resume",
+        cleanup_policy="replace_originals" if cleanup else "keep_originals",
+        batch_jobs=active_jobs,
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -4363,7 +4725,7 @@ def overnight(
         results = _build_skipped_results(active_jobs)
         stopped_early = False
         console.print("[dim]All overnight candidates were skipped before encode start.[/dim]")
-    _record_cleanup_results(session, session_path, results, [])
+    _record_cleanup_results(session, session_path, results, [], {})
     json_report, text_report = _write_batch_reports(
         mode="overnight",
         base_dir=directory,
@@ -4380,6 +4742,7 @@ def overnight(
         results=results,
         cleaned_paths=[],
         log_path=log_path,
+        mkv_replaced_paths={},
         warnings=preflight_warnings,
         policy=policy,
         on_file_failure="skip",
@@ -4388,6 +4751,9 @@ def overnight(
         split_followup_manifest=split_followup_manifest,
         estimate_miss_summary=_estimate_miss_summary(results),
         require_net_savings_pct=require_net_savings,
+        launch_mode="overnight",
+        cleanup_policy="keep_originals",
+        batch_jobs=active_jobs,
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
     if stopped_early or any(not r.success and not r.skipped for r in results):

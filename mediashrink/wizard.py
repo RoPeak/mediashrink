@@ -568,7 +568,7 @@ def _cleanup_expectation_lines(
             lines.append(
                 f"{len(true_mkv_sidecars)} true MKV sidecar output"
                 + ("s" if len(true_mkv_sidecars) != 1 else "")
-                + " will remain as .mkv file(s)."
+                + " will get a separate end-of-run prompt about replacing the original non-MKV files."
             )
     else:
         if same_format_outputs:
@@ -577,7 +577,7 @@ def _cleanup_expectation_lines(
             )
         if true_mkv_sidecars:
             lines.append(
-                f"{len(true_mkv_sidecars)} file(s) are already planned as true MKV sidecars."
+                f"{len(true_mkv_sidecars)} file(s) are already planned as true MKV sidecars and will get a separate end-of-run replacement prompt."
             )
     return lines
 

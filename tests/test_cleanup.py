@@ -8,7 +8,9 @@ from mediashrink.cleanup import (
     RecoverableSidecar,
     cleanup_successful_results,
     eligible_cleanup_results,
+    eligible_mkv_replacement_results,
     find_recoverable_sidecars,
+    replace_successful_mkv_results,
     reconcile_recoverable_sidecars,
 )
 from mediashrink.models import EncodeJob, EncodeResult
@@ -95,6 +97,72 @@ def test_eligible_cleanup_results_skips_cross_container_sidecars(tmp_path: Path)
     eligible = eligible_cleanup_results([mp4_to_mkv])
 
     assert eligible == []
+
+
+def test_eligible_mkv_replacement_results_accepts_safe_cross_container_outputs(
+    tmp_path: Path,
+) -> None:
+    mp4_to_mkv = _make_result(tmp_path, source_name="movie.mp4", output_name="movie.mkv")
+
+    with (
+        patch("mediashrink.cleanup.get_duration_seconds", side_effect=[120.0, 120.5]),
+        patch(
+            "mediashrink.cleanup.probe_stream_type_counts",
+            side_effect=[
+                {"video": 1, "audio": 2, "subtitle": 1, "attachment": 0, "data": 0},
+                {"video": 1, "audio": 2, "subtitle": 1, "attachment": 0, "data": 0},
+            ],
+        ),
+    ):
+        eligible = eligible_mkv_replacement_results([mp4_to_mkv], ffprobe=Path("/usr/bin/ffprobe"))
+
+    assert eligible == [mp4_to_mkv]
+
+
+def test_replace_successful_mkv_results_moves_output_back_beside_source(tmp_path: Path) -> None:
+    reroute_dir = tmp_path / "mediashrink_mkv_followup"
+    reroute_dir.mkdir()
+    source = tmp_path / "episode.mp4"
+    output = reroute_dir / "episode.mkv"
+    source.write_bytes(b"original-source-bytes")
+    output.write_bytes(b"compressed")
+    result = EncodeResult(
+        job=EncodeJob(
+            source=source,
+            output=output,
+            tmp_output=reroute_dir / ".tmp_episode.mkv",
+            crf=20,
+            preset="fast",
+            dry_run=False,
+            skip=False,
+            skip_reason=None,
+            action_label="MKV REROUTE",
+            batch_cohort="mkv_reroute",
+        ),
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=source.stat().st_size,
+        output_size_bytes=output.stat().st_size,
+        duration_seconds=10.0,
+    )
+
+    with (
+        patch("mediashrink.cleanup.get_duration_seconds", side_effect=[120.0, 120.2]),
+        patch(
+            "mediashrink.cleanup.probe_stream_type_counts",
+            side_effect=[
+                {"video": 1, "audio": 1, "subtitle": 0, "attachment": 0, "data": 0},
+                {"video": 1, "audio": 1, "subtitle": 0, "attachment": 0, "data": 0},
+            ],
+        ),
+    ):
+        replaced = replace_successful_mkv_results([result], ffprobe=Path("/usr/bin/ffprobe"))
+
+    assert replaced == {source: tmp_path / "episode.mkv"}
+    assert not source.exists()
+    assert (tmp_path / "episode.mkv").read_bytes() == b"compressed"
+    assert not output.exists()
 
 
 def test_find_recoverable_sidecars_accepts_matching_completed_sidecars(tmp_path: Path) -> None:

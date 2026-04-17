@@ -147,6 +147,15 @@ def _skip_bucket(result: EncodeResult) -> str:
     return "other"
 
 
+def _reroute_summary(results: list[EncodeResult]) -> str | None:
+    rerouted = [result for result in results if result.job.batch_cohort == "mkv_reroute"]
+    if not rerouted:
+        return None
+    destinations = sorted({str(result.job.output.parent) for result in rerouted})
+    destination = destinations[0] if len(destinations) == 1 else "multiple destinations"
+    return f"MKV reroute cohort: {len(rerouted)} file(s) wrote MKV sidecars to {destination}."
+
+
 class EncodingDisplay:
     def __init__(self, console: Console | None = None, *, render_mode: str = "auto") -> None:
         self.console = console or Console()
@@ -166,7 +175,9 @@ class EncodingDisplay:
             self.console.print()
             self.console.print("[bold cyan]Files found[/bold cyan]")
             for job in jobs:
-                action = "SKIP" if job.skip else "DRY RUN" if job.dry_run else "ENCODE"
+                action = job.action_label or (
+                    "SKIP" if job.skip else "DRY RUN" if job.dry_run else "ENCODE"
+                )
                 line = f"- {job.source.name} | {job.source_codec or '?'} | {_fmt_size(job.source.stat().st_size)} | {action}"
                 if show_estimates and not job.skip and job.estimated_output_bytes > 0:
                     est_saved = job.source.stat().st_size - job.estimated_output_bytes
@@ -208,7 +219,9 @@ class EncodingDisplay:
             elif job.dry_run:
                 action = Text("DRY RUN", style="cyan")
             else:
-                action = Text("ENCODE", style="green bold")
+                action_text = job.action_label or "ENCODE"
+                action_style = "yellow bold" if action_text == "MKV REROUTE" else "green bold"
+                action = Text(action_text, style=action_style)
 
             filename = job.source.name
             if job.skip and job.skip_reason:
@@ -248,6 +261,9 @@ class EncodingDisplay:
             f"[dim]{to_skip}[/dim] to skip  "
             f"([yellow]{_fmt_size(total_input_bytes)}[/yellow] total input)"
         )
+        rerouted = sum(1 for job in jobs if job.batch_cohort == "mkv_reroute" and not job.skip)
+        if rerouted:
+            summary += f"  [yellow]{rerouted} rerouted to MKV sidecars[/yellow]"
         if show_estimates and total_est_bytes > 0:
             total_saving = total_input_bytes - total_est_bytes
             total_pct = total_saving / total_input_bytes * 100 if total_input_bytes else 0
@@ -383,6 +399,9 @@ class EncodingDisplay:
                 f"[dim]{len(skipped_results)}[/dim] skipped",
                 highlight=False,
             )
+            reroute_summary = _reroute_summary(results)
+            if reroute_summary:
+                self.console.print(f"[dim]{reroute_summary}[/dim]", highlight=False)
             if total_input > 0:
                 self.console.print(
                     f"Total: {_fmt_size(total_input)} -> {_fmt_size(total_output)} "
@@ -579,6 +598,9 @@ class EncodingDisplay:
             f"[dim]{len(skipped_results)}[/dim] skipped",
             highlight=False,
         )
+        reroute_summary = _reroute_summary(results)
+        if reroute_summary:
+            self.console.print(f"[dim]{reroute_summary}[/dim]", highlight=False)
         if skipped_results:
             details: list[str] = []
             if skipped_incompatible:

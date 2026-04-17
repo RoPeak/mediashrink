@@ -208,3 +208,58 @@ def test_file_counts_column_uses_processed_batch_wording() -> None:
     rendered = _FileCountsColumn().render(DummyTask())
 
     assert rendered.plain == "processed 3 / rem 2 / ok 1 / fail 1 / skip 1"
+
+
+def test_show_scan_table_marks_mkv_reroutes(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    job = EncodeJob(
+        source=source,
+        output=tmp_path / "mediashrink_mkv_followup" / "episode.mkv",
+        tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_episode.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+        action_label="MKV REROUTE",
+        batch_cohort="mkv_reroute",
+    )
+
+    EncodingDisplay(console).show_scan_table([job])
+    output = console.export_text()
+
+    assert "MKV REROUTE" in output
+    assert "rerouted to MKV sidecars" in output
+
+
+def test_show_summary_mentions_reroute_cohort(tmp_path: Path) -> None:
+    console = Console(record=True, width=140)
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"x" * 1000)
+    result = EncodeResult(
+        job=EncodeJob(
+            source=source,
+            output=tmp_path / "mediashrink_mkv_followup" / "episode.mkv",
+            tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_episode.mkv",
+            crf=20,
+            preset="fast",
+            dry_run=False,
+            skip=False,
+            action_label="MKV REROUTE",
+            batch_cohort="mkv_reroute",
+        ),
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=500,
+        duration_seconds=2.0,
+        media_duration_seconds=120.0,
+    )
+
+    EncodingDisplay(console).show_summary([result])
+    output = console.export_text()
+
+    assert "MKV reroute cohort:" in output
+    assert "wrote MKV sidecars" in output

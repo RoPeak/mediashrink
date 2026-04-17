@@ -45,6 +45,51 @@ def cleanup_successful_results(results: list[EncodeResult]) -> list[Path]:
     return cleaned
 
 
+def eligible_mkv_replacement_results(
+    results: list[EncodeResult],
+    *,
+    ffprobe: Path,
+) -> list[EncodeResult]:
+    """Return successful rerouted MKV outputs that are safe to replace originals with."""
+    eligible: list[EncodeResult] = []
+    for result in results:
+        if not result.success or result.skipped or result.job.dry_run:
+            continue
+        if not output_passes_safety_check(result.input_size_bytes, result.output_size_bytes):
+            continue
+        source = result.job.source
+        output = result.job.output
+        if source == output or not output.exists() or not source.exists():
+            continue
+        if output.suffix.lower() != ".mkv" or source.suffix.lower() == ".mkv":
+            continue
+        if not _duration_matches(source, output, ffprobe):
+            continue
+        if not _stream_layout_matches(source, output, ffprobe):
+            continue
+        eligible.append(result)
+    return eligible
+
+
+def replace_successful_mkv_results(
+    results: list[EncodeResult],
+    *,
+    ffprobe: Path,
+) -> dict[Path, Path]:
+    """
+    Replace original non-MKV sources with successful rerouted MKV outputs.
+
+    The original source is backed up first, then the MKV sidecar is moved into the
+    source directory using the same stem with a `.mkv` suffix. Any pre-existing
+    target MKV is also backed up so the operation can roll back safely.
+    """
+    replaced: dict[Path, Path] = {}
+    for result in eligible_mkv_replacement_results(results, ffprobe=ffprobe):
+        target = _replace_source_with_mkv_sidecar(result.job.source, result.job.output)
+        replaced[result.job.source] = target
+    return replaced
+
+
 @dataclass(frozen=True)
 class RecoverableSidecar:
     source: Path
@@ -69,6 +114,35 @@ def _replace_source_with_sidecar(source: Path, sidecar: Path) -> Path:
         if backup.exists():
             backup.unlink()
     return source
+
+
+def _replace_source_with_mkv_sidecar(source: Path, sidecar: Path) -> Path:
+    target = source.with_suffix(".mkv")
+    source_backup = source.with_name(f".cleanup_backup_{source.name}")
+    target_backup = target.with_name(f".cleanup_backup_{target.name}")
+
+    for backup in (source_backup, target_backup):
+        if backup.exists():
+            backup.unlink()
+
+    if target.exists():
+        target.replace(target_backup)
+
+    source.replace(source_backup)
+    try:
+        shutil.move(str(sidecar), str(target))
+    except Exception:
+        if source_backup.exists():
+            source_backup.replace(source)
+        if target_backup.exists():
+            target_backup.replace(target)
+        raise
+    else:
+        if source_backup.exists():
+            source_backup.unlink()
+        if target_backup.exists():
+            target_backup.unlink()
+    return target
 
 
 def reconcile_recoverable_sidecars(pairs: list[RecoverableSidecar]) -> list[Path]:

@@ -56,6 +56,8 @@ class EncodeJob:
     skip_reason: str | None = None
     source_codec: str | None = None  # e.g. "vc1", "h264", "hevc"
     estimated_output_bytes: int = 0  # 0 means unknown
+    action_label: str | None = None
+    batch_cohort: str | None = None
 
 
 @dataclass

@@ -222,6 +222,40 @@ def test_wizard_subcommand_registered() -> None:
     assert "wizard" in result.stdout.lower() or "encoding" in result.stdout.lower()
 
 
+def test_bare_interactive_invocation_can_route_to_wizard(tmp_path: Path) -> None:
+    with (
+        patch("mediashrink.cli._choose_interactive_default_command", return_value="wizard"),
+        patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.cli.EncodingDisplay"),
+        patch(
+            "mediashrink.wizard.run_wizard",
+            return_value=([], "cancel", False, None),
+        ) as mock_run_wizard,
+    ):
+        result = runner.invoke(app, [str(tmp_path)])
+
+    assert result.exit_code == 3
+    assert mock_run_wizard.called
+
+
+def test_explicit_subcommand_bypasses_default_mode_prompt(tmp_path: Path) -> None:
+    with patch("mediashrink.cli._choose_interactive_default_command") as mock_choose:
+        result = runner.invoke(app, ["wizard", str(tmp_path)])
+
+    assert result.exit_code == 3
+    mock_choose.assert_not_called()
+
+
+def test_choose_interactive_default_command_skips_prompt_for_json() -> None:
+    from mediashrink.cli import _choose_interactive_default_command
+
+    with patch("mediashrink.cli.typer.prompt") as mock_prompt:
+        chosen = _choose_interactive_default_command(["/tmp/library", "--json"])
+
+    assert chosen == "encode"
+    mock_prompt.assert_not_called()
+
+
 def test_wizard_is_recursive_by_default(tmp_path: Path) -> None:
     with (
         patch("mediashrink.cli._prepare_tools", return_value=(FFMPEG, FFPROBE)),
@@ -619,7 +653,7 @@ def test_apply_warns_when_output_container_drops_subtitles(tmp_path: Path) -> No
     assert "Subtitle warning:" in result.stdout
 
 
-def test_encode_prompts_for_cleanup_after_successful_side_by_side_run(tmp_path: Path) -> None:
+def test_encode_prompts_for_cleanup_before_confirmation(tmp_path: Path) -> None:
     source = tmp_path / "ep01.mkv"
     source.write_bytes(b"x" * 1000)
     fake_job = _make_job(source)
@@ -635,13 +669,15 @@ def test_encode_prompts_for_cleanup_after_successful_side_by_side_run(tmp_path: 
         patch("mediashrink.cli.encode_file", return_value=fake_result),
         patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True),
         patch("mediashrink.cli.typer.confirm", return_value=False) as mock_cleanup_confirm,
-        patch("mediashrink.cli.cleanup_successful_results") as mock_cleanup,
+        patch("mediashrink.cli._maybe_prompt_for_cleanup") as mock_prompt_cleanup,
     ):
         result = runner.invoke(app, [str(tmp_path)])
 
     assert result.exit_code == 0
     mock_cleanup_confirm.assert_called_once()
-    mock_cleanup.assert_not_called()
+    mock_prompt_cleanup.assert_not_called()
+    assert "Cleanup decision:" in result.stdout
+    assert "Mode: Direct encode" in result.stdout
 
 
 def test_encode_cleanup_flag_runs_without_prompt(tmp_path: Path) -> None:
@@ -667,6 +703,57 @@ def test_encode_cleanup_flag_runs_without_prompt(tmp_path: Path) -> None:
     assert result.exit_code == 0
     mock_cleanup_confirm.assert_not_called()
     mock_cleanup.assert_called_once()
+
+
+def test_encode_prompts_separately_for_successful_mkv_replacements(tmp_path: Path) -> None:
+    source = tmp_path / "ep01.mp4"
+    reroute_dir = tmp_path / "mediashrink_mkv_followup"
+    reroute_dir.mkdir()
+    source.write_bytes(b"x" * 1000)
+    fake_job = EncodeJob(
+        source=source,
+        output=reroute_dir / "ep01.mkv",
+        tmp_output=reroute_dir / ".tmp_ep01.mkv",
+        crf=20,
+        preset="slow",
+        dry_run=False,
+        skip=False,
+        skip_reason=None,
+        action_label="MKV REROUTE",
+        batch_cohort="mkv_reroute",
+    )
+    fake_job.output.write_bytes(b"compressed")
+    fake_result = _make_result(fake_job, input_size_bytes=1000, output_size_bytes=500)
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli.scan_directory", return_value=[source]),
+        patch("mediashrink.cli.build_jobs", return_value=[fake_job]),
+        patch(
+            "mediashrink.cli._maybe_prepare_mkv_reroute",
+            return_value=([], [fake_job], None, [], ["rerouted"]),
+        ),
+        patch("mediashrink.cli.encode_file", return_value=fake_result),
+        patch("mediashrink.progress.EncodingDisplay.confirm_proceed", return_value=True),
+        patch("mediashrink.cli.typer.confirm", return_value=False) as mock_confirm,
+        patch(
+            "mediashrink.cli.eligible_mkv_replacement_results",
+            return_value=[fake_result],
+        ),
+        patch("mediashrink.cli.replace_successful_mkv_results") as mock_replace,
+    ):
+        result = runner.invoke(app, [str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert mock_confirm.call_count == 1
+    mock_replace.assert_not_called()
+    assert "Successful MKV follow-up outputs detected:" in result.stdout
+    assert (
+        "newly encoded MKV file(s) are ready to replace original .mp4 source file(s)."
+        in result.stdout
+    )
 
 
 def test_apply_yes_does_not_prompt_for_cleanup_without_flag(tmp_path: Path) -> None:
@@ -1762,6 +1849,122 @@ def test_write_batch_reports_cleanup_text_distinguishes_true_mkv_sidecars(tmp_pa
 
     text = text_path.read_text(encoding="utf-8")
     assert "Cleanup: MKV sidecar output kept alongside the original source" in text
+
+
+def test_write_batch_reports_include_launch_mode_cleanup_policy_and_reroute_metadata(
+    tmp_path: Path,
+) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    primary_job = _make_job(tmp_path / "episode01.mkv")
+    primary_job.source.write_bytes(b"x" * 1000)
+    primary_result = _make_result(primary_job)
+
+    reroute_job = EncodeJob(
+        source=tmp_path / "episode02.mp4",
+        output=tmp_path / "mediashrink_mkv_followup" / "episode02.mkv",
+        tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_episode02.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+        skip_reason=None,
+        action_label="MKV REROUTE",
+        batch_cohort="mkv_reroute",
+    )
+    reroute_job.output.parent.mkdir(parents=True)
+    reroute_job.source.write_bytes(b"x" * 1000)
+    reroute_job.output.write_bytes(b"y" * 500)
+    reroute_result = _make_result(reroute_job, input_size_bytes=1000, output_size_bytes=500)
+
+    json_path, text_path = _write_batch_reports(
+        mode="encode",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[primary_result, reroute_result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+        launch_mode="direct_encode",
+        cleanup_policy="keep_originals",
+        batch_jobs=[primary_job, reroute_job],
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["launch_mode"] == "direct_encode"
+    assert payload["cleanup_policy"] == "keep_originals"
+    assert payload["batch_cohorts"]["primary_count"] == 1
+    assert payload["batch_cohorts"]["rerouted_count"] == 1
+    assert payload["files"][1]["action_label"] == "MKV REROUTE"
+    assert payload["files"][1]["batch_cohort"] == "mkv_reroute"
+    assert "Cleanup policy: keep_originals" in text
+    assert "Launch mode: direct_encode" in text
+    assert "Batch cohorts: 1 primary, 1 rerouted" in text
+
+
+def test_write_batch_reports_marks_when_original_is_replaced_with_mkv(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    reroute_job = EncodeJob(
+        source=tmp_path / "episode02.mp4",
+        output=tmp_path / "mediashrink_mkv_followup" / "episode02.mkv",
+        tmp_output=tmp_path / "mediashrink_mkv_followup" / ".tmp_episode02.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+        skip_reason=None,
+        action_label="MKV REROUTE",
+        batch_cohort="mkv_reroute",
+    )
+    reroute_job.output.parent.mkdir(parents=True)
+    reroute_job.source.write_bytes(b"x" * 1000)
+    reroute_job.output.write_bytes(b"y" * 500)
+    reroute_result = _make_result(reroute_job, input_size_bytes=1000, output_size_bytes=500)
+
+    json_path, text_path = _write_batch_reports(
+        mode="encode",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[reroute_result],
+        cleaned_paths=[],
+        log_path=None,
+        mkv_replaced_paths={reroute_job.source: tmp_path / "episode02.mkv"},
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+        batch_jobs=[reroute_job],
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    text = text_path.read_text(encoding="utf-8")
+
+    assert payload["mkv_replacements_completed"] == 1
+    assert payload["files"][0]["output"].endswith("episode02.mkv")
+    assert payload["files"][0]["cleanup_result"].startswith("original .mp4 removed")
+    assert "MKV replacements completed: 1" in text
 
 
 def test_safe_first_queue_prioritizes_lower_risk_jobs(tmp_path: Path) -> None:
