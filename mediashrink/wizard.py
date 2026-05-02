@@ -5,7 +5,8 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from html import unescape
 from pathlib import Path
 
 import typer
@@ -43,6 +44,7 @@ from mediashrink.analysis import (
 )
 from mediashrink.calibration import (
     bitrate_bucket,
+    codec_family,
     describe_history_slices,
     estimate_display_uncertainty,
     estimate_failure_rate,
@@ -75,6 +77,7 @@ from mediashrink.profiles import SavedProfile, get_builtin_profiles, upsert_prof
 from mediashrink.scanner import (
     build_jobs,
     duplicate_policy_choices,
+    parse_episode_grouping,
     scan_directory,
     supported_formats_label,
 )
@@ -425,7 +428,7 @@ def _wizard_confirm(
 
 
 def _render_mode(console: Console, *, plain_output: bool = False) -> str:
-    if plain_output:
+    if plain_output or (not console.is_terminal and not getattr(console, "record", False)):
         return "plain"
     if console.width < 125:
         return "narrow"
@@ -466,15 +469,16 @@ class ProfilePlanningResult:
     candidate_input_bytes: int
     candidate_media_seconds: float
     sample_item: AnalysisItem
-    sample_duration: float
-    preview_items: list[AnalysisItem]
-    available_hw: list[str]
-    benchmark_speeds: dict[str, float | None]
-    observed_probe_failures: dict[tuple[str, int], dict[Path, str]]
-    profiles: list[EncoderProfile]
-    active_calibration: dict[str, object] | None
-    size_error_by_preset: dict[str, float | None]
-    stage_messages: list[str]
+    benchmark_items: list[AnalysisItem] = field(default_factory=list)
+    sample_duration: float = 0.0
+    preview_items: list[AnalysisItem] = field(default_factory=list)
+    available_hw: list[str] = field(default_factory=list)
+    benchmark_speeds: dict[str, float | None] = field(default_factory=dict)
+    observed_probe_failures: dict[tuple[str, int], dict[Path, str]] = field(default_factory=dict)
+    profiles: list[EncoderProfile] = field(default_factory=list)
+    active_calibration: dict[str, object] | None = None
+    size_error_by_preset: dict[str, float | None] = field(default_factory=dict)
+    stage_messages: list[str] = field(default_factory=list)
 
 
 _QUALITY_RANK = {
@@ -539,6 +543,103 @@ def _compact_split_summary(
     return ", ".join(parts)
 
 
+def _looks_like_escaped_filename(name: str) -> bool:
+    if "&" not in name or ";" not in name:
+        return False
+    normalized = unescape(name)
+    return normalized != name and normalized.strip()
+
+
+def _collect_filename_hygiene_candidates(items: list[AnalysisItem]) -> list[tuple[Path, str]]:
+    candidates: list[tuple[Path, str]] = []
+    for item in items:
+        source = item.source
+        normalized_name = unescape(source.name)
+        if normalized_name != source.name and normalized_name.strip():
+            candidates.append((source, normalized_name))
+    return candidates
+
+
+def _maybe_fix_filename_hygiene(
+    items: list[AnalysisItem],
+    *,
+    console: Console,
+    active_auto: bool,
+) -> list[dict[str, str]]:
+    candidates = _collect_filename_hygiene_candidates(items)
+    if not candidates:
+        return []
+    console.print(
+        f"[yellow]Filename hygiene warning:[/yellow] {len(candidates)} file(s) look HTML-escaped or otherwise suspicious."
+    )
+    for source, normalized_name in candidates[:5]:
+        console.print(f"  [dim]{source.name} -> {normalized_name}[/dim]")
+    if active_auto:
+        console.print(
+            "[dim]Non-interactive mode will not rename files automatically. Review these names later if needed.[/dim]"
+        )
+        return [
+            {"source": str(source), "suggested_name": normalized_name, "renamed": "no"}
+            for source, normalized_name in candidates
+        ]
+    if not _wizard_confirm(
+        "Rename suspicious filenames before encoding?",
+        default=False,
+        prompt_id="rename-filenames",
+        acceptance_label="Filename rename decision",
+    ):
+        return [
+            {"source": str(source), "suggested_name": normalized_name, "renamed": "no"}
+            for source, normalized_name in candidates
+        ]
+
+    actions: list[dict[str, str]] = []
+    for source, normalized_name in candidates:
+        target = source.with_name(normalized_name)
+        if target == source:
+            continue
+        try:
+            source.rename(target)
+        except OSError:
+            actions.append(
+                {
+                    "source": str(source),
+                    "suggested_name": normalized_name,
+                    "renamed": "failed",
+                }
+            )
+            continue
+        for item in items:
+            if item.source == source:
+                item.source = target
+        actions.append({"source": str(source), "suggested_name": normalized_name, "renamed": "yes"})
+    return actions
+
+
+def _auto_queue_strategy_for_items(items: list[AnalysisItem]) -> tuple[str, str]:
+    if len(items) < 2:
+        return "original", "Original order is fine for this run size."
+    if any(item.source.suffix.lower() in {".mp4", ".m4v"} for item in items):
+        return (
+            "safe-first",
+            "Safe-first reduces the chance of container-sensitive files blocking early progress.",
+        )
+    sizes = sorted((item.size_bytes for item in items), reverse=True)
+    if (
+        sizes
+        and len(sizes) >= 3
+        and sizes[0] >= max(sum(sizes) * 0.22, sizes[min(2, len(sizes) - 1)] * 1.5)
+    ):
+        return (
+            "largest-first",
+            "Largest-first should reclaim space earlier because a few files dominate the batch.",
+        )
+    return (
+        "safe-first",
+        "Safe-first favors lower-risk files first and is the best default for mixed TV batches.",
+    )
+
+
 def _cleanup_expectation_lines(
     jobs: list[EncodeJob],
     *,
@@ -596,6 +697,16 @@ def _queue_strategy_recommendation(items: list[AnalysisItem]) -> str | None:
     if share < 0.45:
         return None
     return f"Largest-first queueing would front-load {dominant.source.name}, which looks like the longest runtime contributor."
+
+
+def _should_multi_sample_benchmark(items: list[AnalysisItem]) -> bool:
+    if len(items) < _LARGE_BATCH_FILE_THRESHOLD:
+        return False
+    episodes = [parse_episode_grouping(item.source) for item in items]
+    valid = [episode for episode in episodes if episode is not None]
+    if len(valid) != len(items) or not valid:
+        return False
+    return len({episode.show for episode in valid}) == 1
 
 
 def _calibration_trust_line(calibration_store: dict[str, object] | None) -> str | None:
@@ -926,13 +1037,16 @@ def _targeted_profile_probe_failures(
         preset, crf = target
         target_failures: dict[Path, str] = {}
         for item in risky_items:
-            result = preflight_encode_job(
-                item.source,
-                ffmpeg,
-                ffprobe,
-                crf=crf,
-                preset=preset,
-            )
+            try:
+                result = preflight_encode_job(
+                    item.source,
+                    ffmpeg,
+                    ffprobe,
+                    crf=crf,
+                    preset=preset,
+                )
+            except (OSError, ValueError):
+                continue
             if result.success:
                 continue
             target_failures[item.source] = result.error_message or ""
@@ -1257,8 +1371,13 @@ def prepare_profile_planning(
     candidate_media_seconds = _sum_item_durations(candidate_items)
     sample_pool = recommended_items or maybe_items or analysis_items
     representative_pool = select_representative_items(sample_pool, limit=3) or sample_pool
+    benchmark_items = (
+        representative_pool[:3]
+        if _should_multi_sample_benchmark(candidate_items)
+        else representative_pool[:1]
+    )
     sample_item = max(
-        representative_pool,
+        benchmark_items,
         key=lambda item: (
             item.duration_seconds if item.duration_seconds > 0 else 0.0,
             item.size_bytes,
@@ -1283,15 +1402,29 @@ def prepare_profile_planning(
     container_incompatibility_cache: dict[Path, str | None] = {}
 
     def _benchmark_target(key: str) -> tuple[str, float | None]:
-        return (
-            key,
-            benchmark_encoder(
+        sample_speeds: list[float] = []
+        sample_duration_target = max(
+            (item.duration_seconds if item.duration_seconds > 0 else sample_duration)
+            for item in benchmark_items
+        )
+        for benchmark_item in benchmark_items:
+            speed = benchmark_encoder(
                 encoder_key=key,
-                sample_file=sample_item.source,
-                sample_duration=sample_duration,
+                sample_file=benchmark_item.source,
+                sample_duration=min(
+                    benchmark_item.duration_seconds
+                    if benchmark_item.duration_seconds > 0
+                    else sample_duration_target,
+                    sample_duration_target,
+                ),
                 crf=20,
                 ffmpeg=ffmpeg,
-            ),
+            )
+            if speed is not None and speed > 0:
+                sample_speeds.append(speed)
+        return (
+            key,
+            (sum(sample_speeds) / len(sample_speeds)) if sample_speeds else None,
         )
 
     if console is not None and candidates_to_bench:
@@ -1507,6 +1640,7 @@ def prepare_profile_planning(
         candidate_input_bytes=candidate_input_bytes,
         candidate_media_seconds=candidate_media_seconds,
         sample_item=sample_item,
+        benchmark_items=benchmark_items,
         sample_duration=sample_duration,
         preview_items=preview_items,
         available_hw=available_hw,
@@ -3451,11 +3585,28 @@ def run_wizard(
             console,
             use_calibration=use_calibration,
         )
+        filename_hygiene_actions = _maybe_fix_filename_hygiene(
+            analysis_items,
+            console=console,
+            active_auto=requested_non_interactive,
+        )
         analysis_items, duplicate_notes = apply_duplicate_policy_to_items(
             analysis_items,
             policy=duplicate_policy,
         )
         early_notes = list(duplicate_notes)
+        if filename_hygiene_actions:
+            renamed_count = sum(
+                1 for action in filename_hygiene_actions if action.get("renamed") == "yes"
+            )
+            early_notes.append(
+                f"Filename hygiene: {len(filename_hygiene_actions)} suspicious name(s) detected"
+                + (
+                    f", {renamed_count} renamed before encode."
+                    if renamed_count
+                    else "; no automatic rename was applied."
+                )
+            )
         compatibility_signals = collect_container_risk_signals(analysis_items, ffprobe)
         container_risk_count, container_risk_reasons, container_risk_examples = (
             summarize_container_risks(
@@ -3697,6 +3848,8 @@ def run_wizard(
         compatibility_prediction_note: str | None = None
         selected_profile_size_error: float | None = None
         ready_time_refinement_note: str | None = None
+        selected_queue_strategy = "original"
+        selected_queue_rationale = "Original order is fine for this run size."
         mkv_attempt_failed_count = 0
         mkv_attempt_failed_names: list[str] = []
         direct_followup_names: list[str] = []
@@ -3929,6 +4082,23 @@ def run_wizard(
             mkv_attempt_failed_names = []
             direct_followup_names = []
             followup_file_names = []
+            selected_queue_strategy, selected_queue_rationale = _auto_queue_strategy_for_items(
+                selected_items
+            )
+            if selected_queue_strategy == "largest-first":
+                selected_items = sorted(
+                    selected_items,
+                    key=lambda item: (-item.size_bytes, item.source.name.lower()),
+                )
+            elif selected_queue_strategy == "safe-first":
+                selected_items = sorted(
+                    selected_items,
+                    key=lambda item: (
+                        1 if item.source.suffix.lower() in {".mp4", ".m4v"} else 0,
+                        -item.size_bytes,
+                        item.source.name.lower(),
+                    ),
+                )
             jobs = build_jobs(
                 files=[item.source for item in selected_items],
                 output_dir=output_dir,
@@ -4439,7 +4609,7 @@ def run_wizard(
         if followup_count > 0:
             console.print(
                 f"  [yellow]Moved to follow-up:[/yellow] {followup_count} file(s) failed "
-                "compatibility check — see follow-up manifest above."
+                "compatibility check; see follow-up manifest above."
             )
             if followup_count == 1 and followup_file_names:
                 console.print(f"  [dim]Follow-up file:[/dim] {followup_file_names[0]}")
@@ -4547,6 +4717,9 @@ def run_wizard(
         queue_hint = _queue_strategy_recommendation(selected_items)
         if queue_hint:
             console.print(f"  [dim]Queue hint: {queue_hint}[/dim]")
+        console.print(
+            f"  [dim]Queue strategy:[/dim] {selected_queue_strategy} - {selected_queue_rationale}"
+        )
         console.print("  [dim]Estimates are approximate.[/dim]")
         console.print(
             "  [dim]Safe to stop with Ctrl+C: completed files stay done, the current temp output is discarded, and you can resume unfinished files later.[/dim]"
@@ -4592,6 +4765,7 @@ def run_wizard(
                 "selected_estimated_seconds": estimated_total_encode_seconds,
                 "rebenchmarked_after_split": bool(ready_time_refinement_note),
                 "original_benchmark_source": original_benchmark_source.name,
+                "benchmark_sources": [item.source.name for item in planning.benchmark_items],
             },
             "estimate_ranges": {
                 "output_bytes": (
@@ -4684,6 +4858,11 @@ def run_wizard(
                     for name in followup_file_names
                 ],
             },
+            "queue_decision": {
+                "strategy": selected_queue_strategy,
+                "rationale": selected_queue_rationale,
+            },
+            "filename_hygiene": filename_hygiene_actions,
         }
         return jobs, "encode", cleanup_after, followup_manifest_path
     finally:

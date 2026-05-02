@@ -326,6 +326,43 @@ def test_analyze_writes_manifest(tmp_path: Path) -> None:
     assert "Wrote manifest" in result.stdout
 
 
+def test_analyze_surfaces_filename_hygiene_and_persists_notes(tmp_path: Path) -> None:
+    source = tmp_path / "Mergers &amp; Acquisitions.mkv"
+    source.write_bytes(b"x" * 1000)
+    manifest_path = tmp_path / "analysis.json"
+    item = AnalysisItem(
+        source=source,
+        codec="h264",
+        size_bytes=2 * 1024**3,
+        duration_seconds=120.0,
+        bitrate_kbps=12000.0,
+        estimated_output_bytes=800 * 1024**2,
+        estimated_savings_bytes=(2 * 1024**3) - (800 * 1024**2),
+        recommendation="recommended",
+        reason_code="strong_savings_candidate",
+        reason_text="legacy codec with strong projected space savings",
+    )
+
+    with (
+        patch("mediashrink.cli.check_ffmpeg_available", return_value=(True, "")),
+        patch("mediashrink.cli.find_ffmpeg", return_value=FFMPEG),
+        patch("mediashrink.cli.find_ffprobe", return_value=FFPROBE),
+        patch("mediashrink.cli._analyze_with_optional_progress", return_value=[item]),
+        patch("mediashrink.cli.estimate_analysis_encode_seconds", return_value=600.0),
+    ):
+        result = runner.invoke(
+            app, ["analyze", str(tmp_path), "--manifest-out", str(manifest_path)]
+        )
+
+    assert result.exit_code == 0
+    assert "Filename hygiene warning" in result.stdout
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert any(
+        "Mergers &amp; Acquisitions.mkv -> Mergers & Acquisitions.mkv" in note
+        for note in payload["notes"]
+    )
+
+
 def test_analyze_writes_split_manifest_index(tmp_path: Path) -> None:
     first = tmp_path / "Show A - s01e01 - Pilot.mkv"
     second = tmp_path / "Show B - s01e01 - Start.mkv"
@@ -1148,6 +1185,64 @@ def test_progress_bar_nonzero_total(tmp_path: Path) -> None:
     assert all(t >= 1 for t in totals), f"Found zero or negative total: {totals}"
 
 
+def test_run_encode_loop_writes_machine_readable_runtime_log(tmp_path: Path) -> None:
+    from mediashrink.cli import _run_encode_loop
+    from unittest.mock import MagicMock
+
+    source = tmp_path / "episode.mkv"
+    source.write_bytes(b"x" * 5_000_000)
+    output = tmp_path / "episode_out.mkv"
+    output.write_bytes(b"y" * 2_000_000)
+    job = EncodeJob(
+        source=source,
+        output=output,
+        tmp_output=tmp_path / ".tmp_episode_out.mkv",
+        crf=20,
+        preset="fast",
+        dry_run=False,
+        skip=False,
+    )
+    ok_result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=5_000_000,
+        output_size_bytes=2_000_000,
+        duration_seconds=20.0,
+        media_duration_seconds=100.0,
+    )
+
+    mock_progress = MagicMock()
+    mock_progress.__enter__ = MagicMock(return_value=mock_progress)
+    mock_progress.__exit__ = MagicMock(return_value=False)
+    mock_progress.add_task.side_effect = [0, 1]
+    mock_display = MagicMock()
+    mock_display.make_progress_bar.return_value = mock_progress
+    runtime_log = tmp_path / "runtime.jsonl"
+
+    with (
+        patch("mediashrink.cli.encode_file", return_value=ok_result),
+        patch("mediashrink.cli._record_success_calibration"),
+        patch("mediashrink.cli._record_batch_bias_calibration"),
+    ):
+        _run_encode_loop(
+            [job],
+            FFMPEG,
+            FFPROBE,
+            mock_display,
+            use_calibration=False,
+            runtime_log_path=runtime_log,
+        )
+
+    lines = [json.loads(line) for line in runtime_log.read_text(encoding="utf-8").splitlines()]
+    events = [entry["event"] for entry in lines]
+    assert "batch_started" in events
+    assert "file_started" in events
+    assert "file_finished" in events
+    assert "batch_finished" in events
+
+
 def test_run_encode_loop_removes_file_task_and_updates_overall_only_on_completion(
     tmp_path: Path,
 ) -> None:
@@ -1851,6 +1946,43 @@ def test_write_batch_reports_cleanup_text_distinguishes_true_mkv_sidecars(tmp_pa
     assert "Cleanup: MKV sidecar output kept alongside the original source" in text
 
 
+def test_write_batch_reports_compacts_repeated_cleanup_text(tmp_path: Path) -> None:
+    from mediashrink.cli import _write_batch_reports
+
+    first_job = _make_job(tmp_path / "episode01.mkv")
+    second_job = _make_job(tmp_path / "episode02.mkv")
+    for job in (first_job, second_job):
+        job.source.write_bytes(b"x" * 1000)
+        job.output.write_bytes(b"y" * 500)
+    first_result = _make_result(first_job, input_size_bytes=1000, output_size_bytes=500)
+    second_result = _make_result(second_job, input_size_bytes=1000, output_size_bytes=500)
+
+    _, text_path = _write_batch_reports(
+        mode="encode",
+        base_dir=tmp_path,
+        output_dir=None,
+        manifest_path=None,
+        preset="fast",
+        crf=20,
+        overwrite=False,
+        cleanup_requested=False,
+        resumed_from_session=False,
+        session_path=None,
+        started_at="2026-01-01T00:00:00+00:00",
+        finished_at="2026-01-01T01:00:00+00:00",
+        results=[first_result, second_result],
+        cleaned_paths=[],
+        log_path=None,
+        warnings=[],
+        policy="highest-confidence",
+        on_file_failure="skip",
+    )
+
+    text = text_path.read_text(encoding="utf-8")
+    assert "Cleanup summary" in text
+    assert text.count("Cleanup: Side-by-side output kept") == 0
+
+
 def test_write_batch_reports_include_launch_mode_cleanup_policy_and_reroute_metadata(
     tmp_path: Path,
 ) -> None:
@@ -2441,6 +2573,48 @@ def test_review_command_json_includes_guidance(tmp_path: Path) -> None:
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["review_guidance"] == ["No manual follow-up is suggested from this report."]
+    assert payload["review_analysis"]["guidance"] == payload["review_guidance"]
+
+
+def test_review_command_share_safe_redacts_paths_and_exports_json(tmp_path: Path) -> None:
+    report = tmp_path / "mediashrink_report_20260406_120000.json"
+    runtime_log = tmp_path / "mediashrink_runtime_encode_20260406_120000.jsonl"
+    report.write_text(
+        json.dumps(
+            {
+                "mode": "encode",
+                "directory": str(tmp_path),
+                "runtime_log_path": str(runtime_log),
+                "files": [
+                    {
+                        "source": str(tmp_path / "episode01.mkv"),
+                        "output": str(tmp_path / "episode01_out.mkv"),
+                    }
+                ],
+                "totals": {
+                    "succeeded": 1,
+                    "failed": 0,
+                    "skipped_incompatible": 0,
+                    "skipped_by_policy": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    export_path = tmp_path / "share-safe.json"
+
+    result = runner.invoke(
+        app,
+        ["review", str(report), "--json", "--share-safe", "--export-json", str(export_path)],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    exported = json.loads(export_path.read_text(encoding="utf-8"))
+    assert payload["directory"].startswith("<redacted>/")
+    assert payload["runtime_log_path"].startswith("<redacted>/")
+    assert payload["files"][0]["source"].startswith("<redacted>/")
+    assert exported["review_analysis"]["guidance"] == exported["review_guidance"]
 
 
 def test_review_command_mentions_followup_manifest_and_estimate_miss(tmp_path: Path) -> None:

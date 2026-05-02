@@ -163,7 +163,9 @@ class EncodingDisplay:
         self._progress_layout_width: int | None = None
 
     def _use_plain_output(self) -> bool:
-        return self.render_mode == "plain"
+        return self.render_mode == "plain" or (
+            not self.console.is_terminal and not getattr(self.console, "record", False)
+        )
 
     def _is_narrow(self) -> bool:
         return self._use_plain_output() or self.console.width < 120
@@ -223,9 +225,13 @@ class EncodingDisplay:
                 action_style = "yellow bold" if action_text == "MKV REROUTE" else "green bold"
                 action = Text(action_text, style=action_style)
 
-            filename = job.source.name
+            filename: str | Text = Text(job.source.name)
             if job.skip and job.skip_reason:
-                filename += f"\n[dim]{job.skip_reason}[/dim]"
+                filename = Text.assemble(
+                    Text(job.source.name),
+                    Text("\n"),
+                    Text(job.skip_reason, style="dim"),
+                )
 
             row: list[str | Text] = [filename, codec_str, size_str]
             if show_estimates:
@@ -642,7 +648,7 @@ class EncodingDisplay:
                 est_pct = est_saved / est_input_total * 100
                 self.console.print(
                     f"[dim]Estimated saving: ~{_fmt_size(est_saved)} ({est_pct:.0f}%)  "
-                    f"→  Actual saving: {_fmt_size(total_saved)} ({overall_pct:.1f}%)[/dim]",
+                    f"-> Actual saving: {_fmt_size(total_saved)} ({overall_pct:.1f}%)[/dim]",
                     highlight=False,
                 )
 

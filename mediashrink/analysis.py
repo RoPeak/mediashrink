@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from mediashrink.calibration import (
     bitrate_bucket,
@@ -1288,6 +1289,9 @@ def display_analysis_summary(
     calibration_store: dict[str, object] | None = None,
     plain_output: bool = False,
 ) -> None:
+    plain_output = plain_output or (
+        not console.is_terminal and not getattr(console, "record", False)
+    )
     recommended = [item for item in items if item.recommendation == "recommended"]
     maybe = [item for item in items if item.recommendation == "maybe"]
     skipped = [item for item in items if item.recommendation == "skip"]
@@ -1338,15 +1342,15 @@ def display_analysis_summary(
                 else f"~{_fmt_size(item.estimated_savings_bytes)}"
             )
             row = [
-                item.source.name,
-                item.codec or "?",
-                _fmt_size(item.size_bytes),
-                savings_text,
-                item.recommendation.upper(),
-                (compatibility_signals or {}).get(item.source, "Now"),
+                Text(item.source.name),
+                Text(item.codec or "?"),
+                Text(_fmt_size(item.size_bytes)),
+                Text(savings_text),
+                Text(item.recommendation.upper()),
+                Text((compatibility_signals or {}).get(item.source, "Now")),
             ]
             if not narrow:
-                row.append(item.reason_text)
+                row.append(Text(item.reason_text))
             table.add_row(*row)
 
     total_current = sum(item.size_bytes for item in recommended)

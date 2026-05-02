@@ -6,9 +6,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
-_STORE_VERSION = 1
+_STORE_VERSION = 2
 _MAX_SUCCESS_RECORDS = 2000
 _MAX_FAILURE_RECORDS = 1000
+_MAX_BATCH_BIAS_RECORDS = 500
 
 
 @dataclass
@@ -27,6 +28,7 @@ class CalibrationRecord:
     effective_speed: float
     fallback_used: bool
     retry_used: bool
+    codec_family: str = "unknown"
     predicted_output_ratio: float | None = None
     predicted_speed: float | None = None
     accepted_output: bool = True
@@ -42,6 +44,18 @@ class FailureRecord:
 
 
 @dataclass
+class BatchBiasRecord:
+    codec_family: str
+    container: str
+    resolution_bucket: str
+    bitrate_bucket: str
+    preset: str
+    preset_family: str
+    average_size_error: float
+    sample_count: int
+
+
+@dataclass
 class CalibrationEstimate:
     output_ratio: float | None
     speed: float | None
@@ -53,6 +67,7 @@ class CalibrationEstimate:
     source: str
     average_size_error: float | None = None
     average_speed_error: float | None = None
+    batch_bias_adjustment: float | None = None
 
 
 def get_calibration_path() -> Path:
@@ -68,7 +83,7 @@ def get_calibration_path() -> Path:
 
 
 def _empty_store() -> dict[str, object]:
-    return {"version": _STORE_VERSION, "records": [], "failures": []}
+    return {"version": _STORE_VERSION, "records": [], "failures": [], "batch_biases": []}
 
 
 def load_calibration_store(path: Path | None = None) -> dict[str, object]:
@@ -83,14 +98,18 @@ def load_calibration_store(path: Path | None = None) -> dict[str, object]:
         return _empty_store()
     records = raw.get("records", [])
     failures = raw.get("failures", [])
+    batch_biases = raw.get("batch_biases", [])
     if not isinstance(records, list):
         records = []
     if not isinstance(failures, list):
         failures = []
+    if not isinstance(batch_biases, list):
+        batch_biases = []
     return {
         "version": int(raw.get("version", _STORE_VERSION)),
         "records": [item for item in records if isinstance(item, dict)],
         "failures": [item for item in failures if isinstance(item, dict)],
+        "batch_biases": [item for item in batch_biases if isinstance(item, dict)],
     }
 
 
@@ -104,10 +123,13 @@ def save_calibration_store(store: dict[str, object], path: Path | None = None) -
 def _trim_store(store: dict[str, object]) -> None:
     records = store.get("records", [])
     failures = store.get("failures", [])
+    batch_biases = store.get("batch_biases", [])
     if isinstance(records, list) and len(records) > _MAX_SUCCESS_RECORDS:
         store["records"] = records[-_MAX_SUCCESS_RECORDS:]
     if isinstance(failures, list) and len(failures) > _MAX_FAILURE_RECORDS:
         store["failures"] = failures[-_MAX_FAILURE_RECORDS:]
+    if isinstance(batch_biases, list) and len(batch_biases) > _MAX_BATCH_BIAS_RECORDS:
+        store["batch_biases"] = batch_biases[-_MAX_BATCH_BIAS_RECORDS:]
 
 
 def append_success_record(
@@ -141,6 +163,25 @@ def append_failure_record(
         failures = []
         active_store["failures"] = failures
     failures.append(asdict(record))
+    _trim_store(active_store)
+    try:
+        return save_calibration_store(active_store, path)
+    except OSError:
+        return path or get_calibration_path()
+
+
+def append_batch_bias_record(
+    record: BatchBiasRecord,
+    *,
+    store: dict[str, object] | None = None,
+    path: Path | None = None,
+) -> Path:
+    active_store = store if store is not None else load_calibration_store(path)
+    batch_biases = active_store.setdefault("batch_biases", [])
+    if not isinstance(batch_biases, list):
+        batch_biases = []
+        active_store["batch_biases"] = batch_biases
+    batch_biases.append(asdict(record))
     _trim_store(active_store)
     try:
         return save_calibration_store(active_store, path)
@@ -183,28 +224,55 @@ def preset_family(preset: str) -> str:
     return preset
 
 
+def codec_family(codec: str | None) -> str:
+    normalized = (codec or "unknown").lower()
+    if normalized in {"h264", "avc", "mpeg4"}:
+        return "avc-family"
+    if normalized in {"hevc", "h265"}:
+        return "hevc-family"
+    if normalized in {"mpeg2video", "mpeg1video", "vc1"}:
+        return "legacy-broadcast"
+    if normalized in {"vp8", "vp9", "av1"}:
+        return "modern-web"
+    return normalized or "unknown"
+
+
 def _matches(
     raw: dict[str, object],
     *,
     codec: str | None,
+    codec_family_name: str,
     resolution: str,
     bitrate: str,
     preset: str,
     container: str,
 ) -> tuple[bool, bool]:
     raw_codec = raw.get("codec")
+    raw_codec_family = raw.get("codec_family")
     raw_resolution = raw.get("resolution_bucket")
     raw_bitrate = raw.get("bitrate_bucket")
     raw_preset = raw.get("preset")
     raw_family = raw.get("preset_family")
     raw_container = raw.get("container")
     codec_match = codec in {None, "unknown"} or raw_codec == codec
+    family_match = (
+        codec_family_name == "unknown"
+        or raw_codec_family in {None, "", "unknown"}
+        or raw_codec_family == codec_family_name
+    )
     resolution_match = resolution == "unknown" or raw_resolution == resolution
     bitrate_match = bitrate == "unknown" or raw_bitrate == bitrate
     container_match = container == "unknown" or raw_container == container
     preset_match = raw_preset == preset or raw_family == preset_family(preset)
-    exact = codec_match and resolution_match and bitrate_match and container_match and preset_match
-    loose = codec_match and resolution_match and preset_match
+    exact = (
+        codec_match
+        and family_match
+        and resolution_match
+        and bitrate_match
+        and container_match
+        and preset_match
+    )
+    loose = family_match and resolution_match and preset_match
     return exact, loose
 
 
@@ -223,6 +291,7 @@ def lookup_estimate(
     if not isinstance(raw_records, list) or not raw_records:
         return None
 
+    family_name = codec_family(codec)
     exact_matches: list[dict[str, object]] = []
     loose_matches: list[dict[str, object]] = []
     for raw in raw_records:
@@ -231,6 +300,7 @@ def lookup_estimate(
         exact, loose = _matches(
             raw,
             codec=codec,
+            codec_family_name=family_name,
             resolution=resolution,
             bitrate=bitrate,
             preset=preset,
@@ -241,7 +311,16 @@ def lookup_estimate(
         elif loose:
             loose_matches.append(raw)
 
-    if not exact_matches and not loose_matches:
+    batch_bias_adjustment = _lookup_batch_bias_adjustment(
+        store,
+        codec_family_name=family_name,
+        resolution=resolution,
+        bitrate=bitrate,
+        preset=preset,
+        container=container,
+    )
+
+    if not exact_matches and not loose_matches and batch_bias_adjustment is None:
         return None
 
     weighted_output_total = 0.0
@@ -310,7 +389,45 @@ def lookup_estimate(
             exact_matches + loose_matches, "predicted_output_ratio", "input_bytes", "output_bytes"
         ),
         average_speed_error=_average_speed_error(exact_matches + loose_matches),
+        batch_bias_adjustment=batch_bias_adjustment,
     )
+
+
+def _lookup_batch_bias_adjustment(
+    store: dict[str, object] | None,
+    *,
+    codec_family_name: str,
+    resolution: str,
+    bitrate: str,
+    preset: str,
+    container: str,
+) -> float | None:
+    if not store:
+        return None
+    raw_biases = store.get("batch_biases", [])
+    if not isinstance(raw_biases, list) or not raw_biases:
+        return None
+    matches: list[float] = []
+    preset_family_name = preset_family(preset)
+    for raw in raw_biases:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("codec_family") != codec_family_name:
+            continue
+        if resolution != "unknown" and raw.get("resolution_bucket") != resolution:
+            continue
+        if bitrate != "unknown" and raw.get("bitrate_bucket") != bitrate:
+            continue
+        if container != "unknown" and raw.get("container") != container:
+            continue
+        if raw.get("preset") != preset and raw.get("preset_family") != preset_family_name:
+            continue
+        adjustment = raw.get("average_size_error")
+        if isinstance(adjustment, (int, float)):
+            matches.append(float(adjustment))
+    if not matches:
+        return None
+    return sum(matches) / len(matches)
 
 
 def estimate_failure_rate(
@@ -376,13 +493,39 @@ def describe_calibration_estimate(estimate: CalibrationEstimate | None) -> str |
     return note
 
 
-def recent_bias_summary(store: dict[str, object] | None) -> dict[str, object] | None:
+def recent_bias_summary(
+    store: dict[str, object] | None,
+    *,
+    codec: str | None = None,
+    resolution: str | None = None,
+    bitrate: str | None = None,
+    preset: str | None = None,
+    container: str | None = None,
+) -> dict[str, object] | None:
     if not store:
         return None
     records = store.get("records", [])
     if not isinstance(records, list):
         return None
-    return _recent_bias_summary([raw for raw in records if isinstance(raw, dict)])
+    filtered = [raw for raw in records if isinstance(raw, dict)]
+    if any(value is not None for value in (codec, resolution, bitrate, preset, container)):
+        family_name = codec_family(codec)
+        filtered = [
+            raw
+            for raw in filtered
+            if (
+                codec is None or raw.get("codec") == codec or raw.get("codec_family") == family_name
+            )
+            and (resolution is None or raw.get("resolution_bucket") == resolution)
+            and (bitrate is None or raw.get("bitrate_bucket") == bitrate)
+            and (
+                preset is None
+                or raw.get("preset") == preset
+                or raw.get("preset_family") == preset_family(preset)
+            )
+            and (container is None or raw.get("container") == container)
+        ]
+    return _recent_bias_summary(filtered)
 
 
 def estimate_display_uncertainty(
@@ -770,6 +913,11 @@ def summarize_calibration_store(store: dict[str, object] | None) -> dict[str, ob
             )
         ],
         "failures": len([raw for raw in failures if isinstance(raw, dict)]),
+        "batch_bias_records": len(
+            [raw for raw in store.get("batch_biases", []) if isinstance(raw, dict)]
+        )
+        if isinstance(store, dict)
+        else 0,
         "preset_summaries": preset_summaries,
         "family_container_summaries": family_container_summaries,
         "family_container_summary_text": format_family_container_summary(

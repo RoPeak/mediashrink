@@ -5,6 +5,7 @@ import threading
 import time
 from datetime import datetime
 from datetime import timezone
+from html import unescape
 from pathlib import Path
 from typing import Optional
 
@@ -37,16 +38,20 @@ from mediashrink.analysis import (
     write_split_manifests,
 )
 from mediashrink.calibration import (
+    BatchBiasRecord,
     CalibrationRecord,
     FailureRecord,
+    append_batch_bias_record,
     append_failure_record,
     append_success_record,
     bitrate_bucket,
+    codec_family,
     estimate_failure_rate,
     format_family_container_summary,
     get_calibration_path,
     load_calibration_store,
     lookup_estimate,
+    recent_bias_summary,
     resolution_bucket,
     summarize_calibration_store,
 )
@@ -110,7 +115,7 @@ EXIT_NO_FILES = 1
 EXIT_ENCODE_FAILURES = 2
 EXIT_USER_CANCELLED = 3
 EXIT_FFMPEG_NOT_FOUND = 4
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 STALL_WARNING_SECONDS = 90.0
 STALL_POLL_SECONDS = 5.0
 _FALLBACK_PRESET = "faster"
@@ -344,6 +349,132 @@ def _runtime_outliers(results: list[EncodeResult], *, limit: int = 5) -> list[di
     return outliers[:limit]
 
 
+def _estimate_miss_outliers(
+    results: list[EncodeResult], *, limit: int = 5
+) -> list[dict[str, object]]:
+    outliers: list[dict[str, object]] = []
+    for result in results:
+        if (
+            result.skipped
+            or not result.success
+            or result.job.estimated_output_bytes <= 0
+            or result.output_size_bytes <= 0
+        ):
+            continue
+        miss_ratio = (result.output_size_bytes - result.job.estimated_output_bytes) / max(
+            result.job.estimated_output_bytes, 1
+        )
+        outliers.append(
+            {
+                "name": result.job.source.name,
+                "estimate_miss_ratio": miss_ratio,
+                "estimated_output_bytes": result.job.estimated_output_bytes,
+                "actual_output_bytes": result.output_size_bytes,
+                "duration_seconds": result.duration_seconds,
+            }
+        )
+    outliers.sort(
+        key=lambda entry: (
+            -abs(float(entry["estimate_miss_ratio"])),
+            -float(entry["duration_seconds"]),
+            str(entry["name"]).lower(),
+        )
+    )
+    return outliers[:limit]
+
+
+def _distribution_summary(values: list[float]) -> dict[str, float] | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+    return {
+        "min": ordered[0],
+        "median": median,
+        "max": ordered[-1],
+    }
+
+
+def _result_stats_summary(results: list[EncodeResult]) -> dict[str, object]:
+    successful = [result for result in results if result.success and not result.skipped]
+    output_ratios = [
+        result.output_size_bytes / result.input_size_bytes
+        for result in successful
+        if result.input_size_bytes > 0
+    ]
+    reduction_pcts = [result.size_reduction_pct for result in successful]
+    speeds = [
+        result.media_duration_seconds / result.duration_seconds
+        for result in successful
+        if result.duration_seconds > 0 and result.media_duration_seconds > 0
+    ]
+    estimate_misses = [
+        (result.output_size_bytes - result.job.estimated_output_bytes)
+        / max(result.job.estimated_output_bytes, 1)
+        for result in successful
+        if result.job.estimated_output_bytes > 0
+    ]
+    return {
+        "output_ratio": _distribution_summary(output_ratios),
+        "reduction_pct": _distribution_summary(reduction_pcts),
+        "speed": _distribution_summary(speeds),
+        "estimate_miss_ratio": _distribution_summary(estimate_misses),
+    }
+
+
+def _estimate_trust_recommendation(results: list[EncodeResult]) -> dict[str, str] | None:
+    successful = [result for result in results if result.success and not result.skipped]
+    estimate_misses = [
+        abs(
+            (result.output_size_bytes - result.job.estimated_output_bytes)
+            / max(result.job.estimated_output_bytes, 1)
+        )
+        for result in successful
+        if result.job.estimated_output_bytes > 0
+    ]
+    if not estimate_misses:
+        return None
+    average_miss = sum(estimate_misses) / len(estimate_misses)
+    if average_miss <= 0.10:
+        return {"level": "high", "summary": "This preset looks trustworthy for similar reruns."}
+    if average_miss <= 0.22:
+        return {
+            "level": "medium",
+            "summary": "Time estimates look usable, but size estimates still need a modest safety margin.",
+        }
+    return {
+        "level": "low",
+        "summary": "Reuse this preset cautiously: size estimates for similar files need a larger safety margin.",
+    }
+
+
+def _auto_queue_strategy_for_jobs(jobs: list[EncodeJob]) -> tuple[str, str]:
+    active = [job for job in jobs if not job.skip]
+    if len(active) < 2:
+        return "original", "Original order is fine for this run size."
+    if any(job.output.suffix.lower() in {".mp4", ".m4v"} for job in active):
+        return (
+            "safe-first",
+            "Safe-first front-loads lower-risk files before container-sensitive work.",
+        )
+    sizes = sorted(
+        (
+            job.estimated_output_bytes
+            if job.estimated_output_bytes > 0
+            else job.source.stat().st_size
+            for job in active
+        ),
+        reverse=True,
+    )
+    if sizes and sizes[0] >= max(sum(sizes) * 0.22, sizes[min(2, len(sizes) - 1)] * 1.5):
+        return (
+            "largest-first",
+            "Largest-first should reclaim space earlier because a few files dominate the batch.",
+        )
+    return "safe-first", "Safe-first is the safest default ordering for mixed library batches."
+
+
 def _resolve_runtime_settings(
     *,
     overnight: bool,
@@ -430,6 +561,11 @@ def _estimate_required_free_space(jobs: list[EncodeJob], overwrite: bool) -> int
         return 0
     estimated_outputs = 0
     largest_buffer = 0
+    active_store = load_calibration_store()
+    bias_summary = recent_bias_summary(active_store)
+    optimistic_bias = (
+        isinstance(bias_summary, dict) and bias_summary.get("size_bias") == "larger_than_estimated"
+    )
     for job in to_encode:
         source_size = job.source.stat().st_size
         estimated_output = (
@@ -437,6 +573,8 @@ def _estimate_required_free_space(jobs: list[EncodeJob], overwrite: bool) -> int
             if job.estimated_output_bytes > 0
             else int(source_size * _DISK_ESTIMATE_FALLBACK_RATIO)
         )
+        if optimistic_bias:
+            estimated_output = int(estimated_output * 1.15)
         estimated_outputs += estimated_output
         largest_buffer = max(largest_buffer, max(source_size, estimated_output))
     if overwrite:
@@ -510,7 +648,10 @@ def _maybe_reconcile_recoverable_sidecars(
     ffprobe: Path,
     assume_yes: bool,
 ) -> list[Path]:
-    pairs = find_recoverable_sidecars(files, ffprobe)
+    try:
+        pairs = find_recoverable_sidecars(files, ffprobe)
+    except OSError:
+        return []
     if not pairs:
         return []
     console.print(
@@ -670,13 +811,19 @@ def _apply_batch_preflight_policy(
     skipped: list[str] = []
     stop_errors: list[str] = []
     for job in candidates:
-        result = preflight_encode_job(
-            job.source,
-            ffmpeg,
-            ffprobe,
-            crf=job.crf,
-            preset=job.preset,
-        )
+        try:
+            result = preflight_encode_job(
+                job.source,
+                ffmpeg,
+                ffprobe,
+                crf=job.crf,
+                preset=job.preset,
+            )
+        except (OSError, ValueError):
+            warnings.append(
+                f"{job.source.name}: compatibility preflight unavailable; proceeding without probe"
+            )
+            continue
         if result.success:
             continue
         reason = _classify_incompatible_reason(result.error_message, job, ffprobe=ffprobe)
@@ -779,13 +926,16 @@ def _find_mkv_reroute_candidates(
     candidates: list[EncodeJob] = []
     details: list[str] = []
     for job in _preflight_candidates(jobs):
-        result = preflight_encode_job(
-            job.source,
-            ffmpeg,
-            ffprobe,
-            crf=job.crf,
-            preset=job.preset,
-        )
+        try:
+            result = preflight_encode_job(
+                job.source,
+                ffmpeg,
+                ffprobe,
+                crf=job.crf,
+                preset=job.preset,
+            )
+        except (OSError, ValueError):
+            continue
         if result.success:
             continue
         reason = _classify_incompatible_reason(result.error_message, job, ffprobe=ffprobe)
@@ -947,7 +1097,29 @@ def _write_followup_manifest_for_jobs(
     sources = [job.source for job in jobs if job.source.exists()]
     if not sources:
         return None
-    items = analyze_files(sources, ffprobe, preset=preset, crf=crf)
+    try:
+        items = analyze_files(sources, ffprobe, preset=preset, crf=crf)
+    except (OSError, ValueError):
+        detail_by_name = {
+            detail.partition(": ")[0]: detail.partition(": ")[2] or "follow-up required"
+            for detail in details
+        }
+        items = [
+            AnalysisItem(
+                source=job.source,
+                codec=job.source_codec,
+                size_bytes=job.source.stat().st_size if job.source.exists() else 0,
+                duration_seconds=0.0,
+                bitrate_kbps=0.0,
+                estimated_output_bytes=job.estimated_output_bytes,
+                estimated_savings_bytes=0,
+                recommendation="recommended",
+                reason_code="followup_required",
+                reason_text=detail_by_name.get(job.source.name, "follow-up required"),
+            )
+            for job in jobs
+            if job.source.exists()
+        ]
     manifest = build_manifest(
         directory=directory,
         recursive=recursive,
@@ -1054,6 +1226,92 @@ def _load_report_payload(path: Path) -> dict[str, object]:
     return raw
 
 
+def _redact_path_value(value: str) -> str:
+    path = Path(value)
+    name = path.name or value
+    return f"<redacted>/{name}"
+
+
+def _filename_hygiene_candidates(items: list[AnalysisItem]) -> list[tuple[Path, str]]:
+    candidates: list[tuple[Path, str]] = []
+    for item in items:
+        normalized_name = unescape(item.source.name)
+        if normalized_name != item.source.name and normalized_name.strip():
+            candidates.append((item.source, normalized_name))
+    return candidates
+
+
+def _filename_hygiene_notes(items: list[AnalysisItem]) -> list[str]:
+    notes: list[str] = []
+    for source, normalized_name in _filename_hygiene_candidates(items):
+        notes.append(f"Filename hygiene: {source.name} -> {normalized_name}")
+    return notes
+
+
+def _share_safe_payload(payload: dict[str, object]) -> dict[str, object]:
+    redacted = json.loads(json.dumps(payload))
+    if isinstance(redacted.get("directory"), str):
+        redacted["directory"] = _redact_path_value(str(redacted["directory"]))
+    for key in (
+        "manifest_path",
+        "output_dir",
+        "session_path",
+        "split_followup_manifest",
+        "runtime_log_path",
+    ):
+        if isinstance(redacted.get(key), str):
+            redacted[key] = _redact_path_value(str(redacted[key]))
+    cleaned_paths = redacted.get("cleaned_paths")
+    if isinstance(cleaned_paths, list):
+        redacted["cleaned_paths"] = [_redact_path_value(str(path)) for path in cleaned_paths]
+    container_fallback_actions = redacted.get("container_fallback_actions")
+    if isinstance(container_fallback_actions, dict) and isinstance(
+        container_fallback_actions.get("followup_manifest"), str
+    ):
+        container_fallback_actions["followup_manifest"] = _redact_path_value(
+            str(container_fallback_actions["followup_manifest"])
+        )
+    filename_hygiene = redacted.get("filename_hygiene")
+    if isinstance(filename_hygiene, list):
+        for entry in filename_hygiene:
+            if not isinstance(entry, dict):
+                continue
+            if isinstance(entry.get("source"), str):
+                entry["source"] = _redact_path_value(str(entry["source"]))
+    files = redacted.get("files")
+    if isinstance(files, list):
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            if isinstance(entry.get("source"), str):
+                entry["source"] = _redact_path_value(str(entry["source"]))
+            if isinstance(entry.get("output"), str):
+                entry["output"] = _redact_path_value(str(entry["output"]))
+    return redacted
+
+
+def _review_analysis(payload: dict[str, object], guidance: list[str]) -> dict[str, object]:
+    estimate_outliers = payload.get("estimate_miss_outliers")
+    runtime_outliers = payload.get("runtime_outliers")
+    filename_hygiene = payload.get("filename_hygiene")
+    return {
+        "guidance": guidance,
+        "estimate_trust": payload.get("estimate_trust"),
+        "queue_decision": payload.get("queue_decision"),
+        "filename_hygiene_count": (
+            len(filename_hygiene) if isinstance(filename_hygiene, list) else 0
+        ),
+        "top_runtime_outlier": (
+            runtime_outliers[0] if isinstance(runtime_outliers, list) and runtime_outliers else None
+        ),
+        "top_estimate_outlier": (
+            estimate_outliers[0]
+            if isinstance(estimate_outliers, list) and estimate_outliers
+            else None
+        ),
+    }
+
+
 def _review_guidance(payload: dict[str, object]) -> list[str]:
     totals = payload.get("totals")
     if not isinstance(totals, dict):
@@ -1120,9 +1378,74 @@ def _review_guidance(payload: dict[str, object]) -> list[str]:
         slowest = runtime_outliers[0]
         if isinstance(slowest, dict) and slowest.get("name"):
             guidance.append(f"Slowest file in this run: {slowest['name']}.")
+    estimate_outliers = payload.get("estimate_miss_outliers")
+    if isinstance(estimate_outliers, list) and estimate_outliers:
+        worst = estimate_outliers[0]
+        if isinstance(worst, dict) and worst.get("name"):
+            guidance.append(
+                f"Largest estimate miss in this run: {worst['name']} ({float(worst.get('estimate_miss_ratio', 0.0)) * 100:+.0f}%)."
+            )
+    trust = payload.get("estimate_trust")
+    if isinstance(trust, dict) and isinstance(trust.get("summary"), str):
+        guidance.append(str(trust["summary"]))
+    filename_hygiene = payload.get("filename_hygiene")
+    if isinstance(filename_hygiene, list) and filename_hygiene:
+        guidance.append(
+            f"{len(filename_hygiene)} filename hygiene issue(s) were detected; review suspicious escaped names before the next batch."
+        )
+    queue_decision = payload.get("queue_decision")
+    if isinstance(queue_decision, dict) and isinstance(queue_decision.get("strategy"), str):
+        guidance.append(
+            f"Queue strategy used: {queue_decision['strategy']} - {queue_decision.get('rationale', 'see report for details')}"
+        )
     if not guidance:
         guidance.append("No manual follow-up is suggested from this report.")
     return guidance
+
+
+def _queue_strategy_rationale(strategy: str, jobs: list[EncodeJob]) -> str:
+    auto_strategy, auto_rationale = _auto_queue_strategy_for_jobs(jobs)
+    if strategy == auto_strategy:
+        return auto_rationale
+    if strategy == "largest-first":
+        return "Largest-first was chosen manually to reclaim space earlier in the run."
+    if strategy == "safe-first":
+        return "Safe-first was chosen manually to front-load lower-risk files."
+    return "Original source order was preserved for this run."
+
+
+def _queue_decision_for_jobs(
+    jobs: list[EncodeJob],
+    requested_strategy: str,
+    *,
+    auto_pick: bool = False,
+) -> tuple[str, dict[str, str]]:
+    if auto_pick:
+        chosen_strategy, rationale = _auto_queue_strategy_for_jobs(jobs)
+        return chosen_strategy, {"strategy": chosen_strategy, "rationale": rationale}
+    return requested_strategy, {
+        "strategy": requested_strategy,
+        "rationale": _queue_strategy_rationale(requested_strategy, jobs),
+    }
+
+
+def _write_runtime_log_event(
+    runtime_log_path: Path | None,
+    event_type: str,
+    **payload: object,
+) -> None:
+    if runtime_log_path is None:
+        return
+    event = {"timestamp": _now_iso(), "event": event_type, **payload}
+    runtime_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with runtime_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _runtime_log_path_for_run(base_dir: Path, output_dir: Path | None, mode: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = output_dir or base_dir
+    return target_dir / f"mediashrink_runtime_{mode}_{timestamp}.jsonl"
 
 
 def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
@@ -1136,19 +1459,21 @@ def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
         result.output_failed_safety_check or result.output_failed_acceptance_check
     ):
         return
-    width, height = get_video_resolution(result.job.source, ffprobe)
-    bitrate_kbps = get_video_bitrate_kbps(result.job.source, ffprobe)
-    duration_seconds = (
-        result.media_duration_seconds
-        if result.media_duration_seconds > 0
-        else get_duration_seconds(result.job.source, ffprobe)
-    )
+    try:
+        width, height = get_video_resolution(result.job.source, ffprobe)
+        bitrate_kbps = get_video_bitrate_kbps(result.job.source, ffprobe)
+        duration_seconds = (
+            result.media_duration_seconds
+            if result.media_duration_seconds > 0
+            else get_duration_seconds(result.job.source, ffprobe)
+        )
+    except (OSError, ValueError):
+        return
     codec = result.job.source_codec or "unknown"
     effective_speed = (
         duration_seconds / result.duration_seconds if result.duration_seconds > 0 else 0.0
     )
     active_store = load_calibration_store()
-    width, height = get_video_resolution(result.job.source, ffprobe)
     lookup = lookup_estimate(
         active_store,
         codec=codec,
@@ -1165,6 +1490,7 @@ def _record_success_calibration(result: EncodeResult, ffprobe: Path) -> None:
     append_success_record(
         CalibrationRecord(
             codec=codec,
+            codec_family=codec_family(codec),
             container=result.job.output.suffix.lower() or ".mkv",
             resolution_bucket=resolution_bucket(width, height),
             bitrate_bucket=bitrate_bucket(bitrate_kbps),
@@ -1197,6 +1523,50 @@ def _record_failure_calibration(result: EncodeResult) -> None:
             reason=result.error_message or "unknown",
         )
     )
+
+
+def _record_batch_bias_calibration(results: list[EncodeResult], ffprobe: Path) -> None:
+    successful = [
+        result
+        for result in results
+        if result.success and not result.skipped and result.job.estimated_output_bytes > 0
+    ]
+    if not successful:
+        return
+    grouped: dict[tuple[str, str, str, str, str, str], list[float]] = {}
+    for result in successful:
+        try:
+            width, height = get_video_resolution(result.job.source, ffprobe)
+            bitrate_kbps = get_video_bitrate_kbps(result.job.source, ffprobe)
+        except (OSError, ValueError):
+            continue
+        key = (
+            codec_family(result.job.source_codec or "unknown"),
+            result.job.output.suffix.lower() or ".mkv",
+            resolution_bucket(width, height),
+            bitrate_bucket(bitrate_kbps),
+            result.job.preset,
+            "hardware" if is_hardware_preset(result.job.preset) else "software",
+        )
+        miss = (result.output_size_bytes - result.job.estimated_output_bytes) / max(
+            result.job.estimated_output_bytes, 1
+        )
+        grouped.setdefault(key, []).append(miss)
+    for key, misses in grouped.items():
+        if len(misses) < 2:
+            continue
+        append_batch_bias_record(
+            BatchBiasRecord(
+                codec_family=key[0],
+                container=key[1],
+                resolution_bucket=key[2],
+                bitrate_bucket=key[3],
+                preset=key[4],
+                preset_family=key[5],
+                average_size_error=sum(misses) / len(misses),
+                sample_count=len(misses),
+            )
+        )
 
 
 def _is_true_mkv_sidecar_result(result: EncodeResult) -> bool:
@@ -1434,6 +1804,9 @@ def _write_batch_reports(
     launch_mode: str | None = None,
     cleanup_policy: str | None = None,
     batch_jobs: list[EncodeJob] | None = None,
+    runtime_log_path: Path | None = None,
+    queue_decision: dict[str, object] | None = None,
+    filename_hygiene: list[dict[str, str]] | None = None,
 ) -> tuple[Path, Path]:
     report_dir = _report_output_dir(base_dir, output_dir, log_path)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1443,6 +1816,9 @@ def _write_batch_reports(
     totals = _results_totals(results)
     cohort_summary = _batch_cohort_summary(batch_jobs)
     grouped_incompatibilities = _group_incompatible_results(results)
+    estimate_miss_outliers = _estimate_miss_outliers(results)
+    result_stats = _result_stats_summary(results)
+    estimate_trust = _estimate_trust_recommendation(results)
     mkv_replaced_paths = mkv_replaced_paths or {}
     files = []
     for result in results:
@@ -1499,8 +1875,10 @@ def _write_batch_reports(
         "on_file_failure": on_file_failure,
         "retry_mode": retry_mode,
         "queue_strategy": queue_strategy,
+        "queue_decision": queue_decision,
         "size_confidence": size_confidence,
         "time_confidence": time_confidence,
+        "runtime_log_path": str(runtime_log_path) if runtime_log_path is not None else None,
         "split_followup_manifest": (
             str(split_followup_manifest) if split_followup_manifest is not None else None
         ),
@@ -1511,6 +1889,10 @@ def _write_batch_reports(
         "require_net_savings_pct": require_net_savings_pct,
         "grouped_incompatibilities": grouped_incompatibilities,
         "batch_cohorts": cohort_summary,
+        "summary_stats": result_stats,
+        "estimate_trust": estimate_trust,
+        "estimate_miss_outliers": estimate_miss_outliers,
+        "filename_hygiene": filename_hygiene or [],
         "cohort_summaries": {
             "show": _summarize_result_cohorts(results, group_by="show"),
             "season": _summarize_result_cohorts(results, group_by="season"),
@@ -1537,6 +1919,7 @@ def _write_batch_reports(
         f"MKV replacements completed: {len(mkv_replaced_paths)}",
         f"Launch mode: {launch_mode}" if launch_mode is not None else "Launch mode: -",
         f"Cleanup completed: {len(cleaned_paths)}",
+        f"Runtime log: {runtime_log_path}" if runtime_log_path is not None else "Runtime log: -",
         f"Resumed from session: {'yes' if resumed_from_session else 'no'}",
         f"Session path: {session_path}" if session_path is not None else "Session path: -",
         f"Policy: {policy}" if policy is not None else "Policy: -",
@@ -1545,6 +1928,11 @@ def _write_batch_reports(
         else "On file failure: -",
         f"Retry mode: {retry_mode}" if retry_mode is not None else "Retry mode: -",
         f"Queue strategy: {queue_strategy}" if queue_strategy is not None else "Queue strategy: -",
+        (
+            f"Queue rationale: {queue_decision.get('rationale')}"
+            if isinstance(queue_decision, dict) and queue_decision.get("rationale")
+            else "Queue rationale: -"
+        ),
         f"Size confidence: {size_confidence}"
         if size_confidence is not None
         else "Size confidence: -",
@@ -1653,6 +2041,17 @@ def _write_batch_reports(
             )
         if isinstance(bias_note, str) and bias_note:
             lines.append(f"  - Bias note: {bias_note}")
+    if estimate_trust:
+        lines.extend(["", "Estimate trust"])
+        lines.append(
+            f"  - {estimate_trust.get('level', 'unknown')}: {estimate_trust.get('summary', '')}"
+        )
+    if filename_hygiene:
+        lines.extend(["", "Filename hygiene"])
+        for entry in filename_hygiene[:5]:
+            lines.append(
+                f"  - {Path(entry.get('source', '')).name}: suggested {entry.get('suggested_name')} (renamed={entry.get('renamed')})"
+            )
     if container_fallback_actions:
         lines.extend(["", "Container fallback actions"])
         mkv_sidecars = int(container_fallback_actions.get("mkv_sidecar_outputs", 0) or 0)
@@ -1717,6 +2116,26 @@ def _write_batch_reports(
                 f"  - {entry.get('name')}: {_fmt_duration(float(entry.get('duration_seconds', 0.0) or 0.0))}"
                 + miss_text
             )
+    if estimate_miss_outliers:
+        lines.extend(["", "Worst estimate misses"])
+        for entry in estimate_miss_outliers[:5]:
+            lines.append(
+                f"  - {entry.get('name')}: {float(entry.get('estimate_miss_ratio', 0.0)) * 100:+.0f}%"
+            )
+    if isinstance(result_stats, dict):
+        reduction = result_stats.get("reduction_pct")
+        output_ratio = result_stats.get("output_ratio")
+        lines.extend(["", "Summary stats"])
+        if isinstance(reduction, dict):
+            lines.append(
+                "  - Reduction pct: "
+                f"min {float(reduction.get('min', 0.0)):.1f}, median {float(reduction.get('median', 0.0)):.1f}, max {float(reduction.get('max', 0.0)):.1f}"
+            )
+        if isinstance(output_ratio, dict):
+            lines.append(
+                "  - Output ratio: "
+                f"min {float(output_ratio.get('min', 0.0)):.2f}, median {float(output_ratio.get('median', 0.0)):.2f}, max {float(output_ratio.get('max', 0.0)):.2f}"
+            )
     if split_manifest_index:
         entries = split_manifest_index.get("generated_manifests")
         lines.extend(["", "Split manifest index"])
@@ -1730,6 +2149,20 @@ def _write_batch_reports(
         else:
             lines.append("  - none")
     lines.extend(["", "Files"])
+    repeated_cleanup = {
+        cleanup_text
+        for cleanup_text in (
+            _cleanup_result_text(
+                result,
+                cleaned=result.job.source in cleaned_paths,
+                replaced_with_mkv=result.job.source in mkv_replaced_paths,
+            )
+            for result in results
+        )
+        if cleanup_text
+    }
+    if len(results) > 1 and len(repeated_cleanup) == 1:
+        lines.extend(["", "Cleanup summary", f"  - {next(iter(repeated_cleanup))}"])
     for result in results:
         status = _classify_result_status(result).upper()
         lines.append(f"- {result.job.source.name}: {status}")
@@ -1753,7 +2186,7 @@ def _write_batch_reports(
             cleaned=result.job.source in cleaned_paths,
             replaced_with_mkv=result.job.source in mkv_replaced_paths,
         )
-        if cleanup_result:
+        if cleanup_result and (len(results) == 1 or len(repeated_cleanup) > 1):
             lines.append(f"  Cleanup: {cleanup_result}")
         if result.attempts:
             for index, attempt in enumerate(result.attempts, start=1):
@@ -2047,6 +2480,7 @@ def _run_encode_loop(
     use_calibration: bool = True,
     retry_mode: str = "balanced",
     require_net_savings_pct: float | None = None,
+    runtime_log_path: Path | None = None,
 ) -> list[EncodeResult]:
     if stall_warning_seconds is None:
         stall_warning_seconds = STALL_WARNING_SECONDS
@@ -2060,6 +2494,15 @@ def _run_encode_loop(
     skipped_files = 0
     processed_files = 0
     total_files = len(to_encode)
+    _write_runtime_log_event(
+        runtime_log_path,
+        "batch_started",
+        total_files=total_files,
+        total_bytes=total_bytes,
+        on_file_failure=on_file_failure,
+        retry_mode=retry_mode,
+        require_net_savings_pct=require_net_savings_pct,
+    )
 
     with display.make_progress_bar() as progress:
         overall_task = progress.add_task(
@@ -2125,6 +2568,7 @@ def _run_encode_loop(
                 eta_confident=bytes_done > 0,
             )
             started_at = _now_iso()
+            milestone_state: set[int] = set()
             stall_state = {
                 "last_update": time.monotonic(),
                 "last_signal": time.monotonic(),
@@ -2147,6 +2591,24 @@ def _run_encode_loop(
                     last_progress_at=started_at if not job.skip else None,
                 )
                 save_session(session, session_path)
+            if not job.skip:
+                _write_runtime_log_event(
+                    runtime_log_path,
+                    "file_started",
+                    source=str(job.source),
+                    output=str(job.output),
+                    preset=job.preset,
+                    crf=job.crf,
+                    batch_cohort=job.batch_cohort,
+                    estimated_output_bytes=job.estimated_output_bytes,
+                )
+            else:
+                _write_runtime_log_event(
+                    runtime_log_path,
+                    "file_skipped_pre_start",
+                    source=str(job.source),
+                    reason=job.skip_reason,
+                )
 
             def watch_for_stall() -> None:
                 grace_multiplier = (
@@ -2240,6 +2702,15 @@ def _run_encode_loop(
                         heartbeat_state="active",
                         eta_confident=pct >= 5.0 or bytes_done > 0,
                     )
+                    for threshold in (25, 50, 75, 100):
+                        if pct >= threshold and threshold not in milestone_state:
+                            milestone_state.add(threshold)
+                            _write_runtime_log_event(
+                                runtime_log_path,
+                                "file_progress",
+                                source=str(job.source),
+                                progress_pct=threshold,
+                            )
                     if session is not None and session_path is not None:
                         update_session_entry(
                             session,
@@ -2263,6 +2734,12 @@ def _run_encode_loop(
                 result = _apply_failure_diagnostics(result)
                 transient_retry_kind = _retry_mode_transient_kind(result, retry_mode)
                 if transient_retry_kind is not None:
+                    _write_runtime_log_event(
+                        runtime_log_path,
+                        "retry_scheduled",
+                        source=str(job.source),
+                        retry_kind=transient_retry_kind,
+                    )
                     console.print(
                         f"[yellow]Retrying {filename} after transient {transient_retry_kind.replace('_', ' ')} failure[/yellow]"
                     )
@@ -2301,6 +2778,13 @@ def _run_encode_loop(
                 if allow_hardware_fallback and _retry_mode_allows_hardware_fallback(
                     result, retry_mode
                 ):
+                    _write_runtime_log_event(
+                        runtime_log_path,
+                        "hardware_fallback_scheduled",
+                        source=str(job.source),
+                        fallback_preset=_FALLBACK_PRESET,
+                        fallback_crf=_FALLBACK_CRF,
+                    )
                     console.print(
                         f"[yellow]Retrying {filename} with software fallback[/yellow] [dim](libx265 faster, CRF {_FALLBACK_CRF})[/dim]"
                     )
@@ -2359,6 +2843,12 @@ def _run_encode_loop(
                             attempts=attempts,
                         )
             except KeyboardInterrupt:
+                _write_runtime_log_event(
+                    runtime_log_path,
+                    "batch_interrupted",
+                    source=str(job.source),
+                    progress_pct=stall_state["last_percent"],
+                )
                 stall_stop.set()
                 if stall_thread is not None:
                     stall_thread.join(timeout=1)
@@ -2405,6 +2895,21 @@ def _run_encode_loop(
                     if result.output_failed_safety_check or result.output_failed_acceptance_check:
                         _record_success_calibration(result, ffprobe)
                     _record_failure_calibration(result)
+            _write_runtime_log_event(
+                runtime_log_path,
+                "file_finished",
+                source=str(job.source),
+                status=("skipped" if result.skipped else "success" if result.success else "failed"),
+                output=str(result.job.output),
+                duration_seconds=result.duration_seconds,
+                input_bytes=result.input_size_bytes,
+                output_bytes=result.output_size_bytes,
+                retry_count=result.retry_count,
+                retry_kind=result.retry_kind,
+                fallback_used=result.fallback_used,
+                error_message=result.error_message,
+                skip_reason=result.skip_reason,
+            )
 
             if not result.success and not result.skipped:
                 if on_file_failure == "skip":
@@ -2492,11 +2997,20 @@ def _run_encode_loop(
         )
         progress.remove_task(file_task)
 
+    if use_calibration:
+        _record_batch_bias_calibration(results, ffprobe)
+
     display.show_summary(
         results,
         resumed_from_session=resumed_from_session,
         previously_completed=previously_completed,
         previously_skipped=previously_skipped,
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "batch_finished",
+        stopped_early=stopped_early,
+        totals=_results_totals(results),
     )
     return EncodeLoopResults(results, stopped_early=stopped_early)
 
@@ -3120,6 +3634,7 @@ def encode_cmd(
         ffprobe=ffprobe,
         no_skip=no_skip,
     )
+    queue_strategy, queue_decision = _queue_decision_for_jobs(jobs, queue_strategy)
     jobs = _prioritize_jobs(jobs, queue_strategy)
     split_followup_manifest: Path | None = None
     rerouted_jobs: list[EncodeJob] = []
@@ -3300,11 +3815,22 @@ def encode_cmd(
         save_session(active_session, session_path)
 
     log_path: Path | None = None
+    runtime_log_path: Path | None = None
     if verbose and not dry_run:
         log_dir = output_dir if output_dir is not None else directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = log_dir / f"mediashrink_{timestamp}.log"
         console.print(f"[dim]Verbose log:[/dim] {log_path}")
+    if not dry_run:
+        runtime_log_path = _runtime_log_path_for_run(directory, output_dir, "encode")
+        _write_runtime_log_event(
+            runtime_log_path,
+            "plan",
+            mode="encode",
+            policy=policy,
+            queue_strategy=queue_strategy,
+            queue_rationale=queue_decision.get("rationale"),
+        )
 
     resume_completed, resume_skipped = _resume_summary_counts(
         prior if resumed_from_session else None
@@ -3328,6 +3854,7 @@ def encode_cmd(
                 use_calibration=use_calibration,
                 retry_mode=retry_mode,
                 require_net_savings_pct=require_net_savings,
+                runtime_log_path=runtime_log_path,
             )
         )
     cleaned_paths: list[Path] = []
@@ -3347,6 +3874,14 @@ def encode_cmd(
         results,
         cleaned_paths,
         mkv_replaced_paths,
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "cleanup_completed",
+        cleaned_paths=[str(path) for path in cleaned_paths],
+        mkv_replaced_paths={
+            str(source): str(output) for source, output in mkv_replaced_paths.items()
+        },
     )
 
     if not dry_run:
@@ -3378,6 +3913,14 @@ def encode_cmd(
             launch_mode="direct_encode",
             cleanup_policy="replace_originals" if direct_cleanup_policy else "keep_originals",
             batch_jobs=active_jobs,
+            runtime_log_path=runtime_log_path,
+            queue_decision=queue_decision,
+        )
+        _write_runtime_log_event(
+            runtime_log_path,
+            "reports_written",
+            json_report=str(json_report),
+            text_report=str(text_report),
         )
         if not json_output:
             console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -3473,6 +4016,7 @@ def analyze(
         items,
         policy=_validate_duplicate_policy(duplicate_policy),
     )
+    filename_hygiene_notes = _filename_hygiene_notes(items)
     if not items:
         if json_output:
             print(json.dumps({"exit_code": EXIT_NO_FILES, "items": []}))
@@ -3535,6 +4079,7 @@ def analyze(
             time_confidence=time_confidence,
             time_confidence_detail=time_confidence_detail,
             duplicate_policy=duplicate_policy,
+            notes=duplicate_notes + filename_hygiene_notes,
             items=items,
         )
         print(json.dumps(manifest.to_dict()))
@@ -3554,6 +4099,12 @@ def analyze(
             compatibility_signals=compatibility_signals,
             calibration_store=load_calibration_store() if use_calibration else None,
         )
+        if filename_hygiene_notes:
+            console.print(
+                f"[yellow]Filename hygiene warning:[/yellow] {len(filename_hygiene_notes)} suspicious name(s) were detected."
+            )
+            for note in filename_hygiene_notes[:5]:
+                console.print(f"  [dim]{note.replace('Filename hygiene: ', '')}[/dim]")
 
     if manifest_out is not None:
         if split_mode is None:
@@ -3570,6 +4121,7 @@ def analyze(
                 time_confidence=time_confidence,
                 time_confidence_detail=time_confidence_detail,
                 duplicate_policy=duplicate_policy,
+                notes=duplicate_notes + filename_hygiene_notes,
                 items=items,
             )
             save_manifest(manifest, manifest_out)
@@ -3590,7 +4142,7 @@ def analyze(
                 items=[item for item in items if item.recommendation == "recommended"],
                 split_by=split_mode,
                 index_path=manifest_out,
-                notes=duplicate_notes,
+                notes=duplicate_notes + filename_hygiene_notes,
             )
         if not json_output:
             console.print(f"[green]Wrote manifest[/green] {manifest_out}")
@@ -3714,7 +4266,11 @@ def apply(
         ffprobe=ffprobe,
         no_skip=False,
     )
-    jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
+    queue_strategy, queue_decision = _queue_decision_for_jobs(
+        jobs,
+        _validate_queue_strategy(queue_strategy),
+    )
+    jobs = _prioritize_jobs(jobs, queue_strategy)
     split_followup_manifest: Path | None = None
     rerouted_jobs: list[EncodeJob] = []
     reroute_notes: list[str] = []
@@ -3806,7 +4362,20 @@ def apply(
     else:
         _print_preflight_warnings(preflight_warnings)
 
+    runtime_log_path = _runtime_log_path_for_run(
+        loaded_manifest.analyzed_directory,
+        output_dir,
+        "apply",
+    )
     if to_encode:
+        _write_runtime_log_event(
+            runtime_log_path,
+            "plan",
+            mode="apply",
+            policy=_validate_policy(policy),
+            queue_strategy=queue_strategy,
+            queue_rationale=queue_decision.get("rationale"),
+        )
         results, stopped_early = _normalize_loop_result(
             _run_encode_loop(
                 active_jobs,
@@ -3818,6 +4387,7 @@ def apply(
                 use_calibration=use_calibration,
                 retry_mode=_validate_retry_mode(retry_mode),
                 require_net_savings_pct=require_net_savings,
+                runtime_log_path=runtime_log_path,
             )
         )
     cleaned_paths: list[Path] = []
@@ -3832,6 +4402,14 @@ def apply(
             ffprobe=ffprobe,
             assume_yes=False,
         )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "cleanup_completed",
+        cleaned_paths=[str(path) for path in cleaned_paths],
+        mkv_replaced_paths={
+            str(source): str(output) for source, output in mkv_replaced_paths.items()
+        },
+    )
 
     json_report, text_report = _write_batch_reports(
         mode="apply",
@@ -3854,13 +4432,21 @@ def apply(
         policy=_validate_policy(policy),
         on_file_failure=on_file_failure,
         retry_mode=_validate_retry_mode(retry_mode),
-        queue_strategy=_validate_queue_strategy(queue_strategy),
+        queue_strategy=queue_strategy,
         split_followup_manifest=split_followup_manifest,
         estimate_miss_summary=_estimate_miss_summary(results),
         require_net_savings_pct=require_net_savings,
         launch_mode="apply",
         cleanup_policy="replace_originals" if cleanup else "keep_originals",
         batch_jobs=active_jobs,
+        runtime_log_path=runtime_log_path,
+        queue_decision=queue_decision,
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "reports_written",
+        json_report=str(json_report),
+        text_report=str(text_report),
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
 
@@ -4015,6 +4601,28 @@ def wizard(
         overwrite,
         assume_yes=auto,
     )
+    runtime_log_path = _runtime_log_path_for_run(directory, output_dir, "wizard")
+    _write_runtime_log_event(
+        runtime_log_path,
+        "plan",
+        mode="wizard",
+        policy=policy,
+        queue_strategy=(
+            wizard_report_context.get("queue_decision", {}).get("strategy")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+        queue_rationale=(
+            wizard_report_context.get("queue_decision", {}).get("rationale")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+        benchmark_sources=(
+            wizard_report_context.get("estimate_context", {}).get("benchmark_sources")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+    )
 
     results, stopped_early = _normalize_loop_result(
         _run_encode_loop(
@@ -4026,6 +4634,7 @@ def wizard(
             on_file_failure=on_file_failure,
             use_calibration=use_calibration,
             require_net_savings_pct=require_net_savings,
+            runtime_log_path=runtime_log_path,
         )
     )
     followup_report_notes: list[str] = []
@@ -4134,6 +4743,7 @@ def wizard(
                                 on_file_failure=on_file_failure,
                                 use_calibration=use_calibration,
                                 require_net_savings_pct=require_net_savings,
+                                runtime_log_path=runtime_log_path,
                             )
                         )
                         results = results + followup_results
@@ -4152,6 +4762,14 @@ def wizard(
             ffprobe=ffprobe,
             assume_yes=False,
         )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "cleanup_completed",
+        cleaned_paths=[str(path) for path in cleaned_paths],
+        mkv_replaced_paths={
+            str(source): str(output) for source, output in mkv_replaced_paths.items()
+        },
+    )
 
     json_report, text_report = _write_batch_reports(
         mode="wizard",
@@ -4193,6 +4811,23 @@ def wizard(
         launch_mode="wizard",
         cleanup_policy="replace_originals" if wizard_cleanup else "keep_originals",
         batch_jobs=jobs,
+        runtime_log_path=runtime_log_path,
+        queue_decision=(
+            wizard_report_context.get("queue_decision")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+        filename_hygiene=(
+            wizard_report_context.get("filename_hygiene")
+            if isinstance(wizard_report_context, dict)
+            else None
+        ),
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "reports_written",
+        json_report=str(json_report),
+        text_report=str(text_report),
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -4317,7 +4952,11 @@ def resume(
         )
         _record_recovered_sidecars(session, session_path, recovered_paths)
     jobs = _build_resume_jobs(session, ffprobe=ffprobe)
-    jobs = _prioritize_jobs(jobs, _validate_queue_strategy(queue_strategy))
+    queue_strategy, queue_decision = _queue_decision_for_jobs(
+        jobs,
+        _validate_queue_strategy(queue_strategy),
+    )
+    jobs = _prioritize_jobs(jobs, queue_strategy)
     split_followup_manifest: Path | None = None
     rerouted_jobs: list[EncodeJob] = []
     reroute_notes: list[str] = []
@@ -4419,11 +5058,20 @@ def resume(
         raise typer.Exit(code=EXIT_USER_CANCELLED)
 
     log_path: Path | None = None
+    runtime_log_path = _runtime_log_path_for_run(directory, output_dir, "resume")
     if verbose:
         log_dir = output_dir if output_dir is not None else directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = log_dir / f"mediashrink_{timestamp}.log"
         console.print(f"[dim]Verbose log:[/dim] {log_path}")
+    _write_runtime_log_event(
+        runtime_log_path,
+        "plan",
+        mode="resume",
+        policy=_validate_policy(policy),
+        queue_strategy=queue_strategy,
+        queue_rationale=queue_decision.get("rationale"),
+    )
 
     resume_completed, resume_skipped = _resume_summary_counts(session)
 
@@ -4445,6 +5093,7 @@ def resume(
                 use_calibration=use_calibration,
                 retry_mode=_validate_retry_mode(retry_mode),
                 require_net_savings_pct=require_net_savings,
+                runtime_log_path=runtime_log_path,
             )
         )
     cleaned_paths: list[Path] = []
@@ -4460,6 +5109,14 @@ def resume(
             assume_yes=False,
         )
     _record_cleanup_results(session, session_path, results, cleaned_paths, mkv_replaced_paths)
+    _write_runtime_log_event(
+        runtime_log_path,
+        "cleanup_completed",
+        cleaned_paths=[str(path) for path in cleaned_paths],
+        mkv_replaced_paths={
+            str(source): str(output) for source, output in mkv_replaced_paths.items()
+        },
+    )
 
     json_report, text_report = _write_batch_reports(
         mode="resume",
@@ -4489,6 +5146,14 @@ def resume(
         launch_mode="resume",
         cleanup_policy="replace_originals" if cleanup else "keep_originals",
         batch_jobs=active_jobs,
+        runtime_log_path=runtime_log_path,
+        queue_decision=queue_decision,
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "reports_written",
+        json_report=str(json_report),
+        text_report=str(text_report),
     )
     if not json_output:
         console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
@@ -4591,6 +5256,11 @@ def overnight(
     )
     queue_strategy = _validate_queue_strategy(queue_strategy)
     retry_mode = _validate_retry_mode(retry_mode)
+    queue_strategy, queue_decision = _queue_decision_for_jobs(
+        jobs,
+        queue_strategy,
+        auto_pick=True,
+    )
     jobs = _prioritize_jobs(jobs, queue_strategy)
     split_followup_manifest: Path | None = None
     rerouted_jobs: list[EncodeJob] = []
@@ -4694,8 +5364,20 @@ def overnight(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = output_dir if output_dir is not None else directory
     log_path = log_dir / f"mediashrink_{timestamp}.log"
+    runtime_log_path = _runtime_log_path_for_run(directory, output_dir, "overnight")
     console.print(f"[dim]Overnight mode:[/dim] policy={policy}, on-file-failure=skip")
     console.print(f"[dim]Verbose log:[/dim] {log_path}")
+    console.print(
+        f"[dim]Queue strategy:[/dim] {queue_decision['strategy']} - {queue_decision['rationale']}"
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "plan",
+        mode="overnight",
+        policy=policy,
+        queue_strategy=queue_strategy,
+        queue_rationale=queue_decision.get("rationale"),
+    )
 
     resume_completed, resume_skipped = _resume_summary_counts(
         session if resumed_from_session else None
@@ -4719,6 +5401,7 @@ def overnight(
                 use_calibration=use_calibration,
                 retry_mode=retry_mode,
                 require_net_savings_pct=require_net_savings,
+                runtime_log_path=runtime_log_path,
             )
         )
     else:
@@ -4726,6 +5409,12 @@ def overnight(
         stopped_early = False
         console.print("[dim]All overnight candidates were skipped before encode start.[/dim]")
     _record_cleanup_results(session, session_path, results, [], {})
+    _write_runtime_log_event(
+        runtime_log_path,
+        "cleanup_completed",
+        cleaned_paths=[],
+        mkv_replaced_paths={},
+    )
     json_report, text_report = _write_batch_reports(
         mode="overnight",
         base_dir=directory,
@@ -4754,6 +5443,14 @@ def overnight(
         launch_mode="overnight",
         cleanup_policy="keep_originals",
         batch_jobs=active_jobs,
+        runtime_log_path=runtime_log_path,
+        queue_decision=queue_decision,
+    )
+    _write_runtime_log_event(
+        runtime_log_path,
+        "reports_written",
+        json_report=str(json_report),
+        text_report=str(text_report),
     )
     console.print(f"[dim]Reports:[/dim] {json_report}  {text_report}")
     if stopped_early or any(not r.success and not r.skipped for r in results):
@@ -4773,6 +5470,16 @@ def review(
         "--json",
         help="Emit the loaded report plus generated guidance as JSON.",
     ),
+    share_safe: bool = typer.Option(
+        False,
+        "--share-safe",
+        help="Redact local paths in terminal and JSON review output.",
+    ),
+    export_json: Optional[Path] = typer.Option(
+        None,
+        "--export-json",
+        help="Write the reviewed payload plus generated guidance to this JSON file.",
+    ),
 ) -> None:
     report_path = _find_latest_report(path)
     if report_path is None:
@@ -4781,32 +5488,45 @@ def review(
 
     payload = _load_report_payload(report_path)
     totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
-    guidance = _review_guidance(payload)
+    review_payload = _share_safe_payload(payload) if share_safe else payload
+    guidance = _review_guidance(review_payload)
+    review_analysis = _review_analysis(review_payload, guidance)
 
     if json_output:
-        output = dict(payload)
+        output = dict(review_payload)
         output["review_guidance"] = guidance
+        output["review_analysis"] = review_analysis
+        if export_json is not None:
+            export_json.parent.mkdir(parents=True, exist_ok=True)
+            export_json.write_text(json.dumps(output, indent=2), encoding="utf-8")
         print(json.dumps(output))
         return
 
+    if export_json is not None:
+        export_payload = dict(review_payload)
+        export_payload["review_guidance"] = guidance
+        export_payload["review_analysis"] = review_analysis
+        export_json.parent.mkdir(parents=True, exist_ok=True)
+        export_json.write_text(json.dumps(export_payload, indent=2), encoding="utf-8")
+
     console.print(f"[bold]Run review[/bold] [dim]({report_path.name})[/dim]")
     console.print(
-        f"Mode: {payload.get('mode', '-')}, policy: {payload.get('policy', '-')}, retry mode: {payload.get('retry_mode', '-')}, queue: {payload.get('queue_strategy', '-')}",
+        f"Mode: {review_payload.get('mode', '-')}, policy: {review_payload.get('policy', '-')}, retry mode: {review_payload.get('retry_mode', '-')}, queue: {review_payload.get('queue_strategy', '-')}",
         highlight=False,
     )
-    if payload.get("size_confidence") or payload.get("time_confidence"):
+    if review_payload.get("size_confidence") or review_payload.get("time_confidence"):
         console.print(
-            f"Size confidence: {payload.get('size_confidence', '-')}, time confidence: {payload.get('time_confidence', '-')}",
+            f"Size confidence: {review_payload.get('size_confidence', '-')}, time confidence: {review_payload.get('time_confidence', '-')}",
             highlight=False,
         )
     console.print(
         f"Succeeded: {totals.get('succeeded', 0)}, failed: {totals.get('failed', 0)}, skipped incompatible: {totals.get('skipped_incompatible', 0)}, skipped by policy: {totals.get('skipped_by_policy', 0)}",
         highlight=False,
     )
-    estimate_miss = payload.get("estimate_miss_summary")
+    estimate_miss = review_payload.get("estimate_miss_summary")
     if isinstance(estimate_miss, str) and estimate_miss:
         console.print(f"Estimate miss: {estimate_miss}", highlight=False)
-    grouped_incompatibilities = payload.get("grouped_incompatibilities")
+    grouped_incompatibilities = review_payload.get("grouped_incompatibilities")
     if isinstance(grouped_incompatibilities, list) and grouped_incompatibilities:
         console.print("[bold]Grouped incompatibilities[/bold]")
         for entry in grouped_incompatibilities[:5]:
@@ -4821,11 +5541,15 @@ def review(
                 else ""
             )
             console.print(f"  - {count}: {reason}{suffix}", highlight=False)
-    warnings = payload.get("warnings")
+    warnings = review_payload.get("warnings")
     if isinstance(warnings, list) and warnings:
         console.print("[bold]Warnings[/bold]")
         for warning in warnings[:5]:
             console.print(f"  - {warning}")
+    if share_safe:
+        console.print("[dim]Share-safe review: local paths were redacted.[/dim]")
+    if export_json is not None:
+        console.print(f"[dim]Exported review JSON:[/dim] {export_json}")
     console.print("[bold]Suggested next step[/bold]")
     for line in guidance:
         console.print(f"  - {line}")

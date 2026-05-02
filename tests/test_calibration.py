@@ -134,6 +134,43 @@ def test_lookup_estimate_blends_exact_and_related_matches(tmp_path: Path) -> Non
     assert describe_calibration_estimate(estimate) is not None
 
 
+def test_lookup_estimate_accepts_legacy_records_without_codec_family(tmp_path: Path) -> None:
+    store_path = tmp_path / "calibration.json"
+    append_success_record(
+        CalibrationRecord(
+            codec="mpeg2video",
+            container=".mkv",
+            resolution_bucket="sd",
+            bitrate_bucket="low",
+            preset="fast",
+            preset_family="software",
+            crf=20,
+            input_bytes=1_000_000,
+            output_bytes=280_000,
+            duration_seconds=100.0,
+            wall_seconds=40.0,
+            effective_speed=2.5,
+            fallback_used=False,
+            retry_used=False,
+            codec_family="unknown",
+        ),
+        path=store_path,
+    )
+
+    estimate = lookup_estimate(
+        load_calibration_store(store_path),
+        codec="mpeg2video",
+        resolution="sd",
+        bitrate="low",
+        preset="fast",
+        container=".mkv",
+    )
+
+    assert estimate is not None
+    assert estimate.output_ratio is not None
+    assert estimate.output_ratio < 0.40
+
+
 def test_calibration_summary_counts_rejected_outputs(tmp_path: Path) -> None:
     store_path = tmp_path / "calibration.json"
     append_success_record(
