@@ -570,10 +570,8 @@ def estimate_analysis_encode_seconds(
         return 0.0
 
     speed: float | None = known_speed if known_speed is not None and known_speed > 0 else None
-    if use_calibration and recommended:
-        active_store = (
-            calibration_store if calibration_store is not None else load_calibration_store()
-        )
+    if use_calibration and recommended and calibration_store is not None:
+        active_store = calibration_store
         weighted_speeds: list[tuple[float, float]] = []
         adjustment_factors: list[tuple[float, float]] = []
         for item in recommended:
@@ -858,14 +856,26 @@ def estimate_time_confidence(
         return "Low"
     if benchmarked_files <= 0 and base == "High":
         base = "Medium"
-    active_store = calibration_store if calibration_store is not None else load_calibration_store()
+    active_store = (
+        calibration_store if (use_calibration and calibration_store is not None) else None
+    )
     speed_hits = 0
     for item in candidates[:5]:
+        resolution = (
+            resolution_bucket(item.width, item.height)
+            if getattr(item, "width", 0) and getattr(item, "height", 0)
+            else "unknown"
+        )
+        bitrate = (
+            bitrate_bucket(item.bitrate_kbps)
+            if item.bitrate_kbps and item.bitrate_kbps > 0
+            else "unknown"
+        )
         estimate = lookup_estimate(
-            active_store if use_calibration else None,
+            active_store,
             codec=item.codec,
-            resolution="unknown",
-            bitrate="unknown",
+            resolution=resolution,
+            bitrate=bitrate,
             preset=preset,
             container=item.source.suffix.lower() or ".mkv",
         )
@@ -879,7 +889,7 @@ def estimate_time_confidence(
     duration_spread = (
         max(duration_values) / max(min(duration_values), 1.0) if len(duration_values) >= 2 else 1.0
     )
-    bias_summary = recent_bias_summary(active_store if use_calibration else None)
+    bias_summary = recent_bias_summary(active_store)
     long_batch_risk = len(candidates) >= 24 and preset not in _HW_ENCODERS
     if long_batch_risk and benchmarked_files <= 1 and base == "High":
         base = "Medium"
