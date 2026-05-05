@@ -20,6 +20,7 @@ from mediashrink.platform_utils import (
     find_ffprobe,
 )
 from mediashrink.scanner import build_jobs, scan_directory
+from mediashrink.session import build_session, find_resumable_session, get_session_path, save_session
 from mediashrink.wizard import (
     EncoderProfile,
     prepare_profile_planning,
@@ -65,6 +66,21 @@ class EncodePreparation:
     followup_manifest_path: Path | None = None
     recommendation_reason: str | None = None
     stage_messages: list[str] | None = None
+
+
+class EncodeRunResults(list):
+    def __init__(
+        self,
+        results: list[EncodeResult],
+        *,
+        session_path: Path | None = None,
+        resumed_from_session: bool = False,
+        session_status: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__(results)
+        self.session_path = session_path
+        self.resumed_from_session = resumed_from_session
+        self.session_status = session_status or {}
 
 
 def prepare_tools() -> tuple[Path, Path]:
@@ -330,16 +346,64 @@ def run_encode_plan(
     on_progress: Callable[[EncodeProgress], None] | None = None,
     on_file_failure: str = "retry",
     use_calibration: bool = True,
+    session_path: Path | None = None,
+    resume: bool = False,
 ) -> list[EncodeResult]:
     if not preparation.jobs:
-        return []
+        return EncodeRunResults([], session_path=session_path, resumed_from_session=False)
     display = _CallbackDisplay(on_progress)
+    active_jobs = list(preparation.jobs)
+    output_dir = None
+    session_path = session_path or get_session_path(preparation.directory, output_dir)
+    preset = active_jobs[0].preset
+    crf = active_jobs[0].crf
+    prior = find_resumable_session(preparation.directory, output_dir, preset, crf) if resume else None
+    resumed_from_session = False
+    active_session = None
+    if prior is not None:
+        session_sources = {entry.source for entry in prior.entries}
+        job_sources = {str(job.source) for job in active_jobs}
+        if job_sources.issubset(session_sources):
+            done = {entry.source for entry in prior.entries if entry.status == "success"}
+            for job in active_jobs:
+                if str(job.source) in done:
+                    job.skip = True
+                    job.skip_reason = "resumed (already done)"
+            active_session = prior
+            resumed_from_session = bool(done)
+    if active_session is None:
+        active_session = build_session(
+            preparation.directory,
+            preset,
+            crf,
+            overwrite=all(job.output == job.source for job in active_jobs),
+            output_dir=output_dir,
+            jobs=active_jobs,
+            on_file_failure=on_file_failure,
+            use_calibration=use_calibration,
+        )
+    save_session(active_session, session_path)
+    previously_completed = sum(1 for entry in active_session.entries if entry.status == "success") if resumed_from_session else 0
+    previously_skipped = sum(1 for entry in active_session.entries if entry.status == "skipped") if resumed_from_session else 0
     results = _run_encode_loop(
-        preparation.jobs,
+        active_jobs,
         preparation.ffmpeg,
         preparation.ffprobe,
         display,
+        session=active_session,
+        session_path=session_path,
+        resumed_from_session=resumed_from_session,
+        previously_completed=previously_completed,
+        previously_skipped=previously_skipped,
         on_file_failure=on_file_failure,
         use_calibration=use_calibration,
     )
-    return list(results)
+    session_status: dict[str, int] = {}
+    for entry in active_session.entries:
+        session_status[entry.status] = session_status.get(entry.status, 0) + 1
+    return EncodeRunResults(
+        list(results),
+        session_path=session_path,
+        resumed_from_session=resumed_from_session,
+        session_status=session_status,
+    )

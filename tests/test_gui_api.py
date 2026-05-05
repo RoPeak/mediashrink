@@ -94,9 +94,6 @@ def test_run_encode_plan_forwards_progress_and_results(tmp_path: Path) -> None:
         preset="faster",
         dry_run=False,
     )
-    preparation = (
-        prepare_encode_run.__annotations__
-    )  # keep type checker quiet for local construction
     from mediashrink.gui_api import EncodePreparation
 
     prep = EncodePreparation(
@@ -148,6 +145,61 @@ def test_run_encode_plan_forwards_progress_and_results(tmp_path: Path) -> None:
     assert results == [result]
     assert progress_events
     assert progress_events[-1].overall_progress == 0.5
+
+
+def test_run_encode_plan_creates_session_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "episode.mkv"
+    source.write_bytes(b"data")
+    job = EncodeJob(
+        source=source,
+        output=source,
+        tmp_output=tmp_path / ".tmp_episode.mkv",
+        crf=22,
+        preset="faster",
+        dry_run=False,
+    )
+    from mediashrink.gui_api import EncodePreparation
+
+    prep = EncodePreparation(
+        directory=tmp_path,
+        ffmpeg=FFMPEG,
+        ffprobe=FFPROBE,
+        items=[_analysis_item(source)],
+        duplicate_warnings=[],
+        profile=None,
+        jobs=[job],
+        recommended_count=1,
+        maybe_count=0,
+        skip_count=0,
+        selected_count=1,
+        total_input_bytes=1000,
+        selected_input_bytes=1000,
+        selected_estimated_output_bytes=400,
+        estimated_total_seconds=60.0,
+        on_file_failure="retry",
+        use_calibration=True,
+        stage_messages=[],
+    )
+    result = EncodeResult(
+        job=job,
+        skipped=False,
+        skip_reason=None,
+        success=True,
+        input_size_bytes=1000,
+        output_size_bytes=400,
+        duration_seconds=5.0,
+    )
+
+    def fake_run_encode_loop(jobs, ffmpeg, ffprobe, display, **kwargs):
+        session = kwargs["session"]
+        session.entries[0].status = "success"
+        return [result]
+
+    with patch("mediashrink.gui_api._run_encode_loop", side_effect=fake_run_encode_loop):
+        results = run_encode_plan(prep, resume=True)
+
+    assert getattr(results, "session_path").name == ".mediashrink-session.json"
+    assert getattr(results, "session_status") == {"success": 1}
 
 
 def test_prepare_encode_run_exposes_structured_planning_fields(tmp_path: Path) -> None:
