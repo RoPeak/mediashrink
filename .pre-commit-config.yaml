@@ -1,12 +1,13 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.4
-    hooks:
-      - id: ruff-format
-        stages: [pre-commit]
-
   - repo: local
     hooks:
+      - id: ruff-format
+        name: ruff-format
+        entry: bash -c 'python3 -m ruff format "$@" && git add -- "$@"' --
+        language: system
+        types_or: [python, pyi]
+        stages: [pre-commit]
+
       - id: pytest
         name: pytest
         entry: pytest -q --ignore=tests/test_encoder.py
