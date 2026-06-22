@@ -192,9 +192,9 @@ def estimate_output_size(
             )
             if lookup is not None and lookup.output_ratio is not None and lookup.output_ratio > 0:
                 corrected_ratio = lookup.output_ratio
-                if lookup.batch_bias_adjustment is not None:
+                if isinstance(lookup.batch_bias_adjustment, (int, float)):
                     corrected_ratio = max(0.05, corrected_ratio + lookup.batch_bias_adjustment)
-                if lookup.average_size_error is not None:
+                if isinstance(lookup.average_size_error, (int, float)):
                     corrected_ratio = max(0.05, corrected_ratio + lookup.average_size_error)
                 calibrated_estimate = int(input_size * corrected_ratio)
                 if lookup.confidence == "High":
@@ -206,7 +206,7 @@ def estimate_output_size(
                         calibrated_weight = 0.50
                         heuristic_weight = 0.50
                         if (
-                            lookup.average_size_error is not None
+                            isinstance(lookup.average_size_error, (int, float))
                             and abs(lookup.average_size_error) >= 0.12
                         ):
                             calibrated_weight = 0.35

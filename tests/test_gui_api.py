@@ -45,6 +45,85 @@ def test_prepare_encode_run_returns_empty_plan_for_empty_directory(tmp_path: Pat
     assert result.total_input_bytes == 0
 
 
+def test_prepare_encode_run_source_paths_bypasses_directory_scan(tmp_path: Path) -> None:
+    selected = tmp_path / "selected.mp4"
+    unrelated = tmp_path / "unrelated.mp4"
+    selected.write_bytes(b"data")
+    unrelated.write_bytes(b"data")
+    item = _analysis_item(selected)
+    planning = ProfilePlanningResult(
+        candidate_items=[item],
+        candidate_input_bytes=item.size_bytes,
+        candidate_media_seconds=item.duration_seconds,
+        sample_item=item,
+        sample_duration=item.duration_seconds,
+        preview_items=[item],
+        available_hw=[],
+        benchmark_speeds={"fast": 1.0},
+        observed_probe_failures={},
+        profiles=[],
+        active_calibration=None,
+        size_error_by_preset={},
+        stage_messages=[],
+    )
+    analysed: dict[str, object] = {}
+
+    def fake_analyze_files(files, *args, **kwargs):
+        analysed["files"] = files
+        return [item]
+
+    with (
+        patch("mediashrink.gui_api.prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.gui_api.scan_directory") as scan_directory,
+        patch("mediashrink.gui_api.analyze_files", side_effect=fake_analyze_files),
+        patch("mediashrink.gui_api.prepare_profile_planning", return_value=planning),
+    ):
+        result = prepare_encode_run(directory=tmp_path, source_paths={selected})
+
+    scan_directory.assert_not_called()
+    assert analysed["files"] == [selected]
+    assert result.items == [item]
+
+
+def test_prepare_encode_run_can_cancel_before_scan(tmp_path: Path) -> None:
+    with (
+        patch("mediashrink.gui_api.prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.gui_api.scan_directory") as scan_directory,
+    ):
+        result = prepare_encode_run(directory=tmp_path, cancel_callback=lambda: True)
+
+    scan_directory.assert_not_called()
+    assert result.cancelled is True
+    assert result.items == []
+    assert result.jobs == []
+    assert result.stage_messages == [
+        "Compression preparation was cancelled before a runnable plan was built."
+    ]
+
+
+def test_prepare_encode_run_can_cancel_before_profile_planning(tmp_path: Path) -> None:
+    source = tmp_path / "movie.mp4"
+    item = _analysis_item(source)
+    cancel_checks = iter([False, False, True])
+
+    def cancel_callback() -> bool:
+        return next(cancel_checks, True)
+
+    with (
+        patch("mediashrink.gui_api.prepare_tools", return_value=(FFMPEG, FFPROBE)),
+        patch("mediashrink.gui_api.scan_directory", return_value=[source]),
+        patch("mediashrink.gui_api.analyze_files", return_value=[item]),
+        patch("mediashrink.gui_api.prepare_profile_planning") as prepare_profile_planning,
+    ):
+        result = prepare_encode_run(directory=tmp_path, cancel_callback=cancel_callback)
+
+    prepare_profile_planning.assert_not_called()
+    assert result.cancelled is True
+    assert result.items == [item]
+    assert result.recommended_count == 1
+    assert result.jobs == []
+
+
 def test_auto_select_profile_returns_recommended_profile(tmp_path: Path) -> None:
     item = _analysis_item(tmp_path / "movie.mkv")
     planning = ProfilePlanningResult(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +19,7 @@ from mediashrink.platform_utils import (
     find_ffmpeg,
     find_ffprobe,
 )
-from mediashrink.scanner import build_jobs, scan_directory
+from mediashrink.scanner import SUPPORTED_EXTENSIONS, build_jobs, scan_directory
 from mediashrink.wizard import (
     EncoderProfile,
     prepare_profile_planning,
@@ -65,6 +65,7 @@ class EncodePreparation:
     followup_manifest_path: Path | None = None
     recommendation_reason: str | None = None
     stage_messages: list[str] | None = None
+    cancelled: bool = False
 
 
 def prepare_tools() -> tuple[Path, Path]:
@@ -106,6 +107,8 @@ def prepare_encode_run(
     use_calibration: bool = True,
     duplicate_policy: str = "prefer-mkv",
     progress_callback: Callable[[object], None] | None = None,
+    source_paths: Collection[Path] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> EncodePreparation:
     def emit_stage(
         stage: str,
@@ -118,7 +121,15 @@ def prepare_encode_run(
 
     ffmpeg, ffprobe = prepare_tools()
     emit_stage("discovering", "Discovering files...")
-    files = scan_directory(directory, recursive=recursive)
+    if _cancel_requested(cancel_callback):
+        return _cancelled_preparation(directory, ffmpeg, ffprobe, on_file_failure, use_calibration)
+    files = (
+        _source_path_files(source_paths)
+        if source_paths is not None
+        else scan_directory(directory, recursive=recursive)
+    )
+    if _cancel_requested(cancel_callback):
+        return _cancelled_preparation(directory, ffmpeg, ffprobe, on_file_failure, use_calibration)
     if not files:
         return EncodePreparation(
             directory=directory,
@@ -140,32 +151,66 @@ def prepare_encode_run(
             use_calibration=use_calibration,
             stage_messages=[],
         )
-    items = analyze_files(
-        files,
-        ffprobe,
-        progress_callback=lambda completed, total, path: progress_callback((completed, total, path))
-        if progress_callback is not None
-        else None,
-        preset="fast",
-        crf=20,
-        use_calibration=use_calibration,
-    )
+
+    def emit_analysis_progress(completed: int, total: int, path: Path) -> None:
+        if progress_callback is not None:
+            progress_callback((completed, total, path))
+        if _cancel_requested(cancel_callback):
+            raise _PreparationCancelled
+
+    try:
+        items = analyze_files(
+            files,
+            ffprobe,
+            progress_callback=emit_analysis_progress,
+            preset="fast",
+            crf=20,
+            use_calibration=use_calibration,
+        )
+    except _PreparationCancelled:
+        return _cancelled_preparation(directory, ffmpeg, ffprobe, on_file_failure, use_calibration)
     emit_stage("analysing", "Analysing files complete.", len(items), len(items))
     items, duplicate_warnings = apply_duplicate_policy_to_items(items, policy=duplicate_policy)
+    if _cancel_requested(cancel_callback):
+        return _cancelled_preparation(
+            directory,
+            ffmpeg,
+            ffprobe,
+            on_file_failure,
+            use_calibration,
+            items=items,
+            duplicate_warnings=duplicate_warnings,
+        )
     emit_stage("benchmarking", "Benchmarking profiles...")
-    planning = prepare_profile_planning(
-        analysis_items=items,
-        ffmpeg=ffmpeg,
-        ffprobe=ffprobe,
-        policy=policy,
-        use_calibration=use_calibration,
-        console=None,
-        stage_callback=lambda stage, message, current, total: (
+
+    def emit_profile_stage(
+        stage: str, message: str, current: int | None, total: int | None
+    ) -> None:
+        if progress_callback is not None:
             progress_callback(("stage", stage, message, current, total, ""))
-            if progress_callback is not None
-            else None
-        ),
-    )
+        if _cancel_requested(cancel_callback):
+            raise _PreparationCancelled
+
+    try:
+        planning = prepare_profile_planning(
+            analysis_items=items,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            policy=policy,
+            use_calibration=use_calibration,
+            console=None,
+            stage_callback=emit_profile_stage,
+        )
+    except _PreparationCancelled:
+        return _cancelled_preparation(
+            directory,
+            ffmpeg,
+            ffprobe,
+            on_file_failure,
+            use_calibration,
+            items=items,
+            duplicate_warnings=duplicate_warnings,
+        )
     profile = (
         next((candidate for candidate in planning.profiles if candidate.is_recommended), None)
         if planning is not None
@@ -248,6 +293,64 @@ def prepare_encode_run(
         followup_manifest_path=None,
         recommendation_reason=profile.why_choose if profile is not None else None,
         stage_messages=planning.stage_messages if planning is not None else [],
+    )
+
+
+def _source_path_files(source_paths: Collection[Path]) -> list[Path]:
+    files = [
+        Path(path)
+        for path in source_paths
+        if Path(path).is_file()
+        and Path(path).suffix.lower() in SUPPORTED_EXTENSIONS
+        and not Path(path).name.startswith(".tmp_")
+    ]
+    return sorted(files, key=lambda path: path.name.lower())
+
+
+class _PreparationCancelled(Exception):
+    pass
+
+
+def _cancel_requested(cancel_callback: Callable[[], bool] | None) -> bool:
+    if cancel_callback is None:
+        return False
+    try:
+        return bool(cancel_callback())
+    except Exception:
+        return False
+
+
+def _cancelled_preparation(
+    directory: Path,
+    ffmpeg: Path,
+    ffprobe: Path,
+    on_file_failure: str,
+    use_calibration: bool,
+    *,
+    items: list[AnalysisItem] | None = None,
+    duplicate_warnings: list[str] | None = None,
+) -> EncodePreparation:
+    active_items = list(items or [])
+    return EncodePreparation(
+        directory=directory,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        items=active_items,
+        duplicate_warnings=list(duplicate_warnings or []),
+        profile=None,
+        jobs=[],
+        recommended_count=sum(1 for item in active_items if item.recommendation == "recommended"),
+        maybe_count=sum(1 for item in active_items if item.recommendation == "maybe"),
+        skip_count=sum(1 for item in active_items if item.recommendation == "skip"),
+        selected_count=0,
+        total_input_bytes=sum(item.size_bytes for item in active_items),
+        selected_input_bytes=0,
+        selected_estimated_output_bytes=0,
+        estimated_total_seconds=0.0,
+        on_file_failure=on_file_failure,
+        use_calibration=use_calibration,
+        stage_messages=["Compression preparation was cancelled before a runnable plan was built."],
+        cancelled=True,
     )
 
 
