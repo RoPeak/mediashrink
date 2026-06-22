@@ -1153,6 +1153,23 @@ def _iter_probe_targets(profiles: list[EncoderProfile]) -> list[tuple[str, int]]
     return probe_targets
 
 
+def _probe_capable_profiles(
+    profiles: list[EncoderProfile],
+    benchmark_speeds: dict[str, float | None],
+) -> list[EncoderProfile]:
+    software_ready = any((benchmark_speeds.get(key) or 0) > 0 for key in ("fast", "faster"))
+    capable: list[EncoderProfile] = []
+    for profile in profiles:
+        encoder_key = profile.encoder_key
+        if encoder_key in {"fast", "faster", "slow", "medium"}:
+            if software_ready:
+                capable.append(profile)
+            continue
+        if (benchmark_speeds.get(encoder_key) or 0) > 0:
+            capable.append(profile)
+    return capable
+
+
 def _predict_profile_compatibility(
     *,
     profile: EncoderProfile,
@@ -1385,8 +1402,15 @@ def prepare_profile_planning(
     )
     sample_duration = sample_item.duration_seconds if sample_item.duration_seconds > 0 else 3600.0
     preview_items = select_representative_items(candidate_items or sample_pool, limit=3)
+    stage_messages: list[str] = []
     detect_console = console if console is not None else Console(quiet=True)
     if available_hw is None:
+        _emit_stage_status(
+            "Checking encoder capabilities...",
+            console=console,
+            stage_messages=stage_messages,
+            stage_callback=stage_callback,
+        )
         available_hw = detect_available_encoders(
             ffmpeg,
             detect_console,
@@ -1396,7 +1420,6 @@ def prepare_profile_planning(
 
     candidates_to_bench = list(available_hw) + ["fast", "faster"]
     benchmark_speeds: dict[str, float | None] = {}
-    stage_messages: list[str] = []
 
     active_calibration = load_calibration_store() if use_calibration else None
     container_incompatibility_cache: dict[Path, str | None] = {}
@@ -1475,7 +1498,8 @@ def prepare_profile_planning(
             calibration_store=active_calibration,
             container_incompatibility_cache=container_incompatibility_cache,
         )
-        probe_targets = _iter_probe_targets(provisional_profiles)
+        probe_ready_profiles = _probe_capable_profiles(provisional_profiles, benchmark_speeds)
+        probe_targets = _iter_probe_targets(probe_ready_profiles)
         if probe_targets:
             _emit_stage_status(
                 "Preparing smoke probes...",
@@ -1509,7 +1533,7 @@ def prepare_profile_planning(
 
                 observed_probe_failures = _targeted_profile_probe_failures(
                     items=candidate_items,
-                    profiles=provisional_profiles,
+                    profiles=probe_ready_profiles,
                     ffmpeg=ffmpeg,
                     ffprobe=ffprobe,
                     progress_callback=_update_probe_progress,
@@ -1568,7 +1592,8 @@ def prepare_profile_planning(
             calibration_store=active_calibration,
             container_incompatibility_cache=container_incompatibility_cache,
         )
-        if _iter_probe_targets(provisional_profiles):
+        probe_ready_profiles = _probe_capable_profiles(provisional_profiles, benchmark_speeds)
+        if _iter_probe_targets(probe_ready_profiles):
             _emit_stage_status(
                 "Preparing smoke probes...",
                 console=console,
@@ -1577,7 +1602,7 @@ def prepare_profile_planning(
             )
         observed_probe_failures = _targeted_profile_probe_failures(
             items=candidate_items,
-            profiles=provisional_profiles,
+            profiles=probe_ready_profiles,
             ffmpeg=ffmpeg,
             ffprobe=ffprobe,
             progress_callback=lambda stage, current, total: _emit_stage_progress(
