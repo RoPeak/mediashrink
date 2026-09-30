@@ -21,6 +21,9 @@ htmlcov/
 venv/
 ENV/
 env/
+.env
+.env.*
+!.env.example
 
 # IDE/editor
 .vscode/
@@ -35,3 +38,5 @@ Desktop.ini
 test-output/
 artifacts/
 mediashrink-run-output.txt
+*.log
+logs/
